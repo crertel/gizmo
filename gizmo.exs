@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–3: Skeleton, LLM Client, Interpolation
+# Gizmo — Stages 0–4: Skeleton, LLM Client, Interpolation, Mailbox Router
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -379,6 +379,60 @@ defmodule Gizmo.Interpolation do
   end
 end
 
+# -----------------------------------------------------------------------------
+# Gizmo.Mailbox — Registry-based mailbox router
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Mailbox do
+  @registry Gizmo.Mailbox.Registry
+
+  @doc "Start the underlying Registry. Call once at boot."
+  def start do
+    case Registry.start_link(keys: :unique, name: @registry) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+    end
+  end
+
+  @doc "Register the calling process under `mailbox_id`."
+  def register(mailbox_id) do
+    case Registry.register(@registry, mailbox_id, nil) do
+      {:ok, _} -> :ok
+      {:error, {:already_registered, _}} -> {:error, {:already_registered, mailbox_id}}
+    end
+  end
+
+  @doc "Look up the PID registered under `mailbox_id`."
+  def lookup(mailbox_id) do
+    case Registry.lookup(@registry, mailbox_id) do
+      [{pid, _}] -> {:ok, pid}
+      [] -> {:error, {:not_found, mailbox_id}}
+    end
+  end
+
+  @doc "Send `message` to the process registered under `mailbox_id`."
+  def route(mailbox_id, message) do
+    case lookup(mailbox_id) do
+      {:ok, pid} ->
+        send(pid, {:mailbox_msg, mailbox_id, message})
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Generate a unique mailbox ID with the given prefix."
+  def generate_id(prefix \\ "mb") do
+    "#{prefix}_#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  @doc "Unregister the calling process from `mailbox_id`."
+  def unregister(mailbox_id) do
+    Registry.unregister(@registry, mailbox_id)
+  end
+end
+
 # =============================================================================
 # Gizmo.CLI — command-line interface
 # =============================================================================
@@ -660,7 +714,65 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 6. LLM test (only if API key is set)
+    # 6. Mailbox router tests
+    IO.puts("--- Mailbox Router ---")
+
+    # Start the registry (idempotent)
+    {:ok, _} = Gizmo.Mailbox.start()
+
+    # Generate IDs are unique
+    id1 = Gizmo.Mailbox.generate_id()
+    id2 = Gizmo.Mailbox.generate_id()
+    failures = failures ++ assert_eq("generated IDs are unique", id1 != id2, true)
+    failures = failures ++ assert_eq("generated ID has prefix", String.starts_with?(id1, "mb_"), true)
+
+    # Custom prefix
+    custom_id = Gizmo.Mailbox.generate_id("agent")
+    failures = failures ++ assert_eq("custom prefix", String.starts_with?(custom_id, "agent_"), true)
+
+    # Register and lookup
+    test_mb = Gizmo.Mailbox.generate_id("test")
+    :ok = Gizmo.Mailbox.register(test_mb)
+    failures = failures ++ assert_eq("lookup registered", Gizmo.Mailbox.lookup(test_mb), {:ok, self()})
+
+    # Duplicate registration
+    failures = failures ++ assert_eq("duplicate register",
+      Gizmo.Mailbox.register(test_mb),
+      {:error, {:already_registered, test_mb}}
+    )
+
+    # Lookup missing
+    failures = failures ++ assert_eq("lookup missing",
+      Gizmo.Mailbox.lookup("nonexistent"),
+      {:error, {:not_found, "nonexistent"}}
+    )
+
+    # Route delivers message
+    :ok = Gizmo.Mailbox.route(test_mb, "hello from router")
+    received =
+      receive do
+        {:mailbox_msg, ^test_mb, msg} -> msg
+      after
+        100 -> :timeout
+      end
+    failures = failures ++ assert_eq("route delivers message", received, "hello from router")
+
+    # Route to missing mailbox
+    failures = failures ++ assert_eq("route to missing",
+      Gizmo.Mailbox.route("nonexistent", "msg"),
+      {:error, {:not_found, "nonexistent"}}
+    )
+
+    # Unregister
+    Gizmo.Mailbox.unregister(test_mb)
+    failures = failures ++ assert_eq("lookup after unregister",
+      Gizmo.Mailbox.lookup(test_mb),
+      {:error, {:not_found, test_mb}}
+    )
+
+    IO.puts("")
+
+    # 7. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
