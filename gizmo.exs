@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–2: Skeleton, LLM Client, Interpolation
+# Gizmo — Stages 0–3: Skeleton, LLM Client, Interpolation
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -74,6 +74,143 @@ defmodule Gizmo.LLM do
   }
 
   def eval_tool, do: @eval_tool
+
+  @doc "Shared normalize_eval with op validation, used by both clients."
+  def normalize_eval(input) do
+    ops_raw = input["ops"] || []
+
+    case validate_ops(ops_raw) do
+      {:ok, ops} ->
+        frames = input["frames"] || []
+        {:ok, %{ops: ops, frames: frames}}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp validate_ops(ops_raw) do
+    Enum.reduce_while(ops_raw, {:ok, []}, fn op, {:ok, acc} ->
+      case validate_op(op) do
+        {:ok, parsed} -> {:cont, {:ok, acc ++ [parsed]}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp validate_op(%{"op" => "send"} = op) do
+    with :ok <- require_string(op, "mailbox", "send"),
+         :ok <- require_string(op, "msg", "send") do
+      {:ok, {:send, op["mailbox"], op["msg"]}}
+    end
+  end
+
+  defp validate_op(%{"op" => "receive"}), do: {:ok, :receive}
+
+  defp validate_op(%{"op" => "fork"} = op) do
+    with :ok <- require_integer(op, "n", "fork"),
+         :ok <- require_list(op, "frames", "fork") do
+      {:ok, {:fork, op["n"], op["frames"]}}
+    end
+  end
+
+  defp validate_op(%{"op" => "join"} = op) do
+    with :ok <- require_string(op, "msg", "join") do
+      {:ok, {:join, op["msg"]}}
+    end
+  end
+
+  defp validate_op(%{"op" => name}), do: {:error, {:unknown_op, name}}
+  defp validate_op(_), do: {:error, {:invalid_op, nil, "missing op field"}}
+
+  defp require_string(op, field, op_name) do
+    case op[field] do
+      v when is_binary(v) -> :ok
+      nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
+      _ -> {:error, {:invalid_op, op_name, "#{field} must be a string"}}
+    end
+  end
+
+  defp require_integer(op, field, op_name) do
+    case op[field] do
+      v when is_integer(v) -> :ok
+      nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
+      _ -> {:error, {:invalid_op, op_name, "#{field} must be an integer"}}
+    end
+  end
+
+  defp require_list(op, field, op_name) do
+    case op[field] do
+      v when is_list(v) -> :ok
+      nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
+      _ -> {:error, {:invalid_op, op_name, "#{field} must be a list"}}
+    end
+  end
+
+  @doc """
+  Apply interpolation to an eval_response's frames and op message strings.
+  Takes an eval_response, args list, and bindings map.
+  """
+  def interpolate_response(%{ops: ops, frames: frames}, args, bindings) do
+    interpolated_frames =
+      Enum.map(frames, &Gizmo.Interpolation.resolve(&1, args, bindings))
+
+    interpolated_ops =
+      Enum.map(ops, fn
+        {:send, mailbox, msg} ->
+          {:send, mailbox, Gizmo.Interpolation.resolve(msg, args, bindings)}
+
+        {:join, msg} ->
+          {:join, Gizmo.Interpolation.resolve(msg, args, bindings)}
+
+        {:fork, n, fork_frames} ->
+          {:fork, n,
+           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, args, bindings))}
+
+        other ->
+          other
+      end)
+
+    %{ops: interpolated_ops, frames: interpolated_frames}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.LLM.Retry — retry with exponential backoff for transient API errors
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.LLM.Retry do
+  @max_retries 3
+  @backoff_ms [1_000, 2_000, 4_000]
+  @retryable_statuses [429, 500, 502, 503, 529]
+
+  @doc """
+  Wraps a zero-arity function that returns an API result.
+  Retries on transient errors (429, 5xx, 529) with exponential backoff.
+  Non-retryable errors pass through immediately.
+  """
+  def with_retry(fun, opts \\ []) do
+    max = Keyword.get(opts, :max_retries, @max_retries)
+    backoffs = Keyword.get(opts, :backoff_ms, @backoff_ms)
+    sleep_fn = Keyword.get(opts, :sleep_fn, &Process.sleep/1)
+    do_retry(fun, 0, max, backoffs, sleep_fn)
+  end
+
+  defp do_retry(fun, attempt, max, backoffs, sleep_fn) do
+    case fun.() do
+      {:error, {:api_error, status, _body}} = err when status in @retryable_statuses ->
+        if attempt < max do
+          delay = Enum.at(backoffs, attempt, List.last(backoffs))
+          sleep_fn.(delay)
+          do_retry(fun, attempt + 1, max, backoffs, sleep_fn)
+        else
+          err
+        end
+
+      other ->
+        other
+    end
+  end
 end
 
 # -----------------------------------------------------------------------------
@@ -101,49 +238,35 @@ defmodule Gizmo.LLM.Anthropic do
       tool_choice: %{type: "tool", name: "eval_response"}
     }
 
-    case Req.post(@api_url,
-           headers: [
-             {"x-api-key", api_key},
-             {"anthropic-version", "2023-06-01"}
-           ],
-           json: body,
-           receive_timeout: 120_000
-         ) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        extract_eval_response(body)
+    Gizmo.LLM.Retry.with_retry(fn ->
+      case Req.post(@api_url,
+             headers: [
+               {"x-api-key", api_key},
+               {"anthropic-version", "2023-06-01"}
+             ],
+             json: body,
+             receive_timeout: 120_000
+           ) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          extract_eval_response(body)
 
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, {:api_error, status, body}}
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, {:api_error, status, body}}
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end)
   end
 
   defp extract_eval_response(%{"content" => content}) do
     case Enum.find(content, &(&1["type"] == "tool_use" && &1["name"] == "eval_response")) do
-      %{"input" => input} -> normalize_eval(input)
+      %{"input" => input} -> Gizmo.LLM.normalize_eval(input)
       nil -> {:error, :no_eval_response}
     end
   end
 
   defp extract_eval_response(_), do: {:error, :unexpected_response_shape}
-
-  defp normalize_eval(input) do
-    ops =
-      (input["ops"] || [])
-      |> Enum.map(fn op ->
-        case op["op"] do
-          "send" -> {:send, op["mailbox"], op["msg"]}
-          "receive" -> :receive
-          "fork" -> {:fork, op["n"], op["frames"] || []}
-          "join" -> {:join, op["msg"]}
-        end
-      end)
-
-    frames = input["frames"] || []
-    {:ok, %{ops: ops, frames: frames}}
-  end
 end
 
 # -----------------------------------------------------------------------------
@@ -180,20 +303,22 @@ defmodule Gizmo.LLM.OpenAI do
       }
     }
 
-    case Req.post("#{base_url}/chat/completions",
-           headers: [{"authorization", "Bearer #{api_key}"}],
-           json: body,
-           receive_timeout: 120_000
-         ) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        extract_eval_response(body)
+    Gizmo.LLM.Retry.with_retry(fn ->
+      case Req.post("#{base_url}/chat/completions",
+             headers: [{"authorization", "Bearer #{api_key}"}],
+             json: body,
+             receive_timeout: 120_000
+           ) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          extract_eval_response(body)
 
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, {:api_error, status, body}}
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, {:api_error, status, body}}
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end)
   end
 
   defp extract_eval_response(%{"choices" => [%{"message" => message} | _]}) do
@@ -206,26 +331,10 @@ defmodule Gizmo.LLM.OpenAI do
         true -> nil
       end
 
-    if parsed, do: normalize_eval(parsed), else: {:error, :unexpected_response_shape}
+    if parsed, do: Gizmo.LLM.normalize_eval(parsed), else: {:error, :unexpected_response_shape}
   end
 
   defp extract_eval_response(_), do: {:error, :unexpected_response_shape}
-
-  defp normalize_eval(input) do
-    ops =
-      (input["ops"] || [])
-      |> Enum.map(fn op ->
-        case op["op"] do
-          "send" -> {:send, op["mailbox"], op["msg"]}
-          "receive" -> :receive
-          "fork" -> {:fork, op["n"], op["frames"] || []}
-          "join" -> {:join, op["msg"]}
-        end
-      end)
-
-    frames = input["frames"] || []
-    {:ok, %{ops: ops, frames: frames}}
-  end
 end
 
 # -----------------------------------------------------------------------------
@@ -311,6 +420,7 @@ defmodule Gizmo.CLI do
 
   def run_tests do
     IO.puts("=== Gizmo Smoke Test ===\n")
+    failures = []
 
     # 1. Eval tool schema
     IO.puts("--- Eval Tool Schema ---")
@@ -318,16 +428,171 @@ defmodule Gizmo.CLI do
     IO.puts("Properties: #{inspect(Map.keys(Gizmo.LLM.eval_tool().input_schema.properties))}")
     IO.puts("")
 
-    # 2. Interpolation test
+    # 2. Interpolation tests
     IO.puts("--- Interpolation ---")
 
     text = "Hello $1, your project is ${project}. Cost: $$5. Unknown: $99 and ${nope}."
     result = Gizmo.Interpolation.resolve(text, ["world"], %{"project" => "gizmo"})
     IO.puts("Input:  #{text}")
     IO.puts("Output: #{result}")
+    expected = "Hello world, your project is gizmo. Cost: $5. Unknown: $99 and ${nope}."
+    failures = failures ++ assert_eq("basic interpolation", result, expected)
+
+    # Empty args/bindings
+    failures = failures ++ assert_eq(
+      "empty args/bindings",
+      Gizmo.Interpolation.resolve("$1 ${x}", [], %{}),
+      "$1 ${x}"
+    )
+
+    # Dollar escape at end of string
+    failures = failures ++ assert_eq(
+      "dollar escape at end",
+      Gizmo.Interpolation.resolve("price: $$", [], %{}),
+      "price: $"
+    )
+
+    # Nested reference: ${$1} — named resolution leaves ${$1} as-is (no binding
+    # named "$1"), then positional resolves $1 inside the braces, yielding ${key}.
+    # This is a known quirk: positional resolution doesn't respect brace boundaries.
+    failures = failures ++ assert_eq(
+      "nested ${$1} (positional leaks into braces)",
+      Gizmo.Interpolation.resolve("${$1}", ["key"], %{}),
+      "${key}"
+    )
+
     IO.puts("")
 
-    # 3. LLM test (only if API key is set)
+    # 3. Op validation tests
+    IO.puts("--- Op Validation ---")
+
+    # Valid ops
+    good_input = %{
+      "ops" => [
+        %{"op" => "send", "mailbox" => "human", "msg" => "hello"},
+        %{"op" => "receive"},
+        %{"op" => "fork", "n" => 2, "frames" => ["f1", "f2"]},
+        %{"op" => "join", "msg" => "done"}
+      ],
+      "frames" => ["frame1"]
+    }
+    {:ok, good_result} = Gizmo.LLM.normalize_eval(good_input)
+    failures = failures ++ assert_eq("valid ops count", length(good_result.ops), 4)
+    failures = failures ++ assert_eq("valid ops parse", good_result.ops, [
+      {:send, "human", "hello"},
+      :receive,
+      {:fork, 2, ["f1", "f2"]},
+      {:join, "done"}
+    ])
+    IO.puts("  valid ops: OK")
+
+    # send missing mailbox
+    bad_send = %{"ops" => [%{"op" => "send", "msg" => "hi"}], "frames" => []}
+    failures = failures ++ assert_error_op("send missing mailbox", Gizmo.LLM.normalize_eval(bad_send), :invalid_op, "send")
+
+    # send missing msg
+    bad_send2 = %{"ops" => [%{"op" => "send", "mailbox" => "x"}], "frames" => []}
+    failures = failures ++ assert_error_op("send missing msg", Gizmo.LLM.normalize_eval(bad_send2), :invalid_op, "send")
+
+    # fork missing n
+    bad_fork = %{"ops" => [%{"op" => "fork", "frames" => []}], "frames" => []}
+    failures = failures ++ assert_error_op("fork missing n", Gizmo.LLM.normalize_eval(bad_fork), :invalid_op, "fork")
+
+    # fork missing frames
+    bad_fork2 = %{"ops" => [%{"op" => "fork", "n" => 1}], "frames" => []}
+    failures = failures ++ assert_error_op("fork missing frames", Gizmo.LLM.normalize_eval(bad_fork2), :invalid_op, "fork")
+
+    # join missing msg
+    bad_join = %{"ops" => [%{"op" => "join"}], "frames" => []}
+    failures = failures ++ assert_error_op("join missing msg", Gizmo.LLM.normalize_eval(bad_join), :invalid_op, "join")
+
+    # unknown op
+    bad_op = %{"ops" => [%{"op" => "explode"}], "frames" => []}
+    failures = failures ++ assert_eq("unknown op", Gizmo.LLM.normalize_eval(bad_op), {:error, {:unknown_op, "explode"}})
+
+    IO.puts("")
+
+    # 4. Retry logic tests
+    IO.puts("--- Retry Logic ---")
+
+    # Test: fails twice with 429 then succeeds
+    call_count = :counters.new(1, [:atomics])
+    retry_result = Gizmo.LLM.Retry.with_retry(
+      fn ->
+        :counters.add(call_count, 1, 1)
+        c = :counters.get(call_count, 1)
+        if c <= 2, do: {:error, {:api_error, 429, "rate limited"}}, else: {:ok, :success}
+      end,
+      sleep_fn: fn _ms -> :ok end
+    )
+    failures = failures ++ assert_eq("retry succeeds after 429s", retry_result, {:ok, :success})
+    failures = failures ++ assert_eq("retry called 3 times", :counters.get(call_count, 1), 3)
+
+    # Test: non-retryable error passes through immediately
+    call_count2 = :counters.new(1, [:atomics])
+    retry_result2 = Gizmo.LLM.Retry.with_retry(
+      fn ->
+        :counters.add(call_count2, 1, 1)
+        {:error, {:api_error, 401, "unauthorized"}}
+      end,
+      sleep_fn: fn _ms -> :ok end
+    )
+    failures = failures ++ assert_eq("non-retryable passes through", retry_result2, {:error, {:api_error, 401, "unauthorized"}})
+    failures = failures ++ assert_eq("non-retryable called once", :counters.get(call_count2, 1), 1)
+
+    # Test: exhausts retries
+    call_count3 = :counters.new(1, [:atomics])
+    retry_result3 = Gizmo.LLM.Retry.with_retry(
+      fn ->
+        :counters.add(call_count3, 1, 1)
+        {:error, {:api_error, 500, "server error"}}
+      end,
+      sleep_fn: fn _ms -> :ok end
+    )
+    failures = failures ++ assert_eq("exhausts retries", retry_result3, {:error, {:api_error, 500, "server error"}})
+    failures = failures ++ assert_eq("exhausted after 4 calls (1 + 3 retries)", :counters.get(call_count3, 1), 4)
+
+    IO.puts("")
+
+    # 5. Interpolate response tests
+    IO.puts("--- Interpolate Response ---")
+
+    eval_resp = %{
+      ops: [
+        {:send, "human", "Hello $1, status: ${status}"},
+        :receive,
+        {:fork, 2, ["child frame $1"]},
+        {:join, "result: ${result}"}
+      ],
+      frames: ["next frame $1 ${ctx}"]
+    }
+
+    interpolated = Gizmo.LLM.interpolate_response(eval_resp, ["Alice"], %{"status" => "ok", "result" => "42", "ctx" => "main"})
+
+    failures = failures ++ assert_eq("interpolate send msg",
+      Enum.at(interpolated.ops, 0),
+      {:send, "human", "Hello Alice, status: ok"}
+    )
+    failures = failures ++ assert_eq("interpolate receive unchanged",
+      Enum.at(interpolated.ops, 1),
+      :receive
+    )
+    failures = failures ++ assert_eq("interpolate fork frames",
+      Enum.at(interpolated.ops, 2),
+      {:fork, 2, ["child frame Alice"]}
+    )
+    failures = failures ++ assert_eq("interpolate join msg",
+      Enum.at(interpolated.ops, 3),
+      {:join, "result: 42"}
+    )
+    failures = failures ++ assert_eq("interpolate response frames",
+      interpolated.frames,
+      ["next frame Alice main"]
+    )
+
+    IO.puts("")
+
+    # 6. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
@@ -370,7 +635,47 @@ defmodule Gizmo.CLI do
       IO.puts("ANTHROPIC_API_KEY not set, skipping LLM test.")
     end
 
-    IO.puts("\n=== Done ===")
+    IO.puts("")
+
+    # Summary
+    if failures == [] do
+      IO.puts("=== All tests passed ===")
+    else
+      IO.puts("=== #{length(failures)} test(s) FAILED ===")
+      Enum.each(failures, fn msg -> IO.puts("  FAIL: #{msg}") end)
+      System.halt(1)
+    end
+  end
+
+  defp assert_eq(label, actual, expected) do
+    if actual == expected do
+      IO.puts("  #{label}: OK")
+      []
+    else
+      IO.puts("  #{label}: FAIL")
+      IO.puts("    expected: #{inspect(expected)}")
+      IO.puts("    actual:   #{inspect(actual)}")
+      ["#{label}: expected #{inspect(expected)}, got #{inspect(actual)}"]
+    end
+  end
+
+  defp assert_error_op(label, actual, expected_kind, expected_op_name) do
+    matched =
+      case actual do
+        {:error, {^expected_kind, ^expected_op_name, _reason}} -> true
+        {:error, {^expected_kind, ^expected_op_name}} -> true
+        _ -> false
+      end
+
+    if matched do
+      IO.puts("  #{label}: OK")
+      []
+    else
+      IO.puts("  #{label}: FAIL")
+      IO.puts("    expected: {:error, {#{inspect(expected_kind)}, #{inspect(expected_op_name)}, ...}}")
+      IO.puts("    actual:   #{inspect(actual)}")
+      ["#{label}: did not match expected error pattern"]
+    end
   end
 
   def run(path, opts) do
@@ -392,9 +697,11 @@ defmodule Gizmo.CLI do
                boot_frame,
                [%{role: "user", content: "Begin."}]
              ) do
-          {:ok, %{ops: ops, frames: frames}} ->
-            IO.puts("Ops:    #{inspect(ops)}")
-            IO.puts("Frames: #{inspect(frames)}")
+          {:ok, %{ops: _, frames: _} = response} ->
+            # Apply interpolation (empty args/bindings for now — agent will supply real ones)
+            interpolated = Gizmo.LLM.interpolate_response(response, [], %{})
+            IO.puts("Ops:    #{inspect(interpolated.ops)}")
+            IO.puts("Frames: #{inspect(interpolated.frames)}")
 
           {:error, reason} ->
             IO.puts(:stderr, "LLM error: #{inspect(reason)}")
