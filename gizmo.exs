@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–4: Skeleton, LLM Client, Interpolation, Mailbox Router
+# Gizmo — Stages 0–5: Skeleton, LLM Client, Interpolation, Mailbox Router, Services
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -433,6 +433,217 @@ defmodule Gizmo.Mailbox do
   end
 end
 
+# -----------------------------------------------------------------------------
+# Gizmo.Services.ArgsStack — per-agent stack for positional $n interpolation
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.ArgsStack do
+  use GenServer
+
+  def start_link(mailbox_id) do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  def push(pid, value), do: GenServer.call(pid, {:push, value})
+  def pop(pid), do: GenServer.call(pid, :pop)
+  def peek(pid, n), do: GenServer.call(pid, {:peek, n})
+  def to_list(pid), do: GenServer.call(pid, :to_list)
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, stack: []}}
+  end
+
+  @impl true
+  def handle_call({:push, value}, _from, %{stack: stack} = state) do
+    {:reply, :ok, %{state | stack: [value | stack]}}
+  end
+
+  def handle_call(:pop, _from, %{stack: []} = state) do
+    {:reply, {:error, :empty}, state}
+  end
+
+  def handle_call(:pop, _from, %{stack: [top | rest]} = state) do
+    {:reply, {:ok, top}, %{state | stack: rest}}
+  end
+
+  def handle_call({:peek, n}, _from, %{stack: stack} = state) do
+    case Enum.at(stack, n) do
+      nil -> {:reply, {:error, :out_of_range}, state}
+      val -> {:reply, {:ok, val}, state}
+    end
+  end
+
+  def handle_call(:to_list, _from, %{stack: stack} = state) do
+    {:reply, stack, state}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {:push, value}}, %{stack: stack} = state) do
+    {:noreply, %{state | stack: [value | stack]}}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, :pop}, %{stack: [_ | rest]} = state) do
+    {:noreply, %{state | stack: rest}}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, :pop}, %{stack: []} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {:peek, _n}}, state) do
+    {:noreply, state}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.MessagesQueue — per-agent FIFO queue of {content, source}
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.MessagesQueue do
+  use GenServer
+
+  def start_link(mailbox_id) do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  def push(pid, content, source), do: GenServer.call(pid, {:push, content, source})
+  def pop(pid), do: GenServer.call(pid, :pop)
+  def to_list(pid), do: GenServer.call(pid, :to_list)
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, queue: :queue.new()}}
+  end
+
+  @impl true
+  def handle_call({:push, content, source}, _from, %{queue: q} = state) do
+    {:reply, :ok, %{state | queue: :queue.in({content, source}, q)}}
+  end
+
+  def handle_call(:pop, _from, %{queue: q} = state) do
+    case :queue.out(q) do
+      {{:value, item}, q2} -> {:reply, {:ok, item}, %{state | queue: q2}}
+      {:empty, _} -> {:reply, {:error, :empty}, state}
+    end
+  end
+
+  def handle_call(:to_list, _from, %{queue: q} = state) do
+    {:reply, :queue.to_list(q), state}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Blackboard — shared key-value store for ${name} interpolation
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Blackboard do
+  use GenServer
+
+  def start_link(mailbox_id \\ "blackboard") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  def read(pid, key), do: GenServer.call(pid, {:read, key})
+  def write(pid, key, value), do: GenServer.call(pid, {:write, key, value})
+  def keys(pid), do: GenServer.call(pid, :keys)
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, store: %{}}}
+  end
+
+  @impl true
+  def handle_call({:read, key}, _from, %{store: store} = state) do
+    {:reply, Map.get(store, key), state}
+  end
+
+  def handle_call({:write, key, value}, _from, %{store: store} = state) do
+    {:reply, :ok, %{state | store: Map.put(store, key, value)}}
+  end
+
+  def handle_call(:keys, _from, %{store: store} = state) do
+    {:reply, Map.keys(store), state}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:read, key}}}, %{store: store} = state) do
+    value = Map.get(store, key)
+    Gizmo.Mailbox.route(reply_to, value)
+    {:noreply, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:write, key, value}}}, %{store: store} = state) do
+    Gizmo.Mailbox.route(reply_to, :ok)
+    {:noreply, %{state | store: Map.put(store, key, value)}}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Bash — shell command execution (async via mailbox)
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Bash do
+  use GenServer
+
+  def start_link(mailbox_id \\ "bash") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, command}}, state) do
+    Task.start(fn ->
+      try do
+        {stdout, exit_code} = System.cmd("sh", ["-c", command], stderr_to_stdout: false)
+        stderr = ""
+
+        if exit_code == 0 do
+          Gizmo.Mailbox.route(reply_to, {:ok, stdout, stderr})
+        else
+          Gizmo.Mailbox.route(reply_to, {:error, "exit code #{exit_code}: #{stdout}"})
+        end
+      rescue
+        e -> Gizmo.Mailbox.route(reply_to, {:error, Exception.message(e)})
+      end
+    end)
+
+    {:noreply, state}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Human — terminal output (print only for now)
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Human do
+  use GenServer
+
+  def start_link(mailbox_id \\ "human") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {_reply_to, text}}, state) do
+    IO.puts(text)
+    {:noreply, state}
+  end
+end
+
 # =============================================================================
 # Gizmo.CLI — command-line interface
 # =============================================================================
@@ -772,7 +983,83 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 7. LLM test (only if API key is set)
+    # 7. Services tests
+    IO.puts("--- Services ---")
+
+    # Ensure registry is started
+    {:ok, _} = Gizmo.Mailbox.start()
+
+    # ArgsStack
+    {:ok, as_pid} = Gizmo.Services.ArgsStack.start_link(Gizmo.Mailbox.generate_id("args_stack"))
+    :ok = Gizmo.Services.ArgsStack.push(as_pid, "a")
+    :ok = Gizmo.Services.ArgsStack.push(as_pid, "b")
+    :ok = Gizmo.Services.ArgsStack.push(as_pid, "c")
+    failures = failures ++ assert_eq("args_stack peek 0", Gizmo.Services.ArgsStack.peek(as_pid, 0), {:ok, "c"})
+    failures = failures ++ assert_eq("args_stack peek 2", Gizmo.Services.ArgsStack.peek(as_pid, 2), {:ok, "a"})
+    failures = failures ++ assert_eq("args_stack peek out of range", Gizmo.Services.ArgsStack.peek(as_pid, 5), {:error, :out_of_range})
+    {:ok, popped} = Gizmo.Services.ArgsStack.pop(as_pid)
+    failures = failures ++ assert_eq("args_stack pop top", popped, "c")
+    failures = failures ++ assert_eq("args_stack to_list after pop", Gizmo.Services.ArgsStack.to_list(as_pid), ["b", "a"])
+    GenServer.stop(as_pid)
+
+    # MessagesQueue
+    {:ok, mq_pid} = Gizmo.Services.MessagesQueue.start_link(Gizmo.Mailbox.generate_id("msg_queue"))
+    :ok = Gizmo.Services.MessagesQueue.push(mq_pid, "hello", "agent1")
+    :ok = Gizmo.Services.MessagesQueue.push(mq_pid, "world", "agent2")
+    {:ok, first} = Gizmo.Services.MessagesQueue.pop(mq_pid)
+    failures = failures ++ assert_eq("msg_queue FIFO first", first, {"hello", "agent1"})
+    {:ok, second} = Gizmo.Services.MessagesQueue.pop(mq_pid)
+    failures = failures ++ assert_eq("msg_queue FIFO second", second, {"world", "agent2"})
+    failures = failures ++ assert_eq("msg_queue pop empty", Gizmo.Services.MessagesQueue.pop(mq_pid), {:error, :empty})
+    :ok = Gizmo.Services.MessagesQueue.push(mq_pid, "x", "s")
+    failures = failures ++ assert_eq("msg_queue to_list", Gizmo.Services.MessagesQueue.to_list(mq_pid), [{"x", "s"}])
+    GenServer.stop(mq_pid)
+
+    # Blackboard
+    {:ok, bb_pid} = Gizmo.Services.Blackboard.start_link(Gizmo.Mailbox.generate_id("blackboard"))
+    :ok = Gizmo.Services.Blackboard.write(bb_pid, "color", "red")
+    :ok = Gizmo.Services.Blackboard.write(bb_pid, "size", "large")
+    failures = failures ++ assert_eq("blackboard read color", Gizmo.Services.Blackboard.read(bb_pid, "color"), "red")
+    failures = failures ++ assert_eq("blackboard read size", Gizmo.Services.Blackboard.read(bb_pid, "size"), "large")
+    failures = failures ++ assert_eq("blackboard read missing", Gizmo.Services.Blackboard.read(bb_pid, "nope"), nil)
+    bb_keys = Gizmo.Services.Blackboard.keys(bb_pid) |> Enum.sort()
+    failures = failures ++ assert_eq("blackboard keys", bb_keys, ["color", "size"])
+    GenServer.stop(bb_pid)
+
+    # Bash — send command via mailbox, receive result
+    receiver_mb = Gizmo.Mailbox.generate_id("bash_test_receiver")
+    Gizmo.Mailbox.register(receiver_mb)
+    bash_mb = Gizmo.Mailbox.generate_id("bash_svc")
+    {:ok, _bash_pid} = Gizmo.Services.Bash.start_link(bash_mb)
+    Gizmo.Mailbox.route(bash_mb, {receiver_mb, "echo hello"})
+    bash_result =
+      receive do
+        {:mailbox_msg, ^receiver_mb, result} -> result
+      after
+        5_000 -> :timeout
+      end
+    failures = failures ++ case bash_result do
+      {:ok, stdout, _stderr} ->
+        assert_eq("bash echo hello", String.trim(stdout), "hello")
+      other ->
+        assert_eq("bash echo hello", other, {:ok, "hello\n", ""})
+    end
+    Gizmo.Mailbox.unregister(receiver_mb)
+
+    # Human — send a message, verify no crash
+    human_mb = Gizmo.Mailbox.generate_id("human_svc")
+    {:ok, human_pid} = Gizmo.Services.Human.start_link(human_mb)
+    Gizmo.Mailbox.route(human_mb, {"_nobody", "Hello from human service test!"})
+    Process.sleep(50)
+    failures = failures ++ assert_eq("human service alive", Process.alive?(human_pid), true)
+
+    # Verify mailbox registration for all services
+    failures = failures ++ assert_eq("bash mailbox lookup", elem(Gizmo.Mailbox.lookup(bash_mb), 0), :ok)
+    failures = failures ++ assert_eq("human mailbox lookup", elem(Gizmo.Mailbox.lookup(human_mb), 0), :ok)
+
+    IO.puts("")
+
+    # 8. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
