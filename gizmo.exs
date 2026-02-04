@@ -387,13 +387,16 @@ defmodule Gizmo.CLI do
   def main do
     {opts, args, _} =
       OptionParser.parse(System.argv(),
-        strict: [test: :boolean, verbose: :boolean],
+        strict: [test: :boolean, verbose: :boolean, init: :string],
         aliases: [v: :verbose]
       )
 
     cond do
       opts[:test] ->
         run_tests()
+
+      opts[:init] ->
+        init_boot_frame(opts[:init])
 
       args != [] ->
         run(hd(args), verbose: opts[:verbose] || false)
@@ -408,14 +411,79 @@ defmodule Gizmo.CLI do
     Usage: elixir gizmo.exs [options] [boot_frame_file]
 
     Options:
-      --test       Run smoke tests, then exit
-      -v, --verbose  Enable verbose output
+      --test              Run smoke tests, then exit
+      --init <file>       Write a starter boot frame to <file>
+      -v, --verbose       Enable verbose output
 
     Examples:
       elixir gizmo.exs boot.txt          # single eval cycle
       elixir gizmo.exs -v boot.txt       # verbose single eval cycle
       elixir gizmo.exs --test            # smoke tests
+      elixir gizmo.exs --init boot.txt   # create a starter boot frame
     """)
+  end
+
+  defp init_boot_frame(path) do
+    if File.exists?(path) do
+      IO.puts(:stderr, "Error: #{path} already exists. Remove it first or choose a different name.")
+      System.halt(1)
+    end
+
+    File.write!(path, boot_prompt())
+    IO.puts("Wrote starter boot frame to #{path}")
+    IO.puts("Edit the '## Your task' section, then run: elixir gizmo.exs #{path}")
+  end
+
+  def boot_prompt do
+    """
+    You are a process in the Gizmo runtime. You respond exclusively by calling
+    the eval_response tool. Every response MUST be a single eval_response call.
+
+    ## eval_response contract
+
+    The tool takes two fields:
+
+    - ops: a list of syscall operations to execute, in order.
+    - frames: replacement frames for your context stack. These define what you
+      will see as your system prompt on the NEXT eval cycle. An empty array []
+      means this process is finished and should be removed from the stack.
+
+    ## Syscalls
+
+    You have exactly four syscalls, issued via ops:
+
+    - send(mailbox, msg): Send a message to a named mailbox. Non-blocking,
+      fire-and-forget. The mailbox can be any registered service or agent.
+    - receive(): Block until a message arrives in your mailbox. The message
+      content is pushed onto your args stack (accessible as $1, $2, etc.)
+      and your messages queue.
+    - fork(n, frames): Spawn a child process. Pop the top n frames from your
+      stack, push the given frames onto the child's stack. The child's mailbox
+      ID is pushed onto your args stack.
+    - join(msg): Send msg to your parent's mailbox, then terminate.
+
+    ## Interpolation
+
+    In message strings and frames, you can use:
+    - $n — positional arg from the args stack (1-indexed, $1 is most recent)
+    - ${name} — named value from the blackboard key-value store
+    - $$ — literal dollar sign
+
+    ## Well-known mailboxes
+
+    - human: The user's terminal. Send messages here to display text, and
+      receive from here to get user input.
+    - bash: Shell command execution. Send a command string, receive the output.
+    - blackboard: Key-value store. Send {read, key} or {write, key, value}.
+
+    ## Your task
+
+    Replace this section with instructions for what the agent should do.
+    For example:
+
+      You are a one-shot greeter. Send a short hello to the 'human' mailbox,
+      then terminate by returning an empty frames array.
+    """
   end
 
   def run_tests do
