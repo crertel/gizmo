@@ -6,6 +6,86 @@ Mix.install([{:req, "~> 0.5"}])
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# Gizmo.Format — ANSI color helpers for verbose output
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Format do
+  @reset "\e[0m"
+  @dim "\e[2m"
+  @bold "\e[1m"
+  @cyan "\e[36m"
+  @green "\e[32m"
+  @yellow "\e[33m"
+  @magenta "\e[35m"
+  @red "\e[31m"
+  @blue "\e[34m"
+
+  def agent_tag(id), do: "#{@dim}#{@cyan}[#{id}]#{@reset}"
+
+  def cycle_header(id, n_frames, cycle) do
+    frames_label = if n_frames == 1, do: "1 frame", else: "#{n_frames} frames"
+    "#{agent_tag(id)} #{@bold}── cycle #{cycle} ──#{@reset} #{@dim}(#{frames_label})#{@reset}"
+  end
+
+  def args_line(id, args) do
+    if args == [] do
+      "#{agent_tag(id)}   #{@dim}args: (empty)#{@reset}"
+    else
+      formatted = args |> Enum.with_index(1) |> Enum.map(fn {val, i} ->
+        "#{@dim}$#{i}=#{@reset}#{truncate(val, 60)}"
+      end) |> Enum.join("  ")
+      "#{agent_tag(id)}   #{formatted}"
+    end
+  end
+
+  def op_send(id, mailbox, msg) do
+    "#{agent_tag(id)}   #{@green}send#{@reset} #{@bold}#{mailbox}#{@reset} ← #{truncate(msg, 80)}"
+  end
+
+  def op_receive(id, timeout) do
+    "#{agent_tag(id)}   #{@yellow}receive#{@reset} #{@dim}(timeout: #{timeout}ms)#{@reset}"
+  end
+
+  def op_fork(id, n, child_frames) do
+    n_child = length(child_frames)
+    child_label = if n_child == 1, do: "1 frame", else: "#{n_child} frames"
+    "#{agent_tag(id)}   #{@magenta}fork#{@reset} n=#{n}, child gets #{child_label}"
+  end
+
+  def op_join(id, msg, parent) do
+    "#{agent_tag(id)}   #{@blue}join#{@reset} → #{@bold}#{parent}#{@reset} ← #{truncate(msg, 80)}"
+  end
+
+  def frames_line(id, frames) do
+    if frames == [] do
+      "#{agent_tag(id)}   #{@red}frames: [] (will terminate)#{@reset}"
+    else
+      refs = frames |> Enum.with_index() |> Enum.map(fn {f, i} ->
+        "#{@dim}[#{i}]#{@reset} #{truncate(f, 60)}"
+      end) |> Enum.join("\n#{agent_tag(id)}        ")
+      "#{agent_tag(id)}   #{@dim}frames:#{@reset} #{refs}"
+    end
+  end
+
+  def error_line(id, reason, retries, max) do
+    "#{agent_tag(id)} #{@red}#{@bold}error:#{@reset} #{inspect(reason)} #{@dim}(retry #{retries}/#{max})#{@reset}"
+  end
+
+  def separator(id) do
+    "#{agent_tag(id)} #{@dim}────────────────────────────────#{@reset}"
+  end
+
+  defp truncate(s, max) do
+    s = String.replace(s, "\n", "\\n")
+    if String.length(s) > max do
+      String.slice(s, 0, max) <> "#{@dim}…#{@reset}"
+    else
+      s
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.LLM — behaviour for LLM chat clients
 # -----------------------------------------------------------------------------
 
@@ -787,6 +867,112 @@ end
 defmodule Gizmo.Agent do
   @default_receive_timeout 30_000
 
+  @doc "Runtime preamble appended to every agent's system prompt."
+  def runtime_prompt do
+    """
+    ---
+
+    # Gizmo Runtime
+
+    You are a process in the Gizmo runtime. You respond exclusively by calling
+    the eval_response tool. Every response MUST be a single eval_response call.
+
+    ## eval_response contract
+
+    The tool takes two fields:
+
+    - ops: a list of syscall operations to execute, in order.
+    - frames: replacement frames for your context stack. These define what you
+      will see as your system prompt on the NEXT eval cycle. An empty array []
+      means this process is finished and should be removed from the stack.
+
+    ## Syscalls
+
+    You have exactly four syscalls, issued via ops:
+
+    - send(mailbox, msg): Send a message to a named mailbox. Non-blocking,
+      fire-and-forget. The mailbox can be any registered service or agent.
+    - receive(): Block until a message arrives in your mailbox. The message
+      content is pushed onto your args stack (accessible as $1, $2, etc.)
+      and your messages queue.
+    - fork(n, frames): Spawn a child process. Pop the top n frames from your
+      stack, push the given frames onto the child's stack. The child's mailbox
+      ID is pushed onto your args stack.
+    - join(msg): Send msg to your parent's mailbox, then terminate.
+
+    Only include the ops you actually need. Do NOT include ops you don't use.
+
+    ## Interpolation
+
+    In message strings and frames, you can use:
+    - $n — positional arg from the args stack (1-indexed, $1 is most recent)
+    - ${name} — named value from the blackboard key-value store
+    - $$ — literal dollar sign
+    - @N — inject frame N (0-indexed) from your current context stack verbatim
+    - @name — inject the contents of a named section (see below)
+    - @@ — literal @ sign
+
+    You can define named sections in your frames using:
+      @@section-name
+      content here
+      @@end
+
+    Section content injected via @name is quoted verbatim (no $n interpolation
+    is applied to the injected text).
+
+    ## Well-known mailboxes
+
+    - human: The user's terminal. Send messages here to display text.
+    - human_input: Send a prompt string here, then receive to get the user's
+      typed input. The user's typed line is pushed onto your args stack as $1.
+    - bash: Shell command execution. Send a command string, receive the output.
+      The output is pushed onto your args stack as $1.
+    - blackboard: Key-value store. Send {read, key} or {write, key, value},
+      then receive the result. Read returns the value as $1. Write returns "ok".
+
+    ## Important timing rule
+
+    Interpolation ($1, @name, etc.) is resolved BEFORE ops execute. If you
+    issue a receive and then a send with $1 in the same cycle, $1 refers to
+    the PREVIOUS args stack value, not what you just received. To use a
+    received value, return a continuation frame and use $1 on the next cycle.
+
+    ## Writing good continuation frames
+
+    Your context stack is replaced every cycle. You have NO memory of previous
+    cycles — only what is written in your current frames. Follow these rules:
+
+    1. USE NAMED SECTIONS for multi-step workflows. If your boot prompt defines
+       @@step2, @@step3, etc., return frames: ["@step2"] to advance to the next
+       step. The runtime persists sections across cycles, so @step2 will resolve
+       even after the boot frame is replaced. This is far more reliable than
+       writing new frame text from scratch.
+
+    2. NEVER write frame text that contains @name or @@section markers. If you
+       write "@worker" or "@@step2" literally in a frame string, it will be
+       interpolated by the runtime and produce unexpected results. Only use
+       @name references as standalone frame entries like ["@step2"].
+
+    3. DO NOT pair every send with a receive. Only issue a receive when you
+       actually need to wait for a response. Sending to 'human' is fire-and-
+       forget — no receive needed. Sending to 'bash' or 'blackboard' requires
+       a receive to get the result. Sending to 'human_input' requires a
+       receive to get the user's typed input.
+
+    4. ONLY issue ops you need THIS cycle. Do not pre-issue ops for future
+       steps. Each cycle should do one logical step, then hand off to the next
+       frame.
+
+    5. If you must write a continuation frame (no named section available),
+       write a COMPLETE prompt. Bad: "step2". Good: "You received the bash
+       output in $1. Send 'Result: $1' to 'human', then terminate with empty
+       frames []."
+
+    6. When terminating (frames: []), do NOT issue a receive. Just send any
+       final messages and return empty frames.
+    """
+  end
+
   @doc """
   Spawn a linked agent process. Returns {:ok, mailbox_id}.
 
@@ -865,27 +1051,32 @@ defmodule Gizmo.Agent do
   @max_eval_cycles 50
 
   defp eval_loop([], _state), do: :ok
-  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0)
+  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{})
 
-  defp eval_loop([], _state, _retries, _cycles), do: :ok
+  defp eval_loop([], _state, _retries, _cycles, _persisted_sections), do: :ok
 
-  defp eval_loop(_context_stack, state, _retries, cycles) when cycles >= @max_eval_cycles do
+  defp eval_loop(_context_stack, state, _retries, cycles, _persisted_sections) when cycles >= @max_eval_cycles do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{@max_eval_cycles}) reached, terminating")
   end
 
-  defp eval_loop(_context_stack, state, retries, _cycles) when retries >= @max_eval_retries do
+  defp eval_loop(_context_stack, state, retries, _cycles, _persisted_sections) when retries >= @max_eval_retries do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
   end
 
-  defp eval_loop(context_stack, state, retries, cycles) do
-    system_prompt = Enum.join(context_stack, "\n\n---\n\n")
+  defp eval_loop(context_stack, state, retries, cycles, persisted_sections) do
+    system_prompt = runtime_prompt() <> "\n\n---\n\n" <> Enum.join(context_stack, "\n\n---\n\n")
     args = Gizmo.Services.ArgsStack.to_list(state.args_stack)
     bindings = %{}
-    sections = Gizmo.Interpolation.extract_sections(context_stack)
+    # Merge: current frame sections override persisted, but old ones survive
+    current_sections = Gizmo.Interpolation.extract_sections(context_stack)
+    sections = Map.merge(persisted_sections, current_sections)
+
+    id = state.mailbox_id
 
     if state.verbose do
-      IO.puts("[agent:#{state.mailbox_id}] eval cycle, #{length(context_stack)} frame(s)")
-      IO.puts("[agent:#{state.mailbox_id}] args: #{inspect(args)}")
+      IO.puts(Gizmo.Format.separator(id))
+      IO.puts(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
+      IO.puts(Gizmo.Format.args_line(id, args))
     end
 
     case state.chat_fn.(system_prompt, [%{role: "user", content: "Begin."}], []) do
@@ -893,8 +1084,15 @@ defmodule Gizmo.Agent do
         interpolated = Gizmo.LLM.interpolate_response(response, args, bindings, sections)
 
         if state.verbose do
-          IO.puts("[agent:#{state.mailbox_id}] ops: #{inspect(interpolated.ops)}")
-          IO.puts("[agent:#{state.mailbox_id}] frames: #{inspect(interpolated.frames)}")
+          for op <- interpolated.ops do
+            case op do
+              {:send, mb, msg} -> IO.puts(Gizmo.Format.op_send(id, mb, msg))
+              :receive -> IO.puts(Gizmo.Format.op_receive(id, state.receive_timeout))
+              {:fork, n, cf} -> IO.puts(Gizmo.Format.op_fork(id, n, cf))
+              {:join, msg} -> IO.puts(Gizmo.Format.op_join(id, msg, state.parent))
+            end
+          end
+          IO.puts(Gizmo.Format.frames_line(id, interpolated.frames))
         end
 
         # Execute ops — may modify context_stack via fork
@@ -902,12 +1100,12 @@ defmodule Gizmo.Agent do
 
         case remaining_stack do
           :exit -> :ok
-          new_stack -> eval_loop(new_stack, state, 0, cycles + 1)
+          new_stack -> eval_loop(new_stack, state, 0, cycles + 1, sections)
         end
 
       {:error, reason} ->
-        IO.puts(:stderr, "[agent:#{state.mailbox_id}] LLM error: #{inspect(reason)}, retrying (#{retries + 1}/#{@max_eval_retries})...")
-        eval_loop(context_stack, state, retries + 1, cycles + 1)
+        IO.puts(:stderr, Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
+        eval_loop(context_stack, state, retries + 1, cycles + 1, sections)
     end
   end
 
@@ -921,19 +1119,11 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_op({:send, mailbox, msg}, frames, state) do
-    if state.verbose do
-      IO.puts("[agent:#{state.mailbox_id}] send #{mailbox}: #{inspect(msg)}")
-    end
-
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
     {:cont, frames}
   end
 
   defp execute_op(:receive, frames, state) do
-    if state.verbose do
-      IO.puts("[agent:#{state.mailbox_id}] receive (timeout: #{state.receive_timeout}ms)")
-    end
-
     receive do
       {:mailbox_msg, _to, {from_mb, message}} ->
         Gizmo.Services.ArgsStack.push(state.args_stack, message)
@@ -947,10 +1137,6 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_op({:fork, n, child_frames}, frames, state) do
-    if state.verbose do
-      IO.puts("[agent:#{state.mailbox_id}] fork n=#{n}, child_frames=#{inspect(child_frames)}")
-    end
-
     # Pop n frames from top of current stack (top = beginning of list)
     _popped = Enum.take(frames, n)
     remaining_frames = Enum.drop(frames, n)
@@ -967,10 +1153,6 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_op({:join, msg}, _frames, state) do
-    if state.verbose do
-      IO.puts("[agent:#{state.mailbox_id}] join: #{inspect(msg)} -> #{state.parent}")
-    end
-
     if state.parent do
       Gizmo.Mailbox.route(state.parent, {state.mailbox_id, msg})
     end
@@ -1037,57 +1219,6 @@ defmodule Gizmo.CLI do
 
   def boot_prompt do
     """
-    You are a process in the Gizmo runtime. You respond exclusively by calling
-    the eval_response tool. Every response MUST be a single eval_response call.
-
-    ## eval_response contract
-
-    The tool takes two fields:
-
-    - ops: a list of syscall operations to execute, in order.
-    - frames: replacement frames for your context stack. These define what you
-      will see as your system prompt on the NEXT eval cycle. An empty array []
-      means this process is finished and should be removed from the stack.
-
-    ## Syscalls
-
-    You have exactly four syscalls, issued via ops:
-
-    - send(mailbox, msg): Send a message to a named mailbox. Non-blocking,
-      fire-and-forget. The mailbox can be any registered service or agent.
-    - receive(): Block until a message arrives in your mailbox. The message
-      content is pushed onto your args stack (accessible as $1, $2, etc.)
-      and your messages queue.
-    - fork(n, frames): Spawn a child process. Pop the top n frames from your
-      stack, push the given frames onto the child's stack. The child's mailbox
-      ID is pushed onto your args stack.
-    - join(msg): Send msg to your parent's mailbox, then terminate.
-
-    ## Interpolation
-
-    In message strings and frames, you can use:
-    - $n — positional arg from the args stack (1-indexed, $1 is most recent)
-    - ${name} — named value from the blackboard key-value store
-    - $$ — literal dollar sign
-    - @N — inject frame N (0-indexed) from your current context stack verbatim
-    - @name — inject the contents of a named section (see below)
-    - @@ — literal @ sign
-
-    You can define named sections in your frames using:
-      @@section-name
-      content here
-      @@end
-
-    Section content injected via @name is quoted verbatim (no $n interpolation
-    is applied to the injected text).
-
-    ## Well-known mailboxes
-
-    - human: The user's terminal. Send messages here to display text.
-    - human_input: Send a prompt string here, then receive to get the user's typed input.
-    - bash: Shell command execution. Send a command string, receive the output.
-    - blackboard: Key-value store. Send {read, key} or {write, key, value}.
-
     ## Your task
 
     Replace this section with instructions for what the agent should do.
@@ -1095,6 +1226,9 @@ defmodule Gizmo.CLI do
 
       You are a one-shot greeter. Send a short hello to the 'human' mailbox,
       then terminate by returning an empty frames array.
+
+    The Gizmo runtime reference (syscalls, interpolation, mailboxes) is
+    appended automatically below your frame — you don't need to include it.
     """
   end
 
@@ -1630,7 +1764,7 @@ defmodule Gizmo.CLI do
 
     concat_result = Agent.get(concat_agent, & &1)
     failures = failures ++ assert_eq("multi-frame concat",
-      concat_result, "frame A\n\n---\n\nframe B")
+      String.contains?(concat_result, "frame A\n\n---\n\nframe B"), true)
     Agent.stop(concat_agent)
 
     IO.puts("")
