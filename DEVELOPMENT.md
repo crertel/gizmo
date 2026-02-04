@@ -4,39 +4,41 @@
 
 Set up the single-file script and basic infrastructure.
 
-- [ ] Create `gizmo.exs` with `Mix.install([{:req, "~> 0.5"}])` at the top
-- [ ] Verify `:json.encode/1` and `:json.decode/1` work (Erlang/OTP 28 built-in)
-- [ ] Configure API key management (read `ANTHROPIC_API_KEY` from env)
-- [ ] Verify nix devshell runs `elixir gizmo.exs` cleanly
+- [x] Create `gizmo.exs` with `Mix.install([{:req, "~> 0.5"}])` at the top
+- [x] Configure API key management (read `ANTHROPIC_API_KEY` from env)
+- [x] Verify nix devshell runs `elixir gizmo.exs` cleanly
 
 ## Stage 1: LLM Client
 
-Get a working call to Claude and back.
+Get a working call to Claude and back, returning structured JSON.
 
-- [ ] Module wrapping the Claude Messages API using Req
-- [ ] JSON encoding/decoding via `:json` (Erlang built-in)
-- [ ] Send a system prompt + user message, get a text response
+- [x] `Gizmo.LLM` behaviour with `eval_tool` schema (ops + frames)
+- [x] `Gizmo.LLM.Anthropic` — Claude Messages API via Req, forced tool_use
+- [x] `Gizmo.LLM.OpenAI` — OpenAI-compatible client via structured outputs (json_schema)
+- [x] JSON encoding/decoding via Req (`:json` option)
+- [x] Both clients normalize response to `{:ok, %{ops: [...], frames: [...]}}` tuples
 - [ ] Handle API errors, rate limits, retries
 - [ ] Streaming support (optional, can defer)
 
-## Stage 2: Parser
+## Stage 2: Structured Output (replaces text Parser)
 
-Parse `<ops>` and `<frames>` blocks from raw LLM text output.
+The LLM returns structured JSON via a forced tool call (`eval_response`),
+eliminating the need for a text parser. The `eval_response` tool schema
+defines the ops array and frames array directly.
 
-- [ ] Extract `<ops>...</ops>` block, return list of op structs
-- [ ] Parse op syntax: `send(mailbox, msg)`, `receive()`, `fork(n, [frames])`, `join(msg)`
-- [ ] Extract `<frames>...</frames>` block, split on `---`
-- [ ] Handle missing blocks (no ops, no frames, both, neither)
-- [ ] Handle malformed output (for error/retry path)
-- [ ] Unit tests with representative LLM output samples
+- [x] `eval_response` tool schema with ops (send/receive/fork/join) and frames
+- [x] Anthropic: forced via `tool_choice: {type: "tool", name: "eval_response"}`
+- [x] OpenAI: forced via `response_format: {type: "json_schema", ...}`
+- [x] Normalized to Elixir tuples: `{:send, mailbox, msg}`, `:receive`, etc.
+- [ ] Validation of op fields (e.g. send requires mailbox + msg)
 
 ## Stage 3: Interpolation
 
 Resolve `$n` and `${name}` references in text.
 
-- [ ] `$n` positional resolution against an args list
-- [ ] `${name}` named resolution against a key-value map
-- [ ] Escaping (`$$` for literal `$`)
+- [x] `$n` positional resolution against an args list
+- [x] `${name}` named resolution against a key-value map
+- [x] Escaping (`$$` for literal `$`)
 - [ ] Apply interpolation to frame text and message content
 - [ ] Unit tests
 

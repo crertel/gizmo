@@ -31,7 +31,7 @@ interaction—is built on top as mailbox-backed services.
 │  eval loop:                 │
 │    pop top frame            │
 │    concat remaining → LLM   │
-│    parse <ops> + <frames>   │
+│    LLM → {ops, frames}     │
 │    execute ops              │
 │    push replacement frames  │
 │    repeat                   │
@@ -72,7 +72,7 @@ These are ordinary processes registered at boot. They are not syscalls.
 1. Pop top frame from context stack
 2. Concatenate remaining stack bottom-up (boot frame first)
 3. Call LLM: remaining stack = prefix, popped frame = final input
-4. Parse response for <ops> and <frames> blocks
+4. LLM returns structured {ops, frames} via eval_response tool
 5. Execute ops sequentially
 6. Push replacement frames (last listed = top of stack)
 7. If only boot frame remains → boot frame self-replaces (idle)
@@ -86,23 +86,35 @@ The stack is **self-reducing**:
 
 ## LLM Output Format
 
-The LLM emits `<ops>` and `<frames>` blocks. Prose outside these blocks is
-logged or forwarded to human.
+The LLM returns structured JSON via a forced tool call (`eval_response`).
+The response contains two arrays: `ops` (syscalls to execute) and `frames`
+(replacement frames for the context stack).
 
+```json
+{
+  "ops": [
+    {"op": "send", "mailbox": "human", "msg": "I'll check the files."},
+    {"op": "send", "mailbox": "bash", "msg": "ls -la"},
+    {"op": "receive"}
+  ],
+  "frames": [
+    "Process the directory listing."
+  ]
+}
 ```
-I need to check the files.
 
-<ops>
-send(bash, "ls -la")
-receive()
-</ops>
+Each op is an object with an `"op"` field and syscall-specific parameters:
 
-<frames>
-Process the directory listing.
-</frames>
-```
+| Op | Fields | Example |
+|----|--------|---------|
+| `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
+| `receive` | _(none)_ | `{"op": "receive"}` |
+| `fork` | `n`, `frames` | `{"op": "fork", "n": 1, "frames": ["child task"]}` |
+| `join` | `msg` | `{"op": "join", "msg": "result"}` |
 
-Frames are separated by `---`. No JSON tool calling—ops are native text.
+The schema is enforced by the LLM provider (Anthropic tool_use with forced
+tool_choice, OpenAI structured outputs with json_schema). This eliminates
+parsing ambiguity and the need for a text parser.
 
 ## Interpolation
 
@@ -113,12 +125,13 @@ Frames are separated by `---`. No JSON tool calling—ops are native text.
 ## Error Handling
 
 ```
-parse failure → retry (x2) → exception mailbox → next frame tries → ... → supervisor
+schema violation → retry (x2) → exception mailbox → next frame tries → ... → supervisor
 ```
 
-Three retries for unparseable LLM output. After that, the malformed output
-goes to an exception mailbox. Subsequent frames inherit exception context and
-can attempt recovery. Unrecoverable errors escalate to the supervisor.
+Three retries for invalid LLM output (schema violation, API error). After
+that, the error goes to an exception mailbox. Subsequent frames inherit
+exception context and can attempt recovery. Unrecoverable errors escalate to
+the supervisor.
 
 ## Supervision Tree
 
@@ -177,7 +190,7 @@ preloaded services and instructions.
 - **Language:** Elixir 1.19 / Erlang/OTP 28
 - **Packaging:** Single `gizmo.exs` script file, run with `elixir gizmo.exs`
 - **Dependencies:** `Req` (installed via `Mix.install/2` at script top)
-- **JSON:** Erlang/OTP built-in `:json` module (no external JSON library)
+- **JSON:** Req handles JSON encoding/decoding; Erlang `:json` for edge cases
 - **Process model:** OTP GenServer per agent, DynamicSupervisor for fork
 - **Message routing:** Elixir Registry
 - **LLM backend:** Claude API via Req
