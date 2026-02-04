@@ -1,3 +1,4 @@
+#!/usr/bin/env elixir
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
@@ -270,44 +271,123 @@ defmodule Gizmo.Interpolation do
 end
 
 # =============================================================================
-# Smoke test
+# Gizmo.CLI — command-line interface
 # =============================================================================
 
-IO.puts("=== Gizmo Smoke Test ===\n")
+defmodule Gizmo.CLI do
+  def main do
+    {opts, args, _} =
+      OptionParser.parse(System.argv(),
+        strict: [test: :boolean, verbose: :boolean],
+        aliases: [v: :verbose]
+      )
 
-# 1. Eval tool schema
-IO.puts("--- Eval Tool Schema ---")
-IO.puts("Tool name: #{Gizmo.LLM.eval_tool().name}")
-IO.puts("Properties: #{inspect(Map.keys(Gizmo.LLM.eval_tool().input_schema.properties))}")
-IO.puts("")
+    cond do
+      opts[:test] ->
+        run_tests()
 
-# 2. Interpolation test
-IO.puts("--- Interpolation ---")
+      args != [] ->
+        run(hd(args), verbose: opts[:verbose] || false)
 
-text = "Hello $1, your project is ${project}. Cost: $$5. Unknown: $99 and ${nope}."
-result = Gizmo.Interpolation.resolve(text, ["world"], %{"project" => "gizmo"})
-IO.puts("Input:  #{text}")
-IO.puts("Output: #{result}")
-IO.puts("")
-
-# 3. LLM test (only if API key is set)
-IO.puts("--- LLM (Anthropic) ---")
-
-if System.get_env("ANTHROPIC_API_KEY") do
-  case Gizmo.LLM.Anthropic.chat(
-         "You are a helpful assistant. Respond using the eval_response tool. " <>
-           "Put any commentary in a send to the 'human' mailbox.",
-         [%{role: "user", content: "Say hello and check what files are in the current directory."}]
-       ) do
-    {:ok, %{ops: ops, frames: frames}} ->
-      IO.puts("Ops:    #{inspect(ops)}")
-      IO.puts("Frames: #{inspect(frames)}")
-
-    {:error, reason} ->
-      IO.puts("Error: #{inspect(reason)}")
+      true ->
+        usage()
+    end
   end
-else
-  IO.puts("ANTHROPIC_API_KEY not set, skipping LLM test.")
+
+  defp usage do
+    IO.puts("""
+    Usage: elixir gizmo.exs [options] [boot_frame_file]
+
+    Options:
+      --test       Run smoke tests, then exit
+      -v, --verbose  Enable verbose output
+
+    Examples:
+      elixir gizmo.exs boot.txt          # single eval cycle
+      elixir gizmo.exs -v boot.txt       # verbose single eval cycle
+      elixir gizmo.exs --test            # smoke tests
+    """)
+  end
+
+  def run_tests do
+    IO.puts("=== Gizmo Smoke Test ===\n")
+
+    # 1. Eval tool schema
+    IO.puts("--- Eval Tool Schema ---")
+    IO.puts("Tool name: #{Gizmo.LLM.eval_tool().name}")
+    IO.puts("Properties: #{inspect(Map.keys(Gizmo.LLM.eval_tool().input_schema.properties))}")
+    IO.puts("")
+
+    # 2. Interpolation test
+    IO.puts("--- Interpolation ---")
+
+    text = "Hello $1, your project is ${project}. Cost: $$5. Unknown: $99 and ${nope}."
+    result = Gizmo.Interpolation.resolve(text, ["world"], %{"project" => "gizmo"})
+    IO.puts("Input:  #{text}")
+    IO.puts("Output: #{result}")
+    IO.puts("")
+
+    # 3. LLM test (only if API key is set)
+    IO.puts("--- LLM (Anthropic) ---")
+
+    if System.get_env("ANTHROPIC_API_KEY") do
+      case Gizmo.LLM.Anthropic.chat(
+             "You are a helpful assistant. Respond using the eval_response tool. " <>
+               "Put any commentary in a send to the 'human' mailbox.",
+             [
+               %{
+                 role: "user",
+                 content: "Say hello and check what files are in the current directory."
+               }
+             ]
+           ) do
+        {:ok, %{ops: ops, frames: frames}} ->
+          IO.puts("Ops:    #{inspect(ops)}")
+          IO.puts("Frames: #{inspect(frames)}")
+
+        {:error, reason} ->
+          IO.puts("Error: #{inspect(reason)}")
+      end
+    else
+      IO.puts("ANTHROPIC_API_KEY not set, skipping LLM test.")
+    end
+
+    IO.puts("\n=== Done ===")
+  end
+
+  def run(path, opts) do
+    verbose = opts[:verbose]
+
+    if verbose, do: IO.puts("Loading boot frame from #{path}...")
+
+    case File.read(path) do
+      {:ok, boot_frame} ->
+        if verbose do
+          IO.puts("Boot frame content:")
+          IO.puts(boot_frame)
+          IO.puts("")
+        end
+
+        if verbose, do: IO.puts("Calling LLM...")
+
+        case Gizmo.LLM.Anthropic.chat(
+               boot_frame,
+               [%{role: "user", content: "Begin."}]
+             ) do
+          {:ok, %{ops: ops, frames: frames}} ->
+            IO.puts("Ops:    #{inspect(ops)}")
+            IO.puts("Frames: #{inspect(frames)}")
+
+          {:error, reason} ->
+            IO.puts(:stderr, "LLM error: #{inspect(reason)}")
+            System.halt(1)
+        end
+
+      {:error, reason} ->
+        IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
+        System.halt(1)
+    end
+  end
 end
 
-IO.puts("\n=== Done ===")
+Gizmo.CLI.main()
