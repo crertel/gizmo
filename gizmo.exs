@@ -83,13 +83,13 @@ end
 defmodule Gizmo.LLM.Anthropic do
   @behaviour Gizmo.LLM
 
-  @default_model "claude-haiku-3-5-20241022"
+  @default_model "claude-3-5-haiku-20241022"
   @api_url "https://api.anthropic.com/v1/messages"
 
   @impl true
   def chat(system, messages, opts \\ []) do
     api_key = System.get_env("ANTHROPIC_API_KEY") || raise "ANTHROPIC_API_KEY not set"
-    model = Keyword.get(opts, :model, @default_model)
+    model = Keyword.get(opts, :model, System.get_env("ANTHROPIC_MODEL") || @default_model)
     max_tokens = Keyword.get(opts, :max_tokens, 4096)
 
     body = %{
@@ -159,7 +159,7 @@ defmodule Gizmo.LLM.OpenAI do
   def chat(system, messages, opts \\ []) do
     api_key = System.get_env("OPENAI_API_KEY") || raise "OPENAI_API_KEY not set"
     base_url = System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1"
-    model = Keyword.get(opts, :model, @default_model)
+    model = Keyword.get(opts, :model, System.get_env("OPENAI_MODEL") || @default_model)
     max_tokens = Keyword.get(opts, :max_tokens, 4096)
 
     eval_schema = Gizmo.LLM.eval_tool().input_schema
@@ -331,15 +331,33 @@ defmodule Gizmo.CLI do
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
+      smoke_system = """
+      You are a process in the Gizmo runtime. You respond exclusively by calling
+      the eval_response tool. Every response MUST be a single eval_response call.
+
+      ## eval_response contract
+
+      The tool takes two fields:
+
+      - ops: a list of syscall operations to execute, in order. Available ops:
+        - send(mailbox, msg): send a message to a named mailbox
+        - receive: block until a message arrives
+        - fork(n, frames): spawn a child process with the given frames
+        - join(msg): terminate and send msg to parent
+
+      - frames: replacement frames for your context stack. These define what you
+        will see as your system prompt on the NEXT eval cycle. An empty array []
+        means this process is finished and should be removed from the stack.
+
+      ## Your task
+
+      You are a one-shot greeter. Send a short hello to the 'human' mailbox,
+      then terminate by returning an empty frames array.
+      """
+
       case Gizmo.LLM.Anthropic.chat(
-             "You are a helpful assistant. Respond using the eval_response tool. " <>
-               "Put any commentary in a send to the 'human' mailbox.",
-             [
-               %{
-                 role: "user",
-                 content: "Say hello and check what files are in the current directory."
-               }
-             ]
+             smoke_system,
+             [%{role: "user", content: "Begin."}]
            ) do
         {:ok, %{ops: ops, frames: frames}} ->
           IO.puts("Ops:    #{inspect(ops)}")
