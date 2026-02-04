@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–5: Skeleton, LLM Client, Interpolation, Mailbox Router, Services
+# Gizmo — Stages 0–7: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -149,23 +149,23 @@ defmodule Gizmo.LLM do
 
   @doc """
   Apply interpolation to an eval_response's frames and op message strings.
-  Takes an eval_response, args list, and bindings map.
+  Takes an eval_response, args list, bindings map, and optional sections map.
   """
-  def interpolate_response(%{ops: ops, frames: frames}, args, bindings) do
+  def interpolate_response(%{ops: ops, frames: frames}, args, bindings, sections \\ %{}) do
     interpolated_frames =
-      Enum.map(frames, &Gizmo.Interpolation.resolve(&1, args, bindings))
+      Enum.map(frames, &Gizmo.Interpolation.resolve(&1, args, bindings, sections))
 
     interpolated_ops =
       Enum.map(ops, fn
         {:send, mailbox, msg} ->
-          {:send, mailbox, Gizmo.Interpolation.resolve(msg, args, bindings)}
+          {:send, mailbox, Gizmo.Interpolation.resolve(msg, args, bindings, sections)}
 
         {:join, msg} ->
-          {:join, Gizmo.Interpolation.resolve(msg, args, bindings)}
+          {:join, Gizmo.Interpolation.resolve(msg, args, bindings, sections)}
 
         {:fork, n, fork_frames} ->
           {:fork, n,
-           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, args, bindings))}
+           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, args, bindings, sections))}
 
         other ->
           other
@@ -220,14 +220,15 @@ end
 defmodule Gizmo.LLM.Anthropic do
   @behaviour Gizmo.LLM
 
-  @default_model "claude-3-5-haiku-20241022"
+  @default_model "claude-sonnet-4-20250514"
   @api_url "https://api.anthropic.com/v1/messages"
 
   @impl true
   def chat(system, messages, opts \\ []) do
     api_key = System.get_env("ANTHROPIC_API_KEY") || raise "ANTHROPIC_API_KEY not set"
     model = Keyword.get(opts, :model, System.get_env("ANTHROPIC_MODEL") || @default_model)
-    max_tokens = Keyword.get(opts, :max_tokens, 4096)
+    thinking = Keyword.get(opts, :thinking, false)
+    max_tokens = Keyword.get(opts, :max_tokens, if(thinking, do: 16_000, else: 4096))
 
     body = %{
       model: model,
@@ -235,8 +236,15 @@ defmodule Gizmo.LLM.Anthropic do
       system: system,
       messages: messages,
       tools: [Gizmo.LLM.eval_tool()],
-      tool_choice: %{type: "tool", name: "eval_response"}
+      tool_choice: if(thinking, do: %{type: "any"}, else: %{type: "tool", name: "eval_response"})
     }
+
+    body = if thinking do
+      budget = Keyword.get(opts, :thinking_budget, 10_000)
+      Map.put(body, :thinking, %{type: "enabled", budget_tokens: budget})
+    else
+      body
+    end
 
     Gizmo.LLM.Retry.with_retry(fn ->
       case Req.post(@api_url,
@@ -342,16 +350,71 @@ end
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Interpolation do
+  @at_sentinel "\x00AT\x00"
+  @dollar_sentinel "\x00DOLLAR\x00"
+
   @doc """
-  Resolve `$n` (1-indexed from bottom of args), `${name}` (from bindings map),
-  and `$$` (literal `$`) in text. Unresolved references are left as-is.
+  Extract a sections map from a list of context stack frames.
+  Returns a map with:
+    - "0" => full text of frame 0, "1" => full text of frame 1, ...
+    - "section-name" => content between @@section-name and @@end (first match wins)
   """
-  def resolve(text, args \\ [], bindings \\ %{}) do
+  def extract_sections(frames) do
+    # Numbered frame references
+    numbered =
+      frames
+      |> Enum.with_index()
+      |> Enum.into(%{}, fn {frame, idx} -> {Integer.to_string(idx), frame} end)
+
+    # Named sections: scan frames in order, first match wins
+    named =
+      Enum.reduce(frames, %{}, fn frame, acc ->
+        Regex.scan(~r/^@@([a-zA-Z0-9_-]+)\s*\n(.*?)\n@@end/ms, frame)
+        |> Enum.reduce(acc, fn [_full, name, content], inner_acc ->
+          Map.put_new(inner_acc, name, content)
+        end)
+      end)
+
+    Map.merge(named, numbered)
+  end
+
+  @doc """
+  Resolve `@N`/`@name` (from sections), `$n` (positional args), `${name}`
+  (from bindings), `@@` (literal @), and `$$` (literal $) in text.
+  Unresolved references are left as-is.
+
+  Resolution order:
+  1. Escape @@ → sentinel
+  2. Escape $$ → sentinel
+  3. Resolve @name/@N from sections (injected content has $ escaped)
+  4. Resolve ${name} from bindings
+  5. Resolve $n from args
+  6. Restore sentinels
+  """
+  def resolve(text, args \\ [], bindings \\ %{}, sections \\ %{}) do
     text
-    |> String.replace("$$", "\x00DOLLAR\x00")
+    |> String.replace("@@", @at_sentinel)
+    |> String.replace("$$", @dollar_sentinel)
+    |> resolve_sections(sections)
     |> resolve_named(bindings)
     |> resolve_positional(args)
-    |> String.replace("\x00DOLLAR\x00", "$")
+    |> String.replace(@at_sentinel, "@")
+    |> String.replace(@dollar_sentinel, "$")
+  end
+
+  defp resolve_sections(text, sections) when map_size(sections) == 0, do: text
+
+  defp resolve_sections(text, sections) do
+    Regex.replace(~r/@([a-zA-Z0-9_-]+)/, text, fn full_match, name ->
+      case Map.fetch(sections, name) do
+        {:ok, val} ->
+          # Quote any $ in injected content so it survives as literal
+          String.replace(to_string(val), "$", @dollar_sentinel)
+
+        :error ->
+          full_match
+      end
+    end)
   end
 
   defp resolve_named(text, bindings) do
@@ -571,14 +634,60 @@ defmodule Gizmo.Services.Blackboard do
 
   @impl true
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:read, key}}}, %{store: store} = state) do
-    value = Map.get(store, key)
-    Gizmo.Mailbox.route(reply_to, value)
+    value = Map.get(store, key, "")
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
     {:noreply, state}
   end
 
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:write, key, value}}}, %{store: store} = state) do
-    Gizmo.Mailbox.route(reply_to, :ok)
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
     {:noreply, %{state | store: Map.put(store, key, value)}}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, msg}}, state) when is_binary(msg) do
+    case parse_command(msg) do
+      {:read, key} ->
+        value = Map.get(state.store, key, "")
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
+        {:noreply, state}
+
+      {:write, key, value} ->
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
+        {:noreply, %{state | store: Map.put(state.store, key, value)}}
+
+      :error ->
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unrecognized command"})
+        {:noreply, state}
+    end
+  end
+
+  defp parse_command(msg) do
+    trimmed = msg |> String.trim() |> String.trim_leading("{") |> String.trim_trailing("}")
+
+    # Try comma-separated first, then fall back to space-separated
+    parts = case String.split(trimmed, ",", parts: 2) do
+      [single] -> String.split(single, ~r/\s+/, parts: 2)
+      multi -> Enum.map(multi, &String.trim/1)
+    end
+
+    case parts do
+      ["read", key] ->
+        {:read, String.trim(key)}
+
+      ["write", rest] ->
+        # rest may be "key, value" or "key value"
+        kv = case String.split(rest, ",", parts: 2) do
+          [single] -> String.split(single, ~r/\s+/, parts: 2)
+          multi -> Enum.map(multi, &String.trim/1)
+        end
+        case kv do
+          [key, value] -> {:write, String.trim(key), String.trim(value)}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
   end
 end
 
@@ -601,18 +710,19 @@ defmodule Gizmo.Services.Bash do
 
   @impl true
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, command}}, state) do
+    bash_mb = state.mailbox_id
+
     Task.start(fn ->
       try do
-        {stdout, exit_code} = System.cmd("sh", ["-c", command], stderr_to_stdout: false)
-        stderr = ""
+        {stdout, exit_code} = System.cmd("sh", ["-c", command], stderr_to_stdout: true)
 
         if exit_code == 0 do
-          Gizmo.Mailbox.route(reply_to, {:ok, stdout, stderr})
+          Gizmo.Mailbox.route(reply_to, {bash_mb, stdout})
         else
-          Gizmo.Mailbox.route(reply_to, {:error, "exit code #{exit_code}: #{stdout}"})
+          Gizmo.Mailbox.route(reply_to, {bash_mb, "error: exit code #{exit_code}: #{stdout}"})
         end
       rescue
-        e -> Gizmo.Mailbox.route(reply_to, {:error, Exception.message(e)})
+        e -> Gizmo.Mailbox.route(reply_to, {bash_mb, "error: #{Exception.message(e)}"})
       end
     end)
 
@@ -644,6 +754,231 @@ defmodule Gizmo.Services.Human do
   end
 end
 
+# -----------------------------------------------------------------------------
+# Gizmo.Services.HumanInput — stdin input via "human_input" mailbox
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.HumanInput do
+  use GenServer
+
+  def start_link(mailbox_id \\ "human_input") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, prompt_text}}, state) do
+    IO.write(prompt_text)
+    line = IO.gets("") |> String.trim()
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, line})
+    {:noreply, state}
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Agent — spawned-process agent with eval loop
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Agent do
+  @default_receive_timeout 30_000
+
+  @doc """
+  Spawn a linked agent process. Returns {:ok, mailbox_id}.
+
+  Options:
+    - parent: parent mailbox_id (for join)
+    - chat_fn: fn(system, messages, opts) -> {:ok, eval_response} (default: Anthropic)
+    - verbose: boolean
+    - receive_timeout: ms (default 30_000)
+  """
+  def start(frames, opts \\ []) do
+    chat_fn = Keyword.get(opts, :chat_fn, &Gizmo.LLM.Anthropic.chat/3)
+    parent = Keyword.get(opts, :parent, nil)
+    verbose = Keyword.get(opts, :verbose, false)
+    receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
+    caller = self()
+    mailbox_id = Gizmo.Mailbox.generate_id("agent")
+
+    pid = spawn_link(fn ->
+      Gizmo.Mailbox.register(mailbox_id)
+
+      # Start per-agent services
+      args_stack_mb = Gizmo.Mailbox.generate_id("args")
+      msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
+      {:ok, args_stack} = Gizmo.Services.ArgsStack.start_link(args_stack_mb)
+      {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
+
+      send(caller, {:agent_ready, mailbox_id})
+
+      state = %{
+        mailbox_id: mailbox_id,
+        parent: parent,
+        chat_fn: chat_fn,
+        verbose: verbose,
+        receive_timeout: receive_timeout,
+        args_stack: args_stack,
+        msgs_queue: msgs_queue
+      }
+
+      eval_loop(frames, state)
+
+      # Cleanup
+      GenServer.stop(args_stack)
+      GenServer.stop(msgs_queue)
+      Gizmo.Mailbox.unregister(mailbox_id)
+    end)
+
+    receive do
+      {:agent_ready, ^mailbox_id} -> {:ok, mailbox_id, pid}
+    after
+      5_000 -> {:error, :agent_start_timeout}
+    end
+  end
+
+  @doc """
+  Start shared services and the root agent. Blocks until the root agent exits.
+  """
+  def start_root(boot_frame, opts \\ []) do
+    {:ok, _} = Gizmo.Mailbox.start()
+
+    # Start shared services
+    {:ok, _} = Gizmo.Services.Blackboard.start_link("blackboard")
+    {:ok, _} = Gizmo.Services.Bash.start_link("bash")
+    {:ok, _} = Gizmo.Services.Human.start_link("human")
+    {:ok, _} = Gizmo.Services.HumanInput.start_link("human_input")
+
+    {:ok, _mailbox_id, pid} = start([boot_frame], opts)
+
+    # Block until the root agent exits
+    ref = Process.monitor(pid)
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
+  end
+
+  @max_eval_retries 3
+  @max_eval_cycles 50
+
+  defp eval_loop([], _state), do: :ok
+  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0)
+
+  defp eval_loop([], _state, _retries, _cycles), do: :ok
+
+  defp eval_loop(_context_stack, state, _retries, cycles) when cycles >= @max_eval_cycles do
+    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{@max_eval_cycles}) reached, terminating")
+  end
+
+  defp eval_loop(_context_stack, state, retries, _cycles) when retries >= @max_eval_retries do
+    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
+  end
+
+  defp eval_loop(context_stack, state, retries, cycles) do
+    system_prompt = Enum.join(context_stack, "\n\n---\n\n")
+    args = Gizmo.Services.ArgsStack.to_list(state.args_stack)
+    bindings = %{}
+    sections = Gizmo.Interpolation.extract_sections(context_stack)
+
+    if state.verbose do
+      IO.puts("[agent:#{state.mailbox_id}] eval cycle, #{length(context_stack)} frame(s)")
+      IO.puts("[agent:#{state.mailbox_id}] args: #{inspect(args)}")
+    end
+
+    case state.chat_fn.(system_prompt, [%{role: "user", content: "Begin."}], []) do
+      {:ok, response} ->
+        interpolated = Gizmo.LLM.interpolate_response(response, args, bindings, sections)
+
+        if state.verbose do
+          IO.puts("[agent:#{state.mailbox_id}] ops: #{inspect(interpolated.ops)}")
+          IO.puts("[agent:#{state.mailbox_id}] frames: #{inspect(interpolated.frames)}")
+        end
+
+        # Execute ops — may modify context_stack via fork
+        remaining_stack = execute_ops(interpolated.ops, interpolated.frames, state)
+
+        case remaining_stack do
+          :exit -> :ok
+          new_stack -> eval_loop(new_stack, state, 0, cycles + 1)
+        end
+
+      {:error, reason} ->
+        IO.puts(:stderr, "[agent:#{state.mailbox_id}] LLM error: #{inspect(reason)}, retrying (#{retries + 1}/#{@max_eval_retries})...")
+        eval_loop(context_stack, state, retries + 1, cycles + 1)
+    end
+  end
+
+  defp execute_ops(ops, frames, state) do
+    Enum.reduce_while(ops, frames, fn op, current_frames ->
+      case execute_op(op, current_frames, state) do
+        {:cont, new_frames} -> {:cont, new_frames}
+        :exit -> {:halt, :exit}
+      end
+    end)
+  end
+
+  defp execute_op({:send, mailbox, msg}, frames, state) do
+    if state.verbose do
+      IO.puts("[agent:#{state.mailbox_id}] send #{mailbox}: #{inspect(msg)}")
+    end
+
+    Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
+    {:cont, frames}
+  end
+
+  defp execute_op(:receive, frames, state) do
+    if state.verbose do
+      IO.puts("[agent:#{state.mailbox_id}] receive (timeout: #{state.receive_timeout}ms)")
+    end
+
+    receive do
+      {:mailbox_msg, _to, {from_mb, message}} ->
+        Gizmo.Services.ArgsStack.push(state.args_stack, message)
+        Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
+    after
+      state.receive_timeout ->
+        Gizmo.Services.ArgsStack.push(state.args_stack, "timeout")
+    end
+
+    {:cont, frames}
+  end
+
+  defp execute_op({:fork, n, child_frames}, frames, state) do
+    if state.verbose do
+      IO.puts("[agent:#{state.mailbox_id}] fork n=#{n}, child_frames=#{inspect(child_frames)}")
+    end
+
+    # Pop n frames from top of current stack (top = beginning of list)
+    _popped = Enum.take(frames, n)
+    remaining_frames = Enum.drop(frames, n)
+
+    {:ok, child_mb, _pid} = Gizmo.Agent.start(child_frames,
+      parent: state.mailbox_id,
+      chat_fn: state.chat_fn,
+      verbose: state.verbose,
+      receive_timeout: state.receive_timeout
+    )
+
+    Gizmo.Services.ArgsStack.push(state.args_stack, child_mb)
+    {:cont, remaining_frames}
+  end
+
+  defp execute_op({:join, msg}, _frames, state) do
+    if state.verbose do
+      IO.puts("[agent:#{state.mailbox_id}] join: #{inspect(msg)} -> #{state.parent}")
+    end
+
+    if state.parent do
+      Gizmo.Mailbox.route(state.parent, {state.mailbox_id, msg})
+    end
+
+    :exit
+  end
+end
+
 # =============================================================================
 # Gizmo.CLI — command-line interface
 # =============================================================================
@@ -652,7 +987,7 @@ defmodule Gizmo.CLI do
   def main do
     {opts, args, _} =
       OptionParser.parse(System.argv(),
-        strict: [test: :boolean, verbose: :boolean, init: :string],
+        strict: [test: :boolean, verbose: :boolean, init: :string, thinking: :boolean],
         aliases: [v: :verbose]
       )
 
@@ -664,7 +999,7 @@ defmodule Gizmo.CLI do
         init_boot_frame(opts[:init])
 
       args != [] ->
-        run(hd(args), verbose: opts[:verbose] || false)
+        run(hd(args), verbose: opts[:verbose] || false, thinking: opts[:thinking] || false)
 
       true ->
         usage()
@@ -679,6 +1014,7 @@ defmodule Gizmo.CLI do
       --test              Run smoke tests, then exit
       --init <file>       Write a starter boot frame to <file>
       -v, --verbose       Enable verbose output
+      --thinking          Enable extended thinking (Anthropic only)
 
     Examples:
       elixir gizmo.exs boot.txt          # single eval cycle
@@ -733,11 +1069,22 @@ defmodule Gizmo.CLI do
     - $n — positional arg from the args stack (1-indexed, $1 is most recent)
     - ${name} — named value from the blackboard key-value store
     - $$ — literal dollar sign
+    - @N — inject frame N (0-indexed) from your current context stack verbatim
+    - @name — inject the contents of a named section (see below)
+    - @@ — literal @ sign
+
+    You can define named sections in your frames using:
+      @@section-name
+      content here
+      @@end
+
+    Section content injected via @name is quoted verbatim (no $n interpolation
+    is applied to the injected text).
 
     ## Well-known mailboxes
 
-    - human: The user's terminal. Send messages here to display text, and
-      receive from here to get user input.
+    - human: The user's terminal. Send messages here to display text.
+    - human_input: Send a prompt string here, then receive to get the user's typed input.
     - bash: Shell command execution. Send a command string, receive the output.
     - blackboard: Key-value store. Send {read, key} or {write, key, value}.
 
@@ -792,6 +1139,54 @@ defmodule Gizmo.CLI do
       "nested ${$1} (positional leaks into braces)",
       Gizmo.Interpolation.resolve("${$1}", ["key"], %{}),
       "${key}"
+    )
+
+    # @N frame reference
+    frame_sections = Gizmo.Interpolation.extract_sections(["frame zero", "frame one"])
+    failures = failures ++ assert_eq(
+      "@N frame ref extraction",
+      {frame_sections["0"], frame_sections["1"]},
+      {"frame zero", "frame one"}
+    )
+    failures = failures ++ assert_eq(
+      "@N frame ref resolve",
+      Gizmo.Interpolation.resolve("prefix @0 suffix", [], %{}, frame_sections),
+      "prefix frame zero suffix"
+    )
+
+    # Named section extraction
+    section_frame = "before\n@@greet\nhello world\n@@end\nafter"
+    named_sections = Gizmo.Interpolation.extract_sections([section_frame])
+    failures = failures ++ assert_eq(
+      "named section extraction",
+      named_sections["greet"],
+      "hello world"
+    )
+    failures = failures ++ assert_eq(
+      "named section resolve",
+      Gizmo.Interpolation.resolve("say: @greet", [], %{}, named_sections),
+      "say: hello world"
+    )
+
+    # Section quoting (no $ interpolation in injected content)
+    failures = failures ++ assert_eq(
+      "section quoting ($ in section not resolved)",
+      Gizmo.Interpolation.resolve("info: @price", ["Alice"], %{}, %{"price" => "cost is $1"}),
+      "info: cost is $1"
+    )
+
+    # @@ escape
+    failures = failures ++ assert_eq(
+      "@@ escape",
+      Gizmo.Interpolation.resolve("email: user@@host", [], %{}, %{}),
+      "email: user@host"
+    )
+
+    # Mixed @ and $
+    failures = failures ++ assert_eq(
+      "mixed @ and $",
+      Gizmo.Interpolation.resolve("@0 says $1", ["hi"], %{}, %{"0" => "bot"}),
+      "bot says hi"
     )
 
     IO.puts("")
@@ -1026,6 +1421,45 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("blackboard keys", bb_keys, ["color", "size"])
     GenServer.stop(bb_pid)
 
+    # Blackboard — string command protocol (as agents actually use it)
+    bb_str_mb = Gizmo.Mailbox.generate_id("bb_str")
+    {:ok, bb_str_pid} = Gizmo.Services.Blackboard.start_link(bb_str_mb)
+    bb_reply_mb = Gizmo.Mailbox.generate_id("bb_reply")
+    Gizmo.Mailbox.register(bb_reply_mb)
+
+    # Write via string command
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{write, greeting, Hello from the blackboard!}"})
+    bb_write_result =
+      receive do
+        {:mailbox_msg, ^bb_reply_mb, {_, msg}} -> msg
+      after
+        1_000 -> :timeout
+      end
+    failures = failures ++ assert_eq("blackboard string write", bb_write_result, "ok")
+
+    # Read via string command
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{read, greeting}"})
+    bb_read_result =
+      receive do
+        {:mailbox_msg, ^bb_reply_mb, {_, msg}} -> msg
+      after
+        1_000 -> :timeout
+      end
+    failures = failures ++ assert_eq("blackboard string read", bb_read_result, "Hello from the blackboard!")
+
+    # Read missing key via string command
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{read, nope}"})
+    bb_read_missing =
+      receive do
+        {:mailbox_msg, ^bb_reply_mb, {_, msg}} -> msg
+      after
+        1_000 -> :timeout
+      end
+    failures = failures ++ assert_eq("blackboard string read missing", bb_read_missing, "")
+
+    Gizmo.Mailbox.unregister(bb_reply_mb)
+    GenServer.stop(bb_str_pid)
+
     # Bash — send command via mailbox, receive result
     receiver_mb = Gizmo.Mailbox.generate_id("bash_test_receiver")
     Gizmo.Mailbox.register(receiver_mb)
@@ -1039,10 +1473,10 @@ defmodule Gizmo.CLI do
         5_000 -> :timeout
       end
     failures = failures ++ case bash_result do
-      {:ok, stdout, _stderr} ->
+      {_from, stdout} when is_binary(stdout) ->
         assert_eq("bash echo hello", String.trim(stdout), "hello")
       other ->
-        assert_eq("bash echo hello", other, {:ok, "hello\n", ""})
+        assert_eq("bash echo hello", other, {bash_mb, "hello\n"})
     end
     Gizmo.Mailbox.unregister(receiver_mb)
 
@@ -1053,13 +1487,155 @@ defmodule Gizmo.CLI do
     Process.sleep(50)
     failures = failures ++ assert_eq("human service alive", Process.alive?(human_pid), true)
 
+    # HumanInput — verify it starts and registers its mailbox (no stdin interaction)
+    hi_mb = Gizmo.Mailbox.generate_id("human_input_svc")
+    {:ok, hi_pid} = Gizmo.Services.HumanInput.start_link(hi_mb)
+    failures = failures ++ assert_eq("human_input service alive", Process.alive?(hi_pid), true)
+    failures = failures ++ assert_eq("human_input mailbox lookup", elem(Gizmo.Mailbox.lookup(hi_mb), 0), :ok)
+
     # Verify mailbox registration for all services
     failures = failures ++ assert_eq("bash mailbox lookup", elem(Gizmo.Mailbox.lookup(bash_mb), 0), :ok)
     failures = failures ++ assert_eq("human mailbox lookup", elem(Gizmo.Mailbox.lookup(human_mb), 0), :ok)
 
     IO.puts("")
 
-    # 8. LLM test (only if API key is set)
+    # 8. Agent tests
+    IO.puts("--- Agent ---")
+
+    # Ensure registry is started
+    {:ok, _} = Gizmo.Mailbox.start()
+
+    # Test 1: One-shot send
+    test_target_mb = Gizmo.Mailbox.generate_id("agent_test_target")
+    Gizmo.Mailbox.register(test_target_mb)
+
+    one_shot_chat_fn = fn _system, _messages, _opts ->
+      {:ok, %{ops: [{:send, test_target_mb, "hi"}], frames: []}}
+    end
+
+    {:ok, _agent_mb, agent_pid} = Gizmo.Agent.start(["one shot frame"],
+      chat_fn: one_shot_chat_fn, receive_timeout: 100)
+
+    agent_ref = Process.monitor(agent_pid)
+    send_result = receive do
+      {:mailbox_msg, ^test_target_mb, {_from, "hi"}} -> :ok
+    after
+      2_000 -> :timeout
+    end
+    failures = failures ++ assert_eq("agent one-shot send", send_result, :ok)
+
+    # Wait for agent to exit
+    exit_result = receive do
+      {:DOWN, ^agent_ref, :process, ^agent_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+    failures = failures ++ assert_eq("agent one-shot exits", exit_result, :ok)
+    Gizmo.Mailbox.unregister(test_target_mb)
+
+    # Test 2: Receive + timeout
+    # Cycle 1: receive (times out → "timeout" pushed to args), frame "got it"
+    # Cycle 2: send $1 to a test mailbox (interpolated to "timeout"), then exit
+    timeout_test_mb = Gizmo.Mailbox.generate_id("timeout_test")
+    Gizmo.Mailbox.register(timeout_test_mb)
+    cycle2_counter = :counters.new(1, [:atomics])
+
+    timeout_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(cycle2_counter, 1)
+      :counters.add(cycle2_counter, 1, 1)
+
+      if c == 0 do
+        {:ok, %{ops: [:receive], frames: ["got it"]}}
+      else
+        {:ok, %{ops: [{:send, timeout_test_mb, "$1"}], frames: []}}
+      end
+    end
+
+    {:ok, _timeout_mb, timeout_pid} = Gizmo.Agent.start(["initial frame"],
+      chat_fn: timeout_chat_fn, receive_timeout: 100)
+
+    timeout_ref = Process.monitor(timeout_pid)
+
+    # Receive the message sent in cycle 2 — $1 should be interpolated to "timeout"
+    timeout_sent_msg = receive do
+      {:mailbox_msg, ^timeout_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("receive timeout pushes 'timeout' to args", timeout_sent_msg, "timeout")
+
+    receive do
+      {:DOWN, ^timeout_ref, :process, ^timeout_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(timeout_test_mb)
+
+    # Test 3: Fork + join
+    fork_cycle = :counters.new(1, [:atomics])
+    fork_captured_result = Agent.start_link(fn -> nil end)
+    {:ok, fork_result_agent} = fork_captured_result
+
+    combined_chat_fn = fn system, _messages, _opts ->
+      c = :counters.get(fork_cycle, 1)
+      :counters.add(fork_cycle, 1, 1)
+
+      cond do
+        # First call: parent cycle 0 — fork a child, then receive
+        c == 0 ->
+          {:ok, %{ops: [{:fork, 0, ["child frame"]}, :receive], frames: ["parent waiting"]}}
+        # Second call: child cycle 0 — join with result
+        String.contains?(system, "child frame") ->
+          {:ok, %{ops: [{:join, "result from child"}], frames: []}}
+        # Third call: parent cycle 1 — capture the args and exit
+        true ->
+          Agent.update(fork_result_agent, fn _ -> system end)
+          {:ok, %{ops: [], frames: []}}
+      end
+    end
+
+    {:ok, _fork_mb, fork_pid} = Gizmo.Agent.start(["parent frame"],
+      chat_fn: combined_chat_fn, receive_timeout: 5_000)
+
+    fork_ref = Process.monitor(fork_pid)
+    receive do
+      {:DOWN, ^fork_ref, :process, ^fork_pid, _} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    fork_result = Agent.get(fork_result_agent, & &1)
+    failures = failures ++ assert_eq("fork+join parent receives result",
+      fork_result != nil && String.contains?(fork_result, "parent waiting"), true)
+    Agent.stop(fork_result_agent)
+
+    # Test 4: Multi-frame concat
+    concat_captured = Agent.start_link(fn -> nil end)
+    {:ok, concat_agent} = concat_captured
+
+    concat_chat_fn = fn system, _messages, _opts ->
+      Agent.update(concat_agent, fn _ -> system end)
+      {:ok, %{ops: [], frames: []}}
+    end
+
+    {:ok, _concat_mb, concat_pid} = Gizmo.Agent.start(["frame A", "frame B"],
+      chat_fn: concat_chat_fn, receive_timeout: 100)
+
+    concat_ref = Process.monitor(concat_pid)
+    receive do
+      {:DOWN, ^concat_ref, :process, ^concat_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+
+    concat_result = Agent.get(concat_agent, & &1)
+    failures = failures ++ assert_eq("multi-frame concat",
+      concat_result, "frame A\n\n---\n\nframe B")
+    Agent.stop(concat_agent)
+
+    IO.puts("")
+
+    # 9. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
@@ -1146,7 +1722,8 @@ defmodule Gizmo.CLI do
   end
 
   def run(path, opts) do
-    verbose = opts[:verbose]
+    verbose = opts[:verbose] || false
+    thinking = opts[:thinking] || false
 
     if verbose, do: IO.puts("Loading boot frame from #{path}...")
 
@@ -1158,22 +1735,17 @@ defmodule Gizmo.CLI do
           IO.puts("")
         end
 
-        if verbose, do: IO.puts("Calling LLM...")
-
-        case Gizmo.LLM.Anthropic.chat(
-               boot_frame,
-               [%{role: "user", content: "Begin."}]
-             ) do
-          {:ok, %{ops: _, frames: _} = response} ->
-            # Apply interpolation (empty args/bindings for now — agent will supply real ones)
-            interpolated = Gizmo.LLM.interpolate_response(response, [], %{})
-            IO.puts("Ops:    #{inspect(interpolated.ops)}")
-            IO.puts("Frames: #{inspect(interpolated.frames)}")
-
-          {:error, reason} ->
-            IO.puts(:stderr, "LLM error: #{inspect(reason)}")
-            System.halt(1)
+        run_opts = [verbose: verbose]
+        run_opts = if thinking do
+          chat_fn = fn system, messages, chat_opts ->
+            Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))
+          end
+          Keyword.put(run_opts, :chat_fn, chat_fn)
+        else
+          run_opts
         end
+
+        Gizmo.Agent.start_root(boot_frame, run_opts)
 
       {:error, reason} ->
         IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
