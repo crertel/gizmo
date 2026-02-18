@@ -17,7 +17,7 @@ Get a working call to Claude and back, returning structured JSON.
 - [x] `Gizmo.LLM.OpenAI` — OpenAI-compatible client via structured outputs (json_schema)
 - [x] JSON encoding/decoding via Req (`:json` option)
 - [x] Both clients normalize response to `{:ok, %{ops: [...], frames: [...]}}` tuples
-- [ ] Handle API errors, rate limits, retries
+- [x] Handle API errors, rate limits, retries (`Gizmo.LLM.Retry`, exponential backoff on 429/5xx)
 - [ ] Streaming support (optional, can defer)
 
 ## Stage 2: Structured Output (replaces text Parser)
@@ -30,7 +30,7 @@ defines the ops array and frames array directly.
 - [x] Anthropic: forced via `tool_choice: {type: "tool", name: "eval_response"}`
 - [x] OpenAI: forced via `response_format: {type: "json_schema", ...}`
 - [x] Normalized to Elixir tuples: `{:send, mailbox, msg}`, `:receive`, etc.
-- [ ] Validation of op fields (e.g. send requires mailbox + msg)
+- [x] Validation of op fields (`validate_op/1` — send requires mailbox + msg, fork requires n + frames, etc.)
 
 ## Stage 3: Interpolation
 
@@ -39,96 +39,96 @@ Resolve `$n` and `${name}` references in text.
 - [x] `$n` positional resolution against an args list
 - [x] `${name}` named resolution against a key-value map
 - [x] Escaping (`$$` for literal `$`)
-- [ ] Apply interpolation to frame text and message content
-- [ ] Unit tests
+- [x] Apply interpolation to frame text and message content (`interpolate_response/4`)
+- [x] Unit tests (in-process smoke tests via `--test`)
 
 ## Stage 4: Mailbox Router
 
 Central message routing registry.
 
-- [ ] Elixir Registry-based router: register(mailbox_id, pid), lookup(mailbox_id)
-- [ ] `route(mailbox_id, message)` — deliver message to registered PID
-- [ ] Mailbox ID generation (e.g., `mb_001`, `mb_002`, ...)
-- [ ] Error handling for unregistered mailbox IDs
+- [x] Elixir Registry-based router: register(mailbox_id, pid), lookup(mailbox_id)
+- [x] `route(mailbox_id, message)` — deliver message to registered PID
+- [x] Mailbox ID generation (`generate_id/1`, monotonic integer with prefix)
+- [x] Error handling for unregistered mailbox IDs
 
 ## Stage 5: Well-Known Services
 
 Implement the service processes that back the well-known mailboxes.
 
 ### 5a: Args Stack
-- [ ] GenServer holding a list
-- [ ] Handle `{push, value}`, `{peek, n}`, `{pop}`, `{pop, n}`
-- [ ] Registered in mailbox router
+- [x] GenServer holding a list
+- [x] Handle `{push, value}`, `{peek, n}`, `{pop}`
+- [x] Registered in mailbox router
 
 ### 5b: Messages Queue
-- [ ] GenServer holding a `:queue`
-- [ ] Stores `{content, source}` tuples
-- [ ] Registered in mailbox router
+- [x] GenServer holding a `:queue`
+- [x] Stores `{content, source}` tuples
+- [x] Registered in mailbox router
 
 ### 5c: Blackboard
-- [ ] GenServer or ETS-backed key-value store
-- [ ] Handle `{read, key}`, `{write, key, value}`
-- [ ] Registered in mailbox router
+- [x] GenServer key-value store (plain map)
+- [x] Handle `{read, key}`, `{write, key, value}` (plus string command protocol)
+- [x] Registered in mailbox router
 
 ### 5d: Bash Adapter
-- [ ] GenServer that receives command strings
-- [ ] Execute via `System.cmd` or `Port`
-- [ ] Send stdout/stderr back to caller's mailbox
+- [x] GenServer that receives command strings
+- [x] Execute via `System.cmd("sh", ["-c", cmd])`
+- [x] Send stdout/stderr back to caller's mailbox
 - [ ] Timeout handling for long-running commands
 
 ### 5e: Human Adapter
-- [ ] GenServer bridging IO.gets/IO.puts to a mailbox
-- [ ] Receive message from agent → print to terminal
-- [ ] Read user input → send to agent's mailbox
+- [x] Two GenServers: `Human` (output) and `HumanInput` (input)
+- [x] Receive message from agent → print to terminal
+- [x] Read user input → send to agent's mailbox
 - [ ] Later: swap IO for Phoenix channel without changing the agent
 
 ## Stage 6: Agent Process (The Core)
 
 The GenServer that runs the eval loop.
 
-- [ ] State: context_stack, mailbox_id, parent_id
-- [ ] Boot frame loaded on init
-- [ ] Eval loop implementation:
-  - Pop top frame
-  - Concatenate remaining stack bottom-up
-  - Call LLM client (prefix = concat, input = popped frame)
-  - Parse response
+- [x] State: mailbox_id, parent, chat_fn, verbose, receive_timeout, args_stack, msgs_queue
+- [x] Boot frame loaded on init
+- [x] Eval loop implementation:
+  - Concatenate context stack as system prompt
+  - Call LLM client
+  - Interpolate response
   - Execute ops sequentially
   - Push replacement frames
   - Loop
-- [ ] `send` op: interpolate msg, route via mailbox router
-- [ ] `receive` op: block until message arrives, push to messages queue + args stack
+- [x] `send` op: interpolate msg, route via mailbox router
+- [x] `receive` op: block until message arrives, push to messages queue + args stack
 - [ ] Idle behavior: boot frame self-replaces, checks mailbox
-- [ ] Error handling: retry on parse failure (3x), then exception mailbox
+- [x] Error handling: retry on LLM failure (3x)
+- [ ] Exception mailbox on retry exhaustion (currently prints to stderr and terminates)
 
 ## Stage 7: End-to-End Single Agent
 
 Wire everything together and run the addition example from the design doc.
 
-- [ ] Boot an agent process with a boot frame and a task frame
-- [ ] Agent talks to human adapter (ask for two numbers)
-- [ ] Agent talks to bash adapter (compute sum)
-- [ ] Agent reports result to human
-- [ ] Verify args stack, messages queue, and blackboard work correctly
-- [ ] Manual testing, then write integration test
+- [x] Boot an agent process with a boot frame and a task frame
+- [x] Agent talks to human adapter
+- [x] Agent talks to bash adapter
+- [x] Agent reports result to human
+- [x] Verify args stack, messages queue, and blackboard work correctly (smoke tests)
+- [x] Manual testing via test frames (01–06), smoke tests via `--test`
 
 ## Stage 8: Fork and Join
 
 Multi-process support.
 
-- [ ] `fork` op: DynamicSupervisor.start_child with copied/modified stack
-- [ ] Register child mailbox in router
-- [ ] Push child mailbox ID onto parent's args
-- [ ] `join` op: send message to parent mailbox, terminate self
+- [x] `fork` op: spawn child with `spawn_link` (not yet DynamicSupervisor)
+- [x] Register child mailbox in router
+- [x] Push child mailbox ID onto parent's args
+- [x] `join` op: send message to parent mailbox, terminate self
 - [ ] Process.monitor for unexpected child death → notify parent
-- [ ] Test: parent forks child, child does work, joins back
+- [x] Test: parent forks child, child does work, joins back (smoke test)
 
 ## Stage 9: Supervision and Error Recovery
 
 Production-grade process management.
 
 - [ ] Static supervisor for service processes (one_for_one)
-- [ ] DynamicSupervisor for agent processes
+- [ ] DynamicSupervisor for agent processes (fork currently uses spawn_link)
 - [ ] Exception mailbox service
 - [ ] Supervisor service: receives error reports, can spawn replacement agents
 - [ ] Restart strategies and backoff
