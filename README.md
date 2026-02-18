@@ -11,6 +11,13 @@ text "boot frame" describing what the agent should do, and Gizmo runs an eval
 loop: prompt the LLM, execute the returned ops, replace the context stack with
 the returned frames, repeat.
 
+
+> [!IMPORTANT]
+> Being what this is, there is *extremely heavy* use of Claude and other AI tooling. Max vibes.
+> This is also a research project and so it's extra messy (why else is it all just one script file? That's madness ordinarily.)
+>
+> So, if you aren't willing to deal with that, don't complain--just go elsewhere. - @crertel
+
 ## Prerequisites
 
 - **Elixir 1.19+** / Erlang/OTP 28+
