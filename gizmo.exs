@@ -902,6 +902,16 @@ defmodule Gizmo.Agent do
 
     Only include the ops you actually need. Do NOT include ops you don't use.
 
+    ## Args visibility
+
+    The current args stack values are shown in the user message as:
+      $1 = <value>
+      $2 = <value>
+      ...
+    You can read these to make decisions (e.g. check if $1 is "quit").
+    Use $1, $2 etc. in your ops and frames — they will be interpolated to
+    the actual values before execution.
+
     ## Interpolation
 
     In message strings and frames, you can use:
@@ -1079,7 +1089,17 @@ defmodule Gizmo.Agent do
       IO.puts(Gizmo.Format.args_line(id, args))
     end
 
-    case state.chat_fn.(system_prompt, [%{role: "user", content: "Begin."}], []) do
+    user_content = case args do
+      [] -> "Begin."
+      _ ->
+        arg_lines = args
+        |> Enum.with_index(1)
+        |> Enum.map(fn {val, i} -> "$#{i} = #{val}" end)
+        |> Enum.join("\n")
+        "Begin.\n\nCurrent args:\n#{arg_lines}"
+    end
+
+    case state.chat_fn.(system_prompt, [%{role: "user", content: user_content}], []) do
       {:ok, response} ->
         interpolated = Gizmo.LLM.interpolate_response(response, args, bindings, sections)
 
