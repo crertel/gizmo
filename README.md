@@ -114,4 +114,4 @@ PROMPTING.md       # Guide for writing boot frames
 
 ## License
 
-See repository for license details.
+Apache License 2.0. See [LICENSE](LICENSE) for details.
