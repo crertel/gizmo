@@ -22,24 +22,25 @@ interaction—is built on top as mailbox-backed services.
 ```
 ┌─────────────────────────────┐
 │         Agent Process       │
-│  (Elixir GenServer)         │
+│  (plain process via         │
+│   :proc_lib / Wrapper)      │
 │                             │
 │  context_stack: [frame]     │  ← the prompt, bottom-up
 │  mailbox_id:    mb_id       │  ← address for receiving messages
 │  parent_id:     mb_id|nil   │  ← for join()
 │                             │
 │  eval loop:                 │
-│    pop top frame            │
-│    concat remaining → LLM   │
+│    concat stack → LLM       │
 │    LLM → {ops, frames}     │
 │    execute ops              │
-│    push replacement frames  │
+│    replace stack with frames│
 │    repeat                   │
 └─────────────────────────────┘
 ```
 
-A process is **idle** when only the boot frame remains. The boot frame is a
-self-replacing frame that checks the mailbox for new work.
+A process is **idle** when the context stack empties and the boot frame is
+restored. The LLM re-evaluates the boot frame and typically issues a
+`receive` to wait for new work.
 
 ## Syscalls
 
@@ -55,28 +56,36 @@ time.
 
 ## Well-Known Services
 
-These are ordinary processes registered at boot. They are not syscalls.
+These are supervised processes with fixed mailbox names, registered at boot
+by `Gizmo.Supervision`. They are not syscalls.
 
 | Service | Mailbox | Purpose |
 |---------|---------|---------|
-| **bindings** | (in-process) | Named bindings map. Values from `receive(dest)` and `fork(dest)`. Threaded through eval loop. |
-| **messages** | registered | Message queue. `receive()` results with content + source metadata. |
-| **blackboard** | registered | Key-value store. Persistent shared memory. `{read, key}` / `{write, key, value}`. |
-| **bash** | registered | Shell command execution. Send command string, get output back. |
-| **human** | registered | User interaction bridge. IO or Phoenix channel behind the mailbox. |
-| **supervisor** | registered | Error escalation and process replacement. |
+| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `{read, key}` / `{write, key, value}`. |
+| **bash** | `"bash"` | Shell command execution. Send command string, get output back. |
+| **human** | `"human"` | Terminal output. Send text to display to the user. |
+| **human_input** | `"human_input"` | Terminal input. Send a prompt string, receive the user's typed response. |
+| **exception** | `"exception"` | Error notification sink. Receives agent retry/cycle exhaustion reports. |
+
+Per-agent state (not well-known, created per agent instance):
+
+| Component | Scope | Purpose |
+|-----------|-------|---------|
+| **bindings** | in-process | Named bindings map. Values from `receive(dest)` and `fork(dest)`. Threaded through eval loop. |
+| **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. |
 
 ## Eval Loop Detail
 
 ```
-1. Pop top frame from context stack
-2. Concatenate remaining stack bottom-up (boot frame first)
-3. Call LLM: remaining stack = prefix, popped frame = final input
-4. LLM returns structured {ops, frames} via eval_response tool
-5. Execute ops sequentially
-6. Push replacement frames (last listed = top of stack)
-7. If only boot frame remains → boot frame self-replaces (idle)
-8. Goto 1
+1. Concatenate runtime prompt + all context stack frames → system prompt
+2. Build user message: "Begin." + current bindings
+3. Call LLM with system prompt and user message
+4. LLM returns structured {ops, frames, notes} via eval_response tool
+5. Interpolate frames and op strings against bindings and sections
+6. Execute ops sequentially (may update bindings via receive/fork)
+7. Replace context stack with returned frames
+8. If stack is empty and boot frame exists → restore boot frame (idle)
+9. Goto 1
 ```
 
 The stack is **self-reducing**:
@@ -87,8 +96,8 @@ The stack is **self-reducing**:
 ## LLM Output Format
 
 The LLM returns structured JSON via a forced tool call (`eval_response`).
-The response contains two arrays: `ops` (syscalls to execute) and `frames`
-(replacement frames for the context stack).
+The response contains three fields: `ops` (syscalls to execute), `frames`
+(replacement frames for the context stack), and `notes` (binding annotations).
 
 ```json
 {
@@ -119,41 +128,53 @@ parsing ambiguity and the need for a text parser.
 
 ## Interpolation
 
-- `${name}` — named reference resolved via bindings map (populated by
+- `${name}` — named binding resolved from bindings map (populated by
   `receive(dest)` and `fork(dest)`)
+- `@N` — inject frame N (0-indexed) from the current context stack
+- `@name` — inject contents of a named section (`@@section-name` ... `@@end`)
+- `$$` — literal `$`; `@@` — literal `@`
 - Resolved at operation time, not at frame push time
+- Section content injected via `@name` is quoted (no `${name}` expansion)
 
 ## Error Handling
 
 ```
-schema violation → retry (x2) → exception mailbox → next frame tries → ... → supervisor
+LLM error → retry (×3) → exception mailbox → agent terminates
+cycle limit (50) exceeded → exception mailbox → agent terminates
 ```
 
-Three retries for invalid LLM output (schema violation, API error). After
-that, the error goes to an exception mailbox. Subsequent frames inherit
-exception context and can attempt recovery. Unrecoverable errors escalate to
-the supervisor.
+Three retries for LLM errors (schema violation, API error). After exhaustion,
+the error is reported to the `"exception"` mailbox and the agent terminates.
+A separate cycle limit (50) catches infinite loops. Transient API errors
+(429, 5xx) are retried with exponential backoff at the HTTP layer before
+reaching the eval retry logic.
 
 ## Supervision Tree
 
 ```
-Application
-├── MailboxRouter (Registry)
-├── ServiceSupervisor (one_for_one)
-│   ├── BashAdapter
-│   ├── MessagesQueue
-│   ├── Blackboard
-│   ├── HumanAdapter
-│   └── Supervisor (error escalation)
-└── AgentSupervisor (DynamicSupervisor)
-    ├── Agent Process 1
-    ├── Agent Process 2
+Gizmo.Supervision (one_for_one)
+├── Gizmo.Mailbox.Registry (Registry)
+├── Gizmo.Services.Blackboard ("blackboard")
+├── Gizmo.Services.Bash ("bash")
+├── Gizmo.Services.Human ("human")
+├── Gizmo.Services.HumanInput ("human_input")
+├── Gizmo.Services.Exception ("exception")
+└── Gizmo.AgentSupervisor (DynamicSupervisor)
+    ├── Agent via Wrapper (:temporary)
+    ├── Agent via Wrapper (:temporary)
     └── ...
 ```
 
-- Service processes run under a static `one_for_one` supervisor.
-- Agent processes (spawned by `fork`) run under a `DynamicSupervisor`.
-- `Process.monitor` links parent to child for unexpected death notification.
+- All services run under a single `one_for_one` supervisor (`Gizmo.Supervision`).
+  If a service crashes, it is automatically restarted. Services are independent
+  so one crash does not affect others.
+- Agent processes run under `Gizmo.AgentSupervisor` (`DynamicSupervisor`) with
+  `:temporary` restart — they are not restarted on exit. Restarting a crashed
+  agent from its boot frame would duplicate work and confuse parent processes
+  waiting for join messages. The watcher pattern (`Process.monitor`) notifies
+  parents of child death.
+- `Gizmo.Agent.Wrapper` bridges `DynamicSupervisor` and the bare eval loop,
+  using `:proc_lib.start_link/3` for proper OTP process initialization.
 
 ## Message Routing
 
@@ -173,14 +194,18 @@ Application
 
 The router is an Elixir `Registry`. Each mailbox ID maps to an Elixir PID.
 `send` is non-blocking message delivery. `receive` blocks the calling
-GenServer until a message arrives in its mailbox.
+process until a message arrives in its mailbox.
 
 ## Boot Frame
 
-The boot frame is frame 0 on every process's context stack. It contains:
-- The syscall descriptions
-- The mailbox registry (available services and their addresses)
-- Instructions for idle behavior (check mailbox, self-replace)
+The boot frame is frame 0 on every agent's context stack. It is user-provided
+content (task description, workflow steps, named sections). The runtime prompt
+(syscall reference, well-known mailboxes, interpolation rules) is prepended
+automatically by `Gizmo.Agent.runtime_prompt/0`.
+
+When the context stack drains to `[]`, the boot frame is restored so the
+agent idles and can receive new work. Agents that want to terminate use
+`join`, which exits before the idle clause fires.
 
 Different boot frames = different "OS distributions." Same kernel, different
 preloaded services and instructions.
@@ -191,7 +216,7 @@ preloaded services and instructions.
 - **Packaging:** Single `gizmo.exs` script file, run with `elixir gizmo.exs`
 - **Dependencies:** `Req` (installed via `Mix.install/2` at script top)
 - **JSON:** Req handles JSON encoding/decoding; Erlang `:json` for edge cases
-- **Process model:** OTP GenServer per agent, DynamicSupervisor for fork
+- **Process model:** OTP process (`:proc_lib` via `Gizmo.Agent.Wrapper`) per agent, `DynamicSupervisor` for fork
 - **Message routing:** Elixir Registry
 - **LLM backend:** Claude API via Req
 - **Human interface:** Initially IO, later Phoenix LiveView

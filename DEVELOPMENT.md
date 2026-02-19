@@ -126,12 +126,13 @@ Multi-process support.
 
 Production-grade process management.
 
-- [ ] Static supervisor for service processes (one_for_one)
-- [ ] DynamicSupervisor for agent processes (fork currently uses spawn_link)
-- [ ] Exception mailbox service
-- [ ] Supervisor service: receives error reports, can spawn replacement agents
-- [ ] Restart strategies and backoff
-- [ ] Test: kill a service, verify it restarts; kill an agent, verify supervisor is notified
+- [x] `Gizmo.Supervision` — `one_for_one` supervisor for Registry + all services + `DynamicSupervisor`
+- [x] `Gizmo.AgentSupervisor` (`DynamicSupervisor`) for agent processes with `:temporary` restart
+- [x] `Gizmo.Agent.Wrapper` — `:proc_lib.start_link/3` bridge for OTP-compatible agent processes
+- [x] Exception mailbox service (implemented in Stage 8, now supervised)
+- [x] Supervisor service dropped — OTP supervision handles restarts; exception mailbox handles error reporting
+- [x] Test: kill Blackboard, verify it restarts and re-registers
+- [x] Test: agent exits cleanly under DynamicSupervisor, not restarted
 
 ## Stage 10: Polish and Hardening
 

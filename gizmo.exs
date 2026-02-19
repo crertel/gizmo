@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–7: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput
+# Gizmo — Stages 0–9: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput, Fork/Join, Supervision
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -855,12 +855,77 @@ defmodule Gizmo.Services.Exception do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Agent.Wrapper — OTP-compatible wrapper for agent processes
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Agent.Wrapper do
+  @default_receive_timeout 30_000
+
+  def start_link({frames, opts, caller}) do
+    :proc_lib.start_link(__MODULE__, :init_agent, [{frames, opts, caller}])
+  end
+
+  def init_agent({frames, opts, caller}) do
+    chat_fn = Keyword.get(opts, :chat_fn, &Gizmo.LLM.Anthropic.chat/3)
+    parent = Keyword.get(opts, :parent, nil)
+    verbose = Keyword.get(opts, :verbose, false)
+    receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
+
+    mailbox_id = Gizmo.Mailbox.generate_id("agent")
+    Gizmo.Mailbox.register(mailbox_id)
+
+    msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
+    {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
+
+    :proc_lib.init_ack({:ok, self()})
+    send(caller, {:agent_ready, mailbox_id, self()})
+
+    state = %{
+      mailbox_id: mailbox_id,
+      parent: parent,
+      chat_fn: chat_fn,
+      verbose: verbose,
+      receive_timeout: receive_timeout,
+      msgs_queue: msgs_queue,
+      boot_frame: List.first(frames)
+    }
+
+    Gizmo.Agent.eval_loop(frames, state)
+
+    # Cleanup
+    GenServer.stop(msgs_queue)
+    Gizmo.Mailbox.unregister(mailbox_id)
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Supervision — OTP supervision tree for services and agents
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Supervision do
+  def start_link do
+    children = [
+      %{id: Gizmo.Mailbox.Registry, start: {Gizmo.Mailbox, :start, []}, type: :supervisor},
+      {Gizmo.Services.Blackboard, "blackboard"},
+      {Gizmo.Services.Bash, "bash"},
+      {Gizmo.Services.Human, "human"},
+      {Gizmo.Services.HumanInput, "human_input"},
+      {Gizmo.Services.Exception, "exception"},
+      {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
+    ]
+
+    case Supervisor.start_link(children, strategy: :one_for_one, name: __MODULE__) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent — spawned-process agent with eval loop
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Agent do
-  @default_receive_timeout 30_000
-
   @doc "Runtime preamble appended to every agent's system prompt."
   def runtime_prompt do
     """
@@ -985,9 +1050,9 @@ defmodule Gizmo.Agent do
   end
 
   @doc """
-  Spawn an agent process. Returns {:ok, mailbox_id, pid}.
+  Spawn an agent process under the DynamicSupervisor. Returns {:ok, mailbox_id, pid}.
 
-  The agent is spawned (not linked) so child crashes do not kill the parent.
+  Agents run as :temporary children — they are not restarted on exit.
   If frames is non-empty, the first frame is saved as the boot frame. When the
   context stack drains to [], the boot frame is re-pushed so the agent idles
   and waits for new work. Agents that want to terminate should use join, which
@@ -1000,62 +1065,34 @@ defmodule Gizmo.Agent do
     - receive_timeout: ms (default 30_000)
   """
   def start(frames, opts \\ []) do
-    chat_fn = Keyword.get(opts, :chat_fn, &Gizmo.LLM.Anthropic.chat/3)
-    parent = Keyword.get(opts, :parent, nil)
-    verbose = Keyword.get(opts, :verbose, false)
-    receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     caller = self()
-    mailbox_id = Gizmo.Mailbox.generate_id("agent")
 
-    pid = spawn(fn ->
-      Gizmo.Mailbox.register(mailbox_id)
+    child_spec = %{
+      id: :erlang.unique_integer([:positive]),
+      start: {Gizmo.Agent.Wrapper, :start_link, [{frames, opts, caller}]},
+      restart: :temporary
+    }
 
-      # Start per-agent services
-      msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
-      {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
+    case DynamicSupervisor.start_child(Gizmo.AgentSupervisor, child_spec) do
+      {:ok, pid} ->
+        receive do
+          {:agent_ready, mailbox_id, ^pid} -> {:ok, mailbox_id, pid}
+        after
+          5_000 -> {:error, :agent_start_timeout}
+        end
 
-      send(caller, {:agent_ready, mailbox_id})
-
-      state = %{
-        mailbox_id: mailbox_id,
-        parent: parent,
-        chat_fn: chat_fn,
-        verbose: verbose,
-        receive_timeout: receive_timeout,
-        msgs_queue: msgs_queue,
-        boot_frame: List.first(frames)
-      }
-
-      eval_loop(frames, state)
-
-      # Cleanup
-      GenServer.stop(msgs_queue)
-      Gizmo.Mailbox.unregister(mailbox_id)
-    end)
-
-    receive do
-      {:agent_ready, ^mailbox_id} -> {:ok, mailbox_id, pid}
-    after
-      5_000 -> {:error, :agent_start_timeout}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   @doc """
-  Start shared services and the root agent. Blocks until the root agent exits.
+  Start the supervision tree and the root agent. Blocks until the root agent exits.
   """
   def start_root(boot_frame, opts \\ []) do
-    {:ok, _} = Gizmo.Mailbox.start()
-
-    # Start shared services
-    {:ok, _} = Gizmo.Services.Blackboard.start_link("blackboard")
-    {:ok, _} = Gizmo.Services.Bash.start_link("bash")
-    {:ok, _} = Gizmo.Services.Human.start_link("human")
-    {:ok, _} = Gizmo.Services.HumanInput.start_link("human_input")
-    {:ok, _} = Gizmo.Services.Exception.start_link("exception")
-
+    {:ok, _} = Gizmo.Supervision.start_link()
     {:ok, _mailbox_id, pid} = start([boot_frame], opts)
 
-    # Block until the root agent exits
     ref = Process.monitor(pid)
     receive do
       {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
@@ -1065,11 +1102,11 @@ defmodule Gizmo.Agent do
   @max_eval_retries 3
   @max_eval_cycles 50
 
-  defp eval_loop([], %{boot_frame: nil}), do: :ok
-  defp eval_loop([], %{boot_frame: boot_frame} = state) do
+  def eval_loop([], %{boot_frame: nil}), do: :ok
+  def eval_loop([], %{boot_frame: boot_frame} = state) do
     eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
   end
-  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{}, %{}, %{})
+  def eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{}, %{}, %{})
 
   defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
   defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, _cycles, _persisted_sections, _bindings, _binding_notes) do
@@ -1521,8 +1558,8 @@ defmodule Gizmo.CLI do
     # 6. Mailbox router tests
     IO.puts("--- Mailbox Router ---")
 
-    # Start the registry (idempotent)
-    {:ok, _} = Gizmo.Mailbox.start()
+    # Start the supervision tree (idempotent — handles already-started)
+    {:ok, _} = Gizmo.Supervision.start_link()
 
     # Generate IDs are unique
     id1 = Gizmo.Mailbox.generate_id()
@@ -1579,8 +1616,8 @@ defmodule Gizmo.CLI do
     # 7. Services tests
     IO.puts("--- Services ---")
 
-    # Ensure registry is started
-    {:ok, _} = Gizmo.Mailbox.start()
+    # Ensure supervision tree is started (idempotent)
+    {:ok, _} = Gizmo.Supervision.start_link()
 
     # MessagesQueue
     {:ok, mq_pid} = Gizmo.Services.MessagesQueue.start_link(Gizmo.Mailbox.generate_id("msg_queue"))
@@ -1687,8 +1724,8 @@ defmodule Gizmo.CLI do
     # 8. Agent tests
     IO.puts("--- Agent ---")
 
-    # Ensure registry is started
-    {:ok, _} = Gizmo.Mailbox.start()
+    # Ensure supervision tree is started (idempotent)
+    {:ok, _} = Gizmo.Supervision.start_link()
 
     # Test 1: One-shot send
     test_target_mb = Gizmo.Mailbox.generate_id("agent_test_target")
@@ -2082,7 +2119,66 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 9. LLM test (only if API key is set)
+    # 9. Supervision tests
+    IO.puts("--- Supervision ---")
+
+    # Ensure supervision tree is started (idempotent)
+    {:ok, _} = Gizmo.Supervision.start_link()
+
+    # Test 1: All well-known services are registered
+    failures = Enum.reduce(["blackboard", "bash", "human", "human_input", "exception"], failures, fn svc, acc ->
+      acc ++ assert_eq("supervised service '#{svc}' registered",
+        elem(Gizmo.Mailbox.lookup(svc), 0), :ok)
+    end)
+
+    # Test 2: Kill Blackboard, verify it restarts and re-registers
+    {:ok, old_bb_pid} = Gizmo.Mailbox.lookup("blackboard")
+    Process.exit(old_bb_pid, :kill)
+    Process.sleep(200)
+    bb_lookup = Gizmo.Mailbox.lookup("blackboard")
+    failures = failures ++ assert_eq("blackboard re-registered after kill",
+      elem(bb_lookup, 0), :ok)
+    {:ok, new_bb_pid} = bb_lookup
+    failures = failures ++ assert_eq("blackboard restarted with new pid",
+      new_bb_pid != old_bb_pid, true)
+
+    # Test 3: Agent exits cleanly under DynamicSupervisor (:temporary — not restarted)
+    sup_test_mb = Gizmo.Mailbox.generate_id("sup_test")
+    Gizmo.Mailbox.register(sup_test_mb)
+
+    sup_chat_fn = fn _system, _messages, _opts ->
+      {:ok, %{ops: [{:send, sup_test_mb, "hello"}, {:join, ""}], frames: [], notes: %{}}}
+    end
+
+    {:ok, _sup_agent_mb, sup_agent_pid} = Gizmo.Agent.start(["supervised agent frame"],
+      chat_fn: sup_chat_fn, receive_timeout: 100)
+
+    sup_ref = Process.monitor(sup_agent_pid)
+
+    # Wait for the agent to send its message and exit
+    sup_msg = receive do
+      {:mailbox_msg, ^sup_test_mb, {_from, msg}} -> msg
+    after
+      2_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("supervised agent sends message", sup_msg, "hello")
+
+    receive do
+      {:DOWN, ^sup_ref, :process, ^sup_agent_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+
+    # Verify agent is NOT restarted (temporary)
+    Process.sleep(100)
+    failures = failures ++ assert_eq("temporary agent not restarted",
+      Process.alive?(sup_agent_pid), false)
+
+    Gizmo.Mailbox.unregister(sup_test_mb)
+
+    IO.puts("")
+
+    # 10. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
