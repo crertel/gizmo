@@ -85,15 +85,35 @@ elixir gizmo.exs my_task.txt
 | `-v` | Verbose mode — shows ops, frames, args each cycle |
 | `--thinking` | Enable extended thinking |
 | `--init <file>` | Generate a starter boot frame file |
+| `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
+| `--quit-on-exhaust` | Terminate when frames are exhausted instead of idling |
+| `--boot <file>` | Separate boot frame file (used for idle recovery) |
+
+### Positional arguments
+
+Without `--boot`, the first positional file is the boot frame and any additional
+files are stacked on top. With `--boot`, the boot file is used for idle recovery
+and all positional files are task frames.
+
+### Signal handling
+
+- `Ctrl+\` (SIGQUIT) or `kill <pid>` (SIGTERM) cleanly stops the runtime.
+- Double `Ctrl+C` is the hard kill.
 
 ### Example
 
 ```bash
-# Run the hello-world test frame
-elixir gizmo.exs test/01_hello.txt
+# Run the hello-world test frame (one-shot, terminates cleanly)
+elixir gizmo.exs --quit-on-exhaust test/01_hello.txt
 
 # Run the echo-bot loop in verbose mode
 elixir gizmo.exs -v test/05_loop.txt
+
+# Multi-file stack with separate boot frame
+elixir gizmo.exs --boot sys.txt task.txt
+
+# Limit eval cycles
+elixir gizmo.exs --max-cycles 10 task.txt
 ```
 
 ## Project structure

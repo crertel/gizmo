@@ -134,11 +134,25 @@ Production-grade process management.
 - [x] Test: kill Blackboard, verify it restarts and re-registers
 - [x] Test: agent exits cleanly under DynamicSupervisor, not restarted
 
-## Stage 10: Polish and Hardening
+## Stage 10: CLI Runtime Options
+
+Configurable cycle limits, stack exhaustion behavior, multi-file frame stacks,
+and signal handling.
+
+- [x] `--max-cycles N` — configurable eval cycle limit (default 50, 0 = unlimited)
+- [x] `--quit-on-exhaust` — terminate on empty frames instead of idling
+- [x] `--boot <file>` — separate boot frame from task frames
+- [x] Multi-file positional args (stacked as frames)
+- [x] `max_cycles` and `quit_on_exhaust` propagated to forked children
+- [x] SIGTERM and SIGQUIT signal traps for clean abort
+- [x] Tests: max_cycles limit, unlimited mode, quit_on_exhaust behavior
+
+## Stage 11: Polish and Hardening
 
 - [ ] Logging: structured logs for eval cycles, message routing, errors
 - [x] ~Telemetry~ — removed, see DEAD_ENDS.md
 - [x] ~Boot frame templating~ — removed, see DEAD_ENDS.md
+- [x] ~Config: cycle limits, stack exhaustion~ — done in Stage 10
 - [ ] Config: LLM model selection, timeouts, retry counts
 - [ ] Documentation: module docs, usage examples
 

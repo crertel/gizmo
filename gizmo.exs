@@ -870,6 +870,8 @@ defmodule Gizmo.Agent.Wrapper do
     parent = Keyword.get(opts, :parent, nil)
     verbose = Keyword.get(opts, :verbose, false)
     receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
+    max_cycles = Keyword.get(opts, :max_cycles, 50)
+    quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, false)
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
     Gizmo.Mailbox.register(mailbox_id)
@@ -886,6 +888,8 @@ defmodule Gizmo.Agent.Wrapper do
       chat_fn: chat_fn,
       verbose: verbose,
       receive_timeout: receive_timeout,
+      max_cycles: max_cycles,
+      quit_on_exhaust: quit_on_exhaust,
       msgs_queue: msgs_queue,
       boot_frame: List.first(frames)
     }
@@ -1089,9 +1093,9 @@ defmodule Gizmo.Agent do
   @doc """
   Start the supervision tree and the root agent. Blocks until the root agent exits.
   """
-  def start_root(boot_frame, opts \\ []) do
+  def start_root(frames, opts \\ []) when is_list(frames) do
     {:ok, _} = Gizmo.Supervision.start_link()
-    {:ok, _mailbox_id, pid} = start([boot_frame], opts)
+    {:ok, _mailbox_id, pid} = start(frames, opts)
 
     ref = Process.monitor(pid)
     receive do
@@ -1100,21 +1104,23 @@ defmodule Gizmo.Agent do
   end
 
   @max_eval_retries 3
-  @max_eval_cycles 50
 
   def eval_loop([], %{boot_frame: nil}), do: :ok
+  def eval_loop([], %{quit_on_exhaust: true}), do: :ok
   def eval_loop([], %{boot_frame: boot_frame} = state) do
     eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
   end
   def eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{}, %{}, %{})
 
   defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
-  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, _cycles, _persisted_sections, _bindings, _binding_notes) do
-    eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
+  defp eval_loop([], %{quit_on_exhaust: true}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
+  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, cycles, _persisted_sections, _bindings, _binding_notes) do
+    eval_loop([boot_frame], state, 0, cycles, %{}, %{}, %{})
   end
 
-  defp eval_loop(_context_stack, state, _retries, cycles, _persisted_sections, _bindings, _binding_notes) when cycles >= @max_eval_cycles do
-    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{@max_eval_cycles}) reached, terminating")
+  defp eval_loop(_context_stack, %{max_cycles: max_cycles} = state, _retries, cycles, _persisted_sections, _bindings, _binding_notes)
+       when max_cycles > 0 and cycles >= max_cycles do
+    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{max_cycles}) reached, terminating")
     error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
@@ -1225,7 +1231,9 @@ defmodule Gizmo.Agent do
       parent: state.mailbox_id,
       chat_fn: state.chat_fn,
       verbose: state.verbose,
-      receive_timeout: state.receive_timeout
+      receive_timeout: state.receive_timeout,
+      max_cycles: state.max_cycles,
+      quit_on_exhaust: state.quit_on_exhaust
     )
 
     # Monitor child: on abnormal exit, notify parent mailbox
@@ -1264,7 +1272,15 @@ defmodule Gizmo.CLI do
   def main do
     {opts, args, _} =
       OptionParser.parse(System.argv(),
-        strict: [test: :boolean, verbose: :boolean, init: :string, thinking: :boolean],
+        strict: [
+          test: :boolean,
+          verbose: :boolean,
+          init: :string,
+          thinking: :boolean,
+          max_cycles: :integer,
+          boot: :string,
+          quit_on_exhaust: :boolean
+        ],
         aliases: [v: :verbose]
       )
 
@@ -1276,7 +1292,7 @@ defmodule Gizmo.CLI do
         init_boot_frame(opts[:init])
 
       args != [] ->
-        run(hd(args), verbose: opts[:verbose] || false, thinking: opts[:thinking] || false)
+        run(args, opts)
 
       true ->
         usage()
@@ -1285,19 +1301,33 @@ defmodule Gizmo.CLI do
 
   defp usage do
     IO.puts("""
-    Usage: elixir gizmo.exs [options] [boot_frame_file]
+    Usage: elixir gizmo.exs [options] <file> [file ...]
 
     Options:
       --test              Run smoke tests, then exit
       --init <file>       Write a starter boot frame to <file>
       -v, --verbose       Enable verbose output
       --thinking          Enable extended thinking (Anthropic only)
+      --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
+      --quit-on-exhaust   Terminate when frames are exhausted instead of idling
+      --boot <file>       Separate boot frame file (used for idle recovery)
+
+    Positional arguments:
+      Without --boot: first file is the boot frame, rest are stacked on top.
+      With --boot:    --boot file is the boot frame, positional files are task frames.
+
+    Signal handling:
+      Ctrl+\\  (SIGQUIT) or kill <pid> (SIGTERM) cleanly stops the runtime.
+      Double Ctrl+C is the hard kill.
 
     Examples:
-      elixir gizmo.exs boot.txt          # single eval cycle
-      elixir gizmo.exs -v boot.txt       # verbose single eval cycle
-      elixir gizmo.exs --test            # smoke tests
-      elixir gizmo.exs --init boot.txt   # create a starter boot frame
+      elixir gizmo.exs task.txt                          # single file (boot = task)
+      elixir gizmo.exs a.txt b.txt                       # multi-file (boot = a)
+      elixir gizmo.exs --boot sys.txt task.txt            # separate boot frame
+      elixir gizmo.exs --quit-on-exhaust task.txt         # terminate on empty frames
+      elixir gizmo.exs --max-cycles 5 task.txt            # limit to 5 eval cycles
+      elixir gizmo.exs --test                             # smoke tests
+      elixir gizmo.exs --init boot.txt                    # create a starter boot frame
     """)
   end
 
@@ -2119,7 +2149,94 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 9. Supervision tests
+    # 9. Runtime options tests
+    IO.puts("--- Runtime Options ---")
+
+    # Ensure supervision tree is started (idempotent)
+    {:ok, _} = Gizmo.Supervision.start_link()
+
+    # Test: max_cycles: 5 terminates after 5 cycles
+    mc5_cycle = :counters.new(1, [:atomics])
+
+    mc5_chat_fn = fn _system, _messages, _opts ->
+      :counters.add(mc5_cycle, 1, 1)
+      {:ok, %{ops: [], frames: ["keep going"], notes: %{}}}
+    end
+
+    {:ok, _mc5_mb, mc5_pid} = Gizmo.Agent.start(["max cycles test"],
+      chat_fn: mc5_chat_fn, receive_timeout: 100, max_cycles: 5)
+
+    mc5_ref = Process.monitor(mc5_pid)
+    receive do
+      {:DOWN, ^mc5_ref, :process, ^mc5_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    mc5_count = :counters.get(mc5_cycle, 1)
+    failures = failures ++ assert_eq("max_cycles: 5 terminates after 5 cycles", mc5_count, 5)
+
+    # Test: max_cycles: 0 runs past 50 (unlimited)
+    mc0_cycle = :counters.new(1, [:atomics])
+
+    mc0_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(mc0_cycle, 1)
+      :counters.add(mc0_cycle, 1, 1)
+      if c >= 54 do
+        {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+      else
+        {:ok, %{ops: [], frames: ["keep going"], notes: %{}}}
+      end
+    end
+
+    {:ok, _mc0_mb, mc0_pid} = Gizmo.Agent.start(["unlimited cycles test"],
+      chat_fn: mc0_chat_fn, receive_timeout: 100, max_cycles: 0)
+
+    mc0_ref = Process.monitor(mc0_pid)
+    receive do
+      {:DOWN, ^mc0_ref, :process, ^mc0_pid, _} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    mc0_count = :counters.get(mc0_cycle, 1)
+    failures = failures ++ assert_eq("max_cycles: 0 runs past 50 (unlimited)", mc0_count, 55)
+
+    # Test: quit_on_exhaust: true terminates on empty frames
+    qoe_cycle = :counters.new(1, [:atomics])
+    qoe_test_mb = Gizmo.Mailbox.generate_id("qoe_test")
+    Gizmo.Mailbox.register(qoe_test_mb)
+
+    qoe_chat_fn = fn _system, _messages, _opts ->
+      :counters.add(qoe_cycle, 1, 1)
+      {:ok, %{ops: [{:send, qoe_test_mb, "hello"}], frames: [], notes: %{}}}
+    end
+
+    {:ok, _qoe_mb, qoe_pid} = Gizmo.Agent.start(["quit on exhaust test"],
+      chat_fn: qoe_chat_fn, receive_timeout: 100, quit_on_exhaust: true)
+
+    qoe_ref = Process.monitor(qoe_pid)
+
+    qoe_msg = receive do
+      {:mailbox_msg, ^qoe_test_mb, {_from, msg}} -> msg
+    after
+      2_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("quit_on_exhaust: sends message", qoe_msg, "hello")
+
+    receive do
+      {:DOWN, ^qoe_ref, :process, ^qoe_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+
+    qoe_count = :counters.get(qoe_cycle, 1)
+    failures = failures ++ assert_eq("quit_on_exhaust: terminates after 1 cycle (no idle)", qoe_count, 1)
+    Gizmo.Mailbox.unregister(qoe_test_mb)
+
+    IO.puts("")
+
+    # 10. Supervision tests
     IO.puts("--- Supervision ---")
 
     # Ensure supervision tree is started (idempotent)
@@ -2178,7 +2295,7 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 10. LLM test (only if API key is set)
+    # 11. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
@@ -2267,36 +2384,66 @@ defmodule Gizmo.CLI do
     end
   end
 
-  def run(path, opts) do
+  def run(paths, opts) when is_list(paths) do
     verbose = opts[:verbose] || false
     thinking = opts[:thinking] || false
+    boot_path = opts[:boot]
+    max_cycles = opts[:max_cycles]
+    quit_on_exhaust = opts[:quit_on_exhaust] || false
 
-    if verbose, do: IO.puts("Loading boot frame from #{path}...")
+    # Read all positional arg files
+    task_frames = Enum.map(paths, fn path ->
+      case File.read(path) do
+        {:ok, content} -> content
+        {:error, reason} ->
+          IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
+          System.halt(1)
+      end
+    end)
 
-    case File.read(path) do
-      {:ok, boot_frame} ->
-        if verbose do
-          IO.puts("Boot frame content:")
-          IO.puts(boot_frame)
-          IO.puts("")
-        end
-
-        run_opts = [verbose: verbose]
-        run_opts = if thinking do
-          chat_fn = fn system, messages, chat_opts ->
-            Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))
-          end
-          Keyword.put(run_opts, :chat_fn, chat_fn)
-        else
-          run_opts
-        end
-
-        Gizmo.Agent.start_root(boot_frame, run_opts)
-
-      {:error, reason} ->
-        IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
-        System.halt(1)
+    # Determine boot frame and assemble frames list
+    {frames, boot_frame} = if boot_path do
+      case File.read(boot_path) do
+        {:ok, boot_content} ->
+          {[boot_content | task_frames], boot_content}
+        {:error, reason} ->
+          IO.puts(:stderr, "Error reading #{boot_path}: #{:file.format_error(reason)}")
+          System.halt(1)
+      end
+    else
+      # First positional arg is the boot frame
+      {task_frames, List.first(task_frames)}
     end
+
+    if verbose do
+      IO.puts("Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}...")
+      IO.puts("")
+    end
+
+    run_opts = [verbose: verbose]
+    run_opts = if thinking do
+      chat_fn = fn system, messages, chat_opts ->
+        Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))
+      end
+      Keyword.put(run_opts, :chat_fn, chat_fn)
+    else
+      run_opts
+    end
+
+    run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
+    run_opts = if quit_on_exhaust, do: Keyword.put(run_opts, :quit_on_exhaust, true), else: run_opts
+
+    # Signal traps for clean abort
+    {:ok, _} = System.trap_signal(:sigterm, fn ->
+      IO.puts(:stderr, "[gizmo] SIGTERM received, shutting down...")
+      System.halt(0)
+    end)
+    {:ok, _} = System.trap_signal(:sigquit, fn ->
+      IO.puts(:stderr, "[gizmo] SIGQUIT received, shutting down...")
+      System.halt(0)
+    end)
+
+    Gizmo.Agent.start_root(frames, run_opts)
   end
 end
 

@@ -40,7 +40,8 @@ interaction—is built on top as mailbox-backed services.
 
 A process is **idle** when the context stack empties and the boot frame is
 restored. The LLM re-evaluates the boot frame and typically issues a
-`receive` to wait for new work.
+`receive` to wait for new work. With `--quit-on-exhaust`, the agent
+terminates immediately instead of idling — useful for one-shot agents.
 
 ## Syscalls
 
@@ -84,7 +85,10 @@ Per-agent state (not well-known, created per agent instance):
 5. Interpolate frames and op strings against bindings and sections
 6. Execute ops sequentially (may update bindings via receive/fork)
 7. Replace context stack with returned frames
-8. If stack is empty and boot frame exists → restore boot frame (idle)
+8. If stack is empty:
+   a. If quit_on_exhaust → agent terminates
+   b. If boot frame exists → restore boot frame (idle)
+   c. If no boot frame → agent terminates
 9. Goto 1
 ```
 
@@ -140,14 +144,15 @@ parsing ambiguity and the need for a text parser.
 
 ```
 LLM error → retry (×3) → exception mailbox → agent terminates
-cycle limit (50) exceeded → exception mailbox → agent terminates
+cycle limit exceeded → exception mailbox → agent terminates
 ```
 
 Three retries for LLM errors (schema violation, API error). After exhaustion,
 the error is reported to the `"exception"` mailbox and the agent terminates.
-A separate cycle limit (50) catches infinite loops. Transient API errors
-(429, 5xx) are retried with exponential backoff at the HTTP layer before
-reaching the eval retry logic.
+A configurable cycle limit (`--max-cycles`, default 50) catches infinite loops.
+Set to 0 for unlimited cycles. The limit is inherited by forked children.
+Transient API errors (429, 5xx) are retried with exponential backoff at the
+HTTP layer before reaching the eval retry logic.
 
 ## Supervision Tree
 
@@ -204,8 +209,21 @@ content (task description, workflow steps, named sections). The runtime prompt
 automatically by `Gizmo.Agent.runtime_prompt/0`.
 
 When the context stack drains to `[]`, the boot frame is restored so the
-agent idles and can receive new work. Agents that want to terminate use
-`join`, which exits before the idle clause fires.
+agent idles and can receive new work (unless `--quit-on-exhaust` is set).
+Agents that want to terminate use `join`, which exits before the idle clause
+fires.
+
+### Multi-file stacks
+
+Multiple files can be loaded as frames:
+
+- `gizmo task.txt` — frames=[task], boot_frame=task (backward compatible)
+- `gizmo a.txt b.txt` — frames=[a, b], boot_frame=a
+- `gizmo --boot sys.txt task.txt` — frames=[sys, task], boot_frame=sys
+
+With `--boot`, the boot frame is separate from task frames. Without it, the
+first positional file serves as both. This lets you reuse a generic boot
+frame (with sections, idle behavior, etc.) across different task files.
 
 Different boot frames = different "OS distributions." Same kernel, different
 preloaded services and instructions.

@@ -148,3 +148,30 @@ loop.
   (`bash`, `human`, `blackboard`) are fixed names. An agent that needs a
   custom service just sends to whatever mailbox ID it knows about—no template
   needed.
+
+## Hardcoded Cycle Limit as the Only Termination Strategy
+
+**Introduced:** Stage 6 (Agent Process)
+**Fixed:** Stage 10 (CLI Runtime Options)
+
+One-shot agents that returned `frames: []` without `join` would idle
+forever — the boot frame was restored, the cycle counter reset, and
+`max_eval_cycles` never fired. This meant even a simple "hello world" agent
+burned 50 LLM calls before the runtime killed it.
+
+### Why it didn't work
+
+- **Cycle counter reset on idle.** The idle clause restored the boot frame
+  and reset retries to 0, but preserved the cycle count. Before that fix,
+  cycles reset too, so the 50-cycle limit never triggered.
+- **No way to say "just stop."** The only exit paths were `join` (which
+  required awareness of the parent protocol) or hitting the cycle limit
+  (expensive). There was no clean "I'm done, don't idle" option.
+- **One size didn't fit all.** A 50-cycle limit is too high for one-shot
+  agents and too low for long-running interactive agents.
+
+### What replaced it
+
+- `--quit-on-exhaust` — agents terminate on empty frames instead of idling.
+- `--max-cycles N` — configurable cycle limit, with 0 meaning unlimited.
+- Both options propagate to forked children.

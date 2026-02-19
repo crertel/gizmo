@@ -49,7 +49,11 @@ Understanding the eval loop is critical for writing good prompts.
 4. Interpolation runs on the returned ops and frames BEFORE ops execute.
 5. Ops execute sequentially (send, receive, fork, join).
 6. The returned frames become the new context stack.
-7. If frames is empty [], the agent terminates. Otherwise, go to 1.
+7. If frames is empty []:
+   - With `--quit-on-exhaust`: the agent terminates.
+   - Otherwise: the boot frame is restored and the agent idles.
+   - Agents can also terminate explicitly via `join`.
+8. Otherwise, go to 1.
 ```
 
 **Key timing rule:** Interpolation happens *before* ops run. If you issue a
@@ -189,7 +193,13 @@ against the bindings. This is the "quoted verbatim" guarantee.
 
 ### One-shot agent
 
-The simplest pattern. Do something, return empty frames.
+The simplest pattern. Do something, return empty frames. Run with
+`--quit-on-exhaust` so the agent terminates cleanly on empty frames
+instead of idling.
+
+```bash
+elixir gizmo.exs --quit-on-exhaust hello.txt
+```
 
 ```
 You are a one-shot greeter. Send a short hello to the 'human' mailbox,
@@ -451,8 +461,39 @@ optional.
 | `--thinking` | Enable extended thinking (Anthropic only) |
 | `--test` | Run built-in smoke tests |
 | `--init <file>` | Generate a starter boot frame |
+| `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
+| `--quit-on-exhaust` | Terminate when frames are exhausted instead of idling |
+| `--boot <file>` | Separate boot frame file (used for idle recovery) |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
 responding. This can help with complex multi-step tasks where the LLM needs
 to plan its cycle carefully. It uses `tool_choice: "any"` instead of forced
 tool use, and increases the max token budget to 16k.
+
+### `--quit-on-exhaust`
+
+By default, when an agent's frame stack drains to `[]`, the runtime restores
+the boot frame and the agent idles (waiting for a message). This is useful
+for long-running agents that receive work dynamically.
+
+For one-shot or multi-step agents that should terminate when done,
+`--quit-on-exhaust` makes the agent exit immediately on empty frames. Without
+it, agents must use `join` to explicitly terminate.
+
+### `--boot <file>` and multi-file stacks
+
+Multiple positional files are loaded as frames (first file on the bottom of
+the stack). Without `--boot`, the first file is both the boot frame and the
+bottom of the stack. With `--boot`, the boot file is used for idle recovery
+and all positional files are task frames stacked on top.
+
+```bash
+# task.txt is both boot frame and task
+elixir gizmo.exs task.txt
+
+# sys.txt is the boot frame, task.txt is stacked on top
+elixir gizmo.exs --boot sys.txt task.txt
+```
+
+This lets you reuse a generic boot frame (with sections, idle behavior, etc.)
+across different task files.

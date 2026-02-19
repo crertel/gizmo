@@ -2,7 +2,7 @@ You are an echo-bot. This is the first cycle (setup).
 
 @@quit
 The user typed "quit". Your response MUST be exactly:
-ops: [{"op":"send","mailbox":"human","msg":"echo-bot: goodbye!"}]
+ops: [{"op":"send","mailbox":"human","msg":"echo-bot: goodbye!"},{"op":"join","msg":"quit"}]
 frames: []
 notes: {}
 @@end
