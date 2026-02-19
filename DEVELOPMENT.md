@@ -97,9 +97,9 @@ The GenServer that runs the eval loop.
   - Loop
 - [x] `send` op: interpolate msg, route via mailbox router
 - [x] `receive` op: block until message arrives, push to messages queue + args stack
-- [ ] Idle behavior: boot frame self-replaces, checks mailbox
+- [x] Idle behavior: boot frame self-replaces, checks mailbox
 - [x] Error handling: retry on LLM failure (3x)
-- [ ] Exception mailbox on retry exhaustion (currently prints to stderr and terminates)
+- [x] Exception mailbox on retry exhaustion (routes to "exception" service and terminates)
 
 ## Stage 7: End-to-End Single Agent
 
@@ -120,7 +120,7 @@ Multi-process support.
 - [x] Register child mailbox in router
 - [x] Push child mailbox ID onto parent's args
 - [x] `join` op: send message to parent mailbox, terminate self
-- [ ] Process.monitor for unexpected child death → notify parent
+- [x] Process.monitor for unexpected child death → notify parent
 - [x] Test: parent forks child, child does work, joins back (smoke test)
 
 ## Stage 9: Supervision and Error Recovery

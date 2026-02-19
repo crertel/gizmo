@@ -861,6 +861,48 @@ defmodule Gizmo.Services.HumanInput do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Exception — logs agent errors to stderr
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Exception do
+  use GenServer
+
+  def start_link(mailbox_id \\ "exception") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {from, error_info}}, state) do
+    IO.puts(:stderr, "[exception] from=#{from} #{format_error(error_info)}")
+    {:noreply, state}
+  end
+
+  defp format_error({:max_retries_exceeded, agent_id, retry_count, failing_frame}) do
+    "max_retries_exceeded agent=#{agent_id} retries=#{retry_count} frame=#{inspect(truncate(failing_frame, 120))}"
+  end
+
+  defp format_error({:max_cycles_exceeded, agent_id, cycle_count}) do
+    "max_cycles_exceeded agent=#{agent_id} cycles=#{cycle_count}"
+  end
+
+  defp format_error(other) do
+    inspect(other)
+  end
+
+  defp truncate(s, max) when is_binary(s) do
+    if String.length(s) > max, do: String.slice(s, 0, max) <> "…", else: s
+  end
+
+  defp truncate(other, _max), do: inspect(other)
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent — spawned-process agent with eval loop
 # -----------------------------------------------------------------------------
 
@@ -939,6 +981,9 @@ defmodule Gizmo.Agent do
       The output is pushed onto your args stack as $1.
     - blackboard: Key-value store. Send {read, key} or {write, key, value},
       then receive the result. Read returns the value as $1. Write returns "ok".
+    - exception: Error notification sink. The runtime sends error tuples here
+      when an agent exceeds retry or cycle limits. You do not normally send
+      to this mailbox yourself.
 
     ## Important timing rule
 
@@ -984,7 +1029,13 @@ defmodule Gizmo.Agent do
   end
 
   @doc """
-  Spawn a linked agent process. Returns {:ok, mailbox_id}.
+  Spawn an agent process. Returns {:ok, mailbox_id, pid}.
+
+  The agent is spawned (not linked) so child crashes do not kill the parent.
+  If frames is non-empty, the first frame is saved as the boot frame. When the
+  context stack drains to [], the boot frame is re-pushed so the agent idles
+  and waits for new work. Agents that want to terminate should use join, which
+  exits before the idle clause fires.
 
   Options:
     - parent: parent mailbox_id (for join)
@@ -1000,7 +1051,7 @@ defmodule Gizmo.Agent do
     caller = self()
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
 
-    pid = spawn_link(fn ->
+    pid = spawn(fn ->
       Gizmo.Mailbox.register(mailbox_id)
 
       # Start per-agent services
@@ -1018,7 +1069,8 @@ defmodule Gizmo.Agent do
         verbose: verbose,
         receive_timeout: receive_timeout,
         args_stack: args_stack,
-        msgs_queue: msgs_queue
+        msgs_queue: msgs_queue,
+        boot_frame: List.first(frames)
       }
 
       eval_loop(frames, state)
@@ -1047,6 +1099,7 @@ defmodule Gizmo.Agent do
     {:ok, _} = Gizmo.Services.Bash.start_link("bash")
     {:ok, _} = Gizmo.Services.Human.start_link("human")
     {:ok, _} = Gizmo.Services.HumanInput.start_link("human_input")
+    {:ok, _} = Gizmo.Services.Exception.start_link("exception")
 
     {:ok, _mailbox_id, pid} = start([boot_frame], opts)
 
@@ -1060,17 +1113,28 @@ defmodule Gizmo.Agent do
   @max_eval_retries 3
   @max_eval_cycles 50
 
-  defp eval_loop([], _state), do: :ok
+  defp eval_loop([], %{boot_frame: nil}), do: :ok
+  defp eval_loop([], %{boot_frame: boot_frame} = state) do
+    eval_loop([boot_frame], state, 0, 0, %{})
+  end
   defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{})
 
-  defp eval_loop([], _state, _retries, _cycles, _persisted_sections), do: :ok
+  defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections), do: :ok
+  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, _cycles, _persisted_sections) do
+    eval_loop([boot_frame], state, 0, 0, %{})
+  end
 
   defp eval_loop(_context_stack, state, _retries, cycles, _persisted_sections) when cycles >= @max_eval_cycles do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{@max_eval_cycles}) reached, terminating")
+    error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
+    Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
-  defp eval_loop(_context_stack, state, retries, _cycles, _persisted_sections) when retries >= @max_eval_retries do
+  defp eval_loop(context_stack, state, retries, _cycles, _persisted_sections) when retries >= @max_eval_retries do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
+    failing_frame = List.first(context_stack) || ""
+    error_info = {:max_retries_exceeded, state.mailbox_id, retries, failing_frame}
+    Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
   defp eval_loop(context_stack, state, retries, cycles, persisted_sections) do
@@ -1161,12 +1225,28 @@ defmodule Gizmo.Agent do
     _popped = Enum.take(frames, n)
     remaining_frames = Enum.drop(frames, n)
 
-    {:ok, child_mb, _pid} = Gizmo.Agent.start(child_frames,
+    {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames,
       parent: state.mailbox_id,
       chat_fn: state.chat_fn,
       verbose: state.verbose,
       receive_timeout: state.receive_timeout
     )
+
+    # Monitor child: on abnormal exit, notify parent mailbox
+    parent_mb = state.mailbox_id
+    verbose = state.verbose
+    spawn(fn ->
+      ref = Process.monitor(child_pid)
+      receive do
+        {:DOWN, ^ref, :process, ^child_pid, :normal} ->
+          :ok
+        {:DOWN, ^ref, :process, ^child_pid, reason} ->
+          if verbose do
+            IO.puts(:stderr, "[watcher] child #{child_mb} died: #{inspect(reason)}")
+          end
+          Gizmo.Mailbox.route(parent_mb, {child_mb, "child_died:#{child_mb} reason=#{inspect(reason)}"})
+      end
+    end)
 
     Gizmo.Services.ArgsStack.push(state.args_stack, child_mb)
     {:cont, remaining_frames}
@@ -1786,6 +1866,193 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("multi-frame concat",
       String.contains?(concat_result, "frame A\n\n---\n\nframe B"), true)
     Agent.stop(concat_agent)
+
+    # Test 5: Idle behavior — agent goes idle, wakes on message, terminates
+    idle_test_mb = Gizmo.Mailbox.generate_id("idle_test")
+    Gizmo.Mailbox.register(idle_test_mb)
+    idle_cycle = :counters.new(1, [:atomics])
+
+    idle_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(idle_cycle, 1)
+      :counters.add(idle_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # Cycle 0: go idle (frames: []) — boot frame will self-replace
+          {:ok, %{ops: [], frames: []}}
+        1 ->
+          # Cycle 1: boot frame re-evaluated, issue a receive to wait for work
+          {:ok, %{ops: [:receive], frames: ["waiting for work"]}}
+        2 ->
+          # Cycle 2: got the message in $1, forward it and terminate via join
+          {:ok, %{ops: [{:send, idle_test_mb, "$1"}, {:join, "done"}], frames: []}}
+        _ ->
+          {:ok, %{ops: [], frames: []}}
+      end
+    end
+
+    {:ok, idle_agent_mb, idle_pid} = Gizmo.Agent.start(["idle boot frame"],
+      chat_fn: idle_chat_fn, receive_timeout: 2_000)
+
+    # Give the agent time to go idle and come back on boot frame
+    Process.sleep(100)
+    # Send it a message to wake it up
+    Gizmo.Mailbox.route(idle_agent_mb, {"test", "wake up!"})
+
+    idle_ref = Process.monitor(idle_pid)
+
+    idle_result = receive do
+      {:mailbox_msg, ^idle_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("idle: agent wakes and forwards message", idle_result, "wake up!")
+
+    receive do
+      {:DOWN, ^idle_ref, :process, ^idle_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(idle_test_mb)
+
+    # Test 6: Exception mailbox on retry exhaustion
+    exc_test_mb = Gizmo.Mailbox.generate_id("exc_test")
+    {:ok, exc_svc_pid} = Gizmo.Services.Exception.start_link(exc_test_mb)
+
+    # Also register a spy mailbox to intercept the exception
+    exc_spy_mb = Gizmo.Mailbox.generate_id("exc_spy")
+    Gizmo.Mailbox.register(exc_spy_mb)
+
+    # We need to temporarily replace the "exception" mailbox routing.
+    # Instead, we'll start an agent that always errors, and the global
+    # "exception" mailbox may or may not exist. We use our own exc_test_mb.
+    # The trick: patch eval_loop to route to exc_test_mb.
+    # Simpler: just check the global "exception" mailbox if started in test context.
+    # Actually simplest: start a global exception service, have the agent fail,
+    # and intercept via the exception service's GenServer state.
+
+    # Use a different approach: start the agent with a chat_fn that always fails,
+    # and check that exception routing happened by reading from a known mailbox.
+    # We'll register "exception" if not already done, have the agent error out,
+    # and use a Process.monitor + message capture.
+
+    # Register a listener on "exception" — but it may already be taken.
+    # Instead: we'll snoop on the exception service we started above.
+    # The exception service prints to stderr; let's just verify the agent terminates
+    # after 3 retries AND that the exception service received a message.
+
+    exc_received = Agent.start_link(fn -> nil end)
+    {:ok, exc_capture} = exc_received
+
+    # Stop the dedicated test exception service and replace with a capturing one
+    GenServer.stop(exc_svc_pid)
+    # Register a capturing process under exc_test_mb — but we need "exception" for routing
+    # Let's just check the global behavior: start a failing agent and verify it doesn't crash the test
+
+    always_fail_fn = fn _system, _messages, _opts ->
+      {:error, :deliberate_fail}
+    end
+
+    # We need "exception" to be registered. It may already be if start_root was called,
+    # but in test mode it's not. Register ourselves temporarily.
+    exception_already = case Gizmo.Mailbox.lookup("exception") do
+      {:ok, _} -> true
+      {:error, _} -> false
+    end
+
+    unless exception_already do
+      Gizmo.Mailbox.register("exception")
+    end
+
+    {:ok, _fail_mb, fail_pid} = Gizmo.Agent.start(["always fail frame"],
+      chat_fn: always_fail_fn, receive_timeout: 100)
+
+    fail_ref = Process.monitor(fail_pid)
+
+    # Collect exception notification if we registered "exception"
+    exc_notification = if not exception_already do
+      receive do
+        {:mailbox_msg, "exception", {_from, error_info}} -> error_info
+      after
+        5_000 -> :no_exception
+      end
+    else
+      :skipped
+    end
+
+    receive do
+      {:DOWN, ^fail_ref, :process, ^fail_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures = if not exception_already do
+      failures ++ case exc_notification do
+        {:max_retries_exceeded, _agent_id, 3, "always fail frame"} ->
+          assert_eq("exception mailbox receives retry exhaustion", :ok, :ok)
+        other ->
+          assert_eq("exception mailbox receives retry exhaustion", other, {:max_retries_exceeded, :_, 3, "always fail frame"})
+      end
+    else
+      failures ++ assert_eq("exception mailbox (skipped, already registered)", :skipped, :skipped)
+    end
+
+    unless exception_already do
+      Gizmo.Mailbox.unregister("exception")
+    end
+
+    Agent.stop(exc_capture)
+    Gizmo.Mailbox.unregister(exc_spy_mb)
+
+    # Test 7: Child death notification
+    child_death_cycle = :counters.new(1, [:atomics])
+
+    child_death_chat_fn = fn system, _messages, _opts ->
+      c = :counters.get(child_death_cycle, 1)
+      :counters.add(child_death_cycle, 1, 1)
+
+      cond do
+        # Parent cycle 0: fork a child that will crash, then receive
+        c == 0 ->
+          {:ok, %{ops: [{:fork, 0, ["crash frame"]}, :receive], frames: ["parent waiting for child death"]}}
+        # Child: always raises
+        String.contains?(system, "crash frame") ->
+          raise "deliberate child crash"
+        # Parent cycle 1: got death notification in $1
+        true ->
+          {:ok, %{ops: [], frames: []}}
+      end
+    end
+
+    child_death_result = Agent.start_link(fn -> nil end)
+    {:ok, cd_agent} = child_death_result
+
+    # Wrap to capture args on parent's second call
+    cd_chat_fn = fn system, messages, opts ->
+      result = child_death_chat_fn.(system, messages, opts)
+      c = :counters.get(child_death_cycle, 1)
+      # After cycle counter is 3, parent is on its second call (c was 2 when called)
+      if c >= 3 do
+        Agent.update(cd_agent, fn _ -> system end)
+      end
+      result
+    end
+
+    {:ok, _cd_mb, cd_pid} = Gizmo.Agent.start(["parent frame"],
+      chat_fn: cd_chat_fn, receive_timeout: 5_000)
+
+    cd_ref = Process.monitor(cd_pid)
+    receive do
+      {:DOWN, ^cd_ref, :process, ^cd_pid, _} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    cd_result = Agent.get(cd_agent, & &1)
+    # The parent should have received a "child_died:" message
+    failures = failures ++ assert_eq("child death notification received by parent",
+      cd_result != nil && String.contains?(to_string(cd_result), "child_died:"), true)
+    Agent.stop(cd_agent)
 
     IO.puts("")
 
