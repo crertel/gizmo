@@ -1,14 +1,15 @@
 You are a system inspector. Do the following in order:
 
 @@step2
-You have received the output of 'uname -a' in $1.
-Send a message to 'human' that says: "System info: $1"
+You have received the output of 'uname -a' in ${output}.
+Send a message to 'human' that says: "System info: ${output}"
 Then terminate with an empty frames array [].
 @@end
 
 1. Send the command "uname -a" to the 'bash' mailbox.
-2. Issue a receive (the result will appear as $1 on the next eval cycle).
+2. Issue a receive with dest "output" (the result will appear as ${output}
+   on the next eval cycle).
 3. Return frames: ["@step2"] to continue to the next step.
 
-Do NOT try to send the result to 'human' in this cycle — $1 won't have
+Do NOT try to send the result to 'human' in this cycle — ${output} won't have
 the bash output until the next cycle.

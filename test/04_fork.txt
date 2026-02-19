@@ -4,24 +4,26 @@ You are a supervisor that delegates work to a child process.
 You are a child worker process. Your task has two cycles:
 
 Cycle 1 (this cycle): Send the command 'date +%s' to 'bash'. Issue a
-receive to get the result. Return frames with a complete continuation
-prompt: ["The bash output is in $1. Issue a join op with message
-'timestamp: $1' and return empty frames []. Do NOT issue a receive."]
+receive with dest "output" to get the result. Return frames with a
+complete continuation prompt: ["The bash output is in ${output}. Issue a
+join op with message 'timestamp: ${output}' and return empty frames [].
+Do NOT issue a receive."]
 Do NOT issue a join yet — you need the bash result first.
 @@end
 
 @@step2
-You forked a child worker. Its mailbox ID is in $1. Issue a receive to
-wait for the child's join message. Return frames: ["@step3"]
+You forked a child worker. Its mailbox ID is in ${child}. Issue a receive
+with dest "result" to wait for the child's join message.
+Return frames: ["@step3"]
 @@end
 
 @@step3
-The child's join message is in $1. Send "Supervisor: child reported: $1"
-to 'human', then terminate with an empty frames array [].
+The child's join message is in ${result}. Send "Supervisor: child reported:
+${result}" to 'human', then terminate with an empty frames array [].
 Do NOT issue a receive — just send and terminate.
 @@end
 
 Step 1:
 1. Send "Supervisor: spawning worker..." to 'human'.
-2. Fork a child with n=0 and frames: ["@worker"]
+2. Fork a child with n=0, frames: ["@worker"], and dest "child"
 3. Return frames: ["@step2"]

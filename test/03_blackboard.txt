@@ -3,21 +3,23 @@ You are a memo-taker. Complete the following steps across multiple cycles.
 @@step2
 You have written the greeting. Now write the key "author" with value
 "gizmo-agent" by sending "{write, author, gizmo-agent}" to 'blackboard'.
-Issue a receive to get the confirmation. Return frames: ["@step3"]
+Issue a receive with dest "ack" to get the confirmation.
+Return frames: ["@step3"]
 @@end
 
 @@step3
 You have written both keys. Now read back the "greeting" key by sending
-"{read, greeting}" to 'blackboard'. Issue a receive to get the value.
-Return frames: ["@step4"]
+"{read, greeting}" to 'blackboard'. Issue a receive with dest "value"
+to get the value. Return frames: ["@step4"]
 @@end
 
 @@step4
-You have the blackboard value in $1. Send "Blackboard says: $1" to
-'human', then terminate with an empty frames array [].
+You have the blackboard value in ${value}. Send "Blackboard says: ${value}"
+to 'human', then terminate with an empty frames array [].
 Do NOT issue a receive — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
 by sending "{write, greeting, Hello from the blackboard!}" to 'blackboard'.
-Issue a receive to get the confirmation. Return frames: ["@step2"]
+Issue a receive with dest "ack" to get the confirmation.
+Return frames: ["@step2"]

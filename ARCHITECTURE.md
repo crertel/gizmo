@@ -46,12 +46,12 @@ self-replacing frame that checks the mailbox for new work.
 | Syscall | Signature | Behavior |
 |---------|-----------|----------|
 | `send`  | `send(mailbox_id, msg)` | Async fire-and-forget message to any mailbox. Non-blocking. |
-| `receive` | `receive()` | Block until a message arrives. Result goes to messages queue and args stack. |
-| `fork` | `fork(n, [frames...])` | Spawn child with copied stack, pop top n frames, push new frames. Child mailbox ID pushed to parent's args. |
+| `receive` | `receive(dest)` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
+| `fork` | `fork(n, [frames...], dest)` | Spawn child with copied stack, pop top n frames, push new frames. Child mailbox ID stored in binding `dest`. |
 | `join` | `join(msg)` | Send message to parent (or specified mailbox), then terminate self. |
 
-All message content is interpolated (`$n` from args, `${name}` from
-blackboard) at operation time.
+All message content is interpolated (`${name}` from bindings) at operation
+time.
 
 ## Well-Known Services
 
@@ -59,7 +59,7 @@ These are ordinary processes registered at boot. They are not syscalls.
 
 | Service | Mailbox | Purpose |
 |---------|---------|---------|
-| **args** | registered | Argument stack. Data values for `$n` interpolation. Auto-pushed by `receive()`. |
+| **bindings** | (in-process) | Named bindings map. Values from `receive(dest)` and `fork(dest)`. Threaded through eval loop. |
 | **messages** | registered | Message queue. `receive()` results with content + source metadata. |
 | **blackboard** | registered | Key-value store. Persistent shared memory. `{read, key}` / `{write, key, value}`. |
 | **bash** | registered | Shell command execution. Send command string, get output back. |
@@ -95,11 +95,12 @@ The response contains two arrays: `ops` (syscalls to execute) and `frames`
   "ops": [
     {"op": "send", "mailbox": "human", "msg": "I'll check the files."},
     {"op": "send", "mailbox": "bash", "msg": "ls -la"},
-    {"op": "receive"}
+    {"op": "receive", "dest": "listing"}
   ],
   "frames": [
-    "Process the directory listing."
-  ]
+    "Process the directory listing in ${listing}."
+  ],
+  "notes": {"listing": "output of ls -la"}
 }
 ```
 
@@ -108,8 +109,8 @@ Each op is an object with an `"op"` field and syscall-specific parameters:
 | Op | Fields | Example |
 |----|--------|---------|
 | `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
-| `receive` | _(none)_ | `{"op": "receive"}` |
-| `fork` | `n`, `frames` | `{"op": "fork", "n": 1, "frames": ["child task"]}` |
+| `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
+| `fork` | `n`, `frames`, `dest` | `{"op": "fork", "n": 1, "frames": ["child task"], "dest": "child"}` |
 | `join` | `msg` | `{"op": "join", "msg": "result"}` |
 
 The schema is enforced by the LLM provider (Anthropic tool_use with forced
@@ -118,8 +119,8 @@ parsing ambiguity and the need for a text parser.
 
 ## Interpolation
 
-- `$n` — positional reference to args stack (1-indexed from bottom)
-- `${name}` — named reference resolved via blackboard
+- `${name}` — named reference resolved via bindings map (populated by
+  `receive(dest)` and `fork(dest)`)
 - Resolved at operation time, not at frame push time
 
 ## Error Handling
@@ -140,7 +141,6 @@ Application
 ├── MailboxRouter (Registry)
 ├── ServiceSupervisor (one_for_one)
 │   ├── BashAdapter
-│   ├── ArgsStack
 │   ├── MessagesQueue
 │   ├── Blackboard
 │   ├── HumanAdapter

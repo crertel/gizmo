@@ -27,12 +27,17 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)} #{@bold}── cycle #{cycle} ──#{@reset} #{@dim}(#{frames_label})#{@reset}"
   end
 
-  def args_line(id, args) do
-    if args == [] do
-      "#{agent_tag(id)}   #{@dim}args: (empty)#{@reset}"
+  def bindings_line(id, bindings, binding_notes) do
+    if map_size(bindings) == 0 do
+      "#{agent_tag(id)}   #{@dim}bindings: (empty)#{@reset}"
     else
-      formatted = args |> Enum.with_index(1) |> Enum.map(fn {val, i} ->
-        "#{@dim}$#{i}=#{@reset}#{truncate(val, 60)}"
+      formatted = bindings |> Enum.sort() |> Enum.map(fn {key, val} ->
+        note = Map.get(binding_notes, key)
+        if note do
+          "#{@dim}${#{key}}=#{@reset}#{truncate(val, 60)} #{@dim}(#{note})#{@reset}"
+        else
+          "#{@dim}${#{key}}=#{@reset}#{truncate(val, 60)}"
+        end
       end) |> Enum.join("  ")
       "#{agent_tag(id)}   #{formatted}"
     end
@@ -42,14 +47,14 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)}   #{@green}send#{@reset} #{@bold}#{mailbox}#{@reset} ← #{truncate(msg, 80)}"
   end
 
-  def op_receive(id, timeout) do
-    "#{agent_tag(id)}   #{@yellow}receive#{@reset} #{@dim}(timeout: #{timeout}ms)#{@reset}"
+  def op_receive(id, dest, timeout) do
+    "#{agent_tag(id)}   #{@yellow}receive#{@reset} → #{@bold}${#{dest}}#{@reset} #{@dim}(timeout: #{timeout}ms)#{@reset}"
   end
 
-  def op_fork(id, n, child_frames) do
+  def op_fork(id, n, child_frames, dest) do
     n_child = length(child_frames)
     child_label = if n_child == 1, do: "1 frame", else: "#{n_child} frames"
-    "#{agent_tag(id)}   #{@magenta}fork#{@reset} n=#{n}, child gets #{child_label}"
+    "#{agent_tag(id)}   #{@magenta}fork#{@reset} n=#{n}, child gets #{child_label} → #{@bold}${#{dest}}#{@reset}"
   end
 
   def op_join(id, msg, parent) do
@@ -92,11 +97,11 @@ end
 defmodule Gizmo.LLM do
   @type op ::
           %{op: String.t(), mailbox: String.t(), msg: String.t()}
-          | %{op: String.t()}
-          | %{op: String.t(), n: integer(), frames: [String.t()]}
+          | %{op: String.t(), dest: String.t()}
+          | %{op: String.t(), n: integer(), frames: [String.t()], dest: String.t()}
           | %{op: String.t(), msg: String.t()}
 
-  @type eval_response :: %{ops: [op()], frames: [String.t()]}
+  @type eval_response :: %{ops: [op()], frames: [String.t()], notes: map()}
 
   @callback chat(system :: String.t(), messages :: list(), opts :: keyword()) ::
               {:ok, eval_response()} | {:error, term()}
@@ -108,7 +113,7 @@ defmodule Gizmo.LLM do
         "This is the ONLY way to respond. Always call this tool.",
     input_schema: %{
       type: "object",
-      required: ["ops", "frames"],
+      required: ["ops", "frames", "notes"],
       properties: %{
         ops: %{
           type: "array",
@@ -138,6 +143,10 @@ defmodule Gizmo.LLM do
                 type: "array",
                 items: %{type: "string"},
                 description: "Frames to push onto child stack (for fork)."
+              },
+              dest: %{
+                type: "string",
+                description: "Binding name for the result (for receive and fork)."
               }
             }
           }
@@ -148,6 +157,14 @@ defmodule Gizmo.LLM do
           description:
             "Replacement frames to push onto the context stack. " <>
               "Empty array means this frame is done (stack shrinks)."
+        },
+        notes: %{
+          type: "object",
+          description:
+            "Annotations for bindings. Keys are binding names, values are " <>
+              "short descriptions. These persist across cycles and are shown " <>
+              "alongside binding values.",
+          additionalProperties: %{type: "string"}
         }
       }
     }
@@ -162,12 +179,21 @@ defmodule Gizmo.LLM do
     case validate_ops(ops_raw) do
       {:ok, ops} ->
         frames = input["frames"] || []
-        {:ok, %{ops: ops, frames: frames}}
+        notes = normalize_notes(input["notes"])
+        {:ok, %{ops: ops, frames: frames, notes: notes}}
 
       {:error, _} = err ->
         err
     end
   end
+
+  defp normalize_notes(nil), do: %{}
+  defp normalize_notes(notes) when is_map(notes) do
+    notes
+    |> Enum.filter(fn {k, v} -> is_binary(k) and is_binary(v) end)
+    |> Enum.into(%{})
+  end
+  defp normalize_notes(_), do: %{}
 
   defp validate_ops(ops_raw) do
     Enum.reduce_while(ops_raw, {:ok, []}, fn op, {:ok, acc} ->
@@ -185,12 +211,17 @@ defmodule Gizmo.LLM do
     end
   end
 
-  defp validate_op(%{"op" => "receive"}), do: {:ok, :receive}
+  defp validate_op(%{"op" => "receive"} = op) do
+    with :ok <- require_string(op, "dest", "receive") do
+      {:ok, {:receive, op["dest"]}}
+    end
+  end
 
   defp validate_op(%{"op" => "fork"} = op) do
     with :ok <- require_integer(op, "n", "fork"),
-         :ok <- require_list(op, "frames", "fork") do
-      {:ok, {:fork, op["n"], op["frames"]}}
+         :ok <- require_list(op, "frames", "fork"),
+         :ok <- require_string(op, "dest", "fork") do
+      {:ok, {:fork, op["n"], op["frames"], op["dest"]}}
     end
   end
 
@@ -229,29 +260,30 @@ defmodule Gizmo.LLM do
 
   @doc """
   Apply interpolation to an eval_response's frames and op message strings.
-  Takes an eval_response, args list, bindings map, and optional sections map.
+  Takes an eval_response, bindings map, and optional sections map.
+  Notes are passed through unchanged.
   """
-  def interpolate_response(%{ops: ops, frames: frames}, args, bindings, sections \\ %{}) do
+  def interpolate_response(%{ops: ops, frames: frames, notes: notes}, bindings, sections \\ %{}) do
     interpolated_frames =
-      Enum.map(frames, &Gizmo.Interpolation.resolve(&1, args, bindings, sections))
+      Enum.map(frames, &Gizmo.Interpolation.resolve(&1, bindings, sections))
 
     interpolated_ops =
       Enum.map(ops, fn
         {:send, mailbox, msg} ->
-          {:send, mailbox, Gizmo.Interpolation.resolve(msg, args, bindings, sections)}
+          {:send, mailbox, Gizmo.Interpolation.resolve(msg, bindings, sections)}
 
         {:join, msg} ->
-          {:join, Gizmo.Interpolation.resolve(msg, args, bindings, sections)}
+          {:join, Gizmo.Interpolation.resolve(msg, bindings, sections)}
 
-        {:fork, n, fork_frames} ->
+        {:fork, n, fork_frames, dest} ->
           {:fork, n,
-           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, args, bindings, sections))}
+           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)), dest}
 
         other ->
           other
       end)
 
-    %{ops: interpolated_ops, frames: interpolated_frames}
+    %{ops: interpolated_ops, frames: interpolated_frames, notes: notes}
   end
 end
 
@@ -426,7 +458,7 @@ defmodule Gizmo.LLM.OpenAI do
 end
 
 # -----------------------------------------------------------------------------
-# Gizmo.Interpolation — resolve $n and ${name} references
+# Gizmo.Interpolation — resolve ${name} references
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Interpolation do
@@ -459,8 +491,8 @@ defmodule Gizmo.Interpolation do
   end
 
   @doc """
-  Resolve `@N`/`@name` (from sections), `$n` (positional args), `${name}`
-  (from bindings), `@@` (literal @), and `$$` (literal $) in text.
+  Resolve `@N`/`@name` (from sections), `${name}` (from bindings),
+  `@@` (literal @), and `$$` (literal $) in text.
   Unresolved references are left as-is.
 
   Resolution order:
@@ -468,16 +500,14 @@ defmodule Gizmo.Interpolation do
   2. Escape $$ → sentinel
   3. Resolve @name/@N from sections (injected content has $ escaped)
   4. Resolve ${name} from bindings
-  5. Resolve $n from args
-  6. Restore sentinels
+  5. Restore sentinels
   """
-  def resolve(text, args \\ [], bindings \\ %{}, sections \\ %{}) do
+  def resolve(text, bindings \\ %{}, sections \\ %{}) do
     text
     |> String.replace("@@", @at_sentinel)
     |> String.replace("$$", @dollar_sentinel)
     |> resolve_sections(sections)
     |> resolve_named(bindings)
-    |> resolve_positional(args)
     |> String.replace(@at_sentinel, "@")
     |> String.replace(@dollar_sentinel, "$")
   end
@@ -506,20 +536,6 @@ defmodule Gizmo.Interpolation do
     end)
   end
 
-  defp resolve_positional(text, args) do
-    Regex.replace(~r/\$(\d+)/, text, fn full_match, n_str ->
-      case Integer.parse(n_str) do
-        {n, ""} ->
-          case Enum.at(args, n - 1) do
-            nil -> full_match
-            val -> to_string(val)
-          end
-
-        _ ->
-          full_match
-      end
-    end)
-  end
 end
 
 # -----------------------------------------------------------------------------
@@ -573,70 +589,6 @@ defmodule Gizmo.Mailbox do
   @doc "Unregister the calling process from `mailbox_id`."
   def unregister(mailbox_id) do
     Registry.unregister(@registry, mailbox_id)
-  end
-end
-
-# -----------------------------------------------------------------------------
-# Gizmo.Services.ArgsStack — per-agent stack for positional $n interpolation
-# -----------------------------------------------------------------------------
-
-defmodule Gizmo.Services.ArgsStack do
-  use GenServer
-
-  def start_link(mailbox_id) do
-    GenServer.start_link(__MODULE__, mailbox_id)
-  end
-
-  def push(pid, value), do: GenServer.call(pid, {:push, value})
-  def pop(pid), do: GenServer.call(pid, :pop)
-  def peek(pid, n), do: GenServer.call(pid, {:peek, n})
-  def to_list(pid), do: GenServer.call(pid, :to_list)
-
-  @impl true
-  def init(mailbox_id) do
-    Gizmo.Mailbox.register(mailbox_id)
-    {:ok, %{mailbox_id: mailbox_id, stack: []}}
-  end
-
-  @impl true
-  def handle_call({:push, value}, _from, %{stack: stack} = state) do
-    {:reply, :ok, %{state | stack: [value | stack]}}
-  end
-
-  def handle_call(:pop, _from, %{stack: []} = state) do
-    {:reply, {:error, :empty}, state}
-  end
-
-  def handle_call(:pop, _from, %{stack: [top | rest]} = state) do
-    {:reply, {:ok, top}, %{state | stack: rest}}
-  end
-
-  def handle_call({:peek, n}, _from, %{stack: stack} = state) do
-    case Enum.at(stack, n) do
-      nil -> {:reply, {:error, :out_of_range}, state}
-      val -> {:reply, {:ok, val}, state}
-    end
-  end
-
-  def handle_call(:to_list, _from, %{stack: stack} = state) do
-    {:reply, stack, state}
-  end
-
-  @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {:push, value}}, %{stack: stack} = state) do
-    {:noreply, %{state | stack: [value | stack]}}
-  end
-
-  def handle_info({:mailbox_msg, _mailbox_id, :pop}, %{stack: [_ | rest]} = state) do
-    {:noreply, %{state | stack: rest}}
-  end
-
-  def handle_info({:mailbox_msg, _mailbox_id, :pop}, %{stack: []} = state) do
-    {:noreply, state}
-  end
-
-  def handle_info({:mailbox_msg, _mailbox_id, {:peek, _n}}, state) do
-    {:noreply, state}
   end
 end
 
@@ -921,12 +873,15 @@ defmodule Gizmo.Agent do
 
     ## eval_response contract
 
-    The tool takes two fields:
+    The tool takes three fields:
 
     - ops: a list of syscall operations to execute, in order.
     - frames: replacement frames for your context stack. These define what you
       will see as your system prompt on the NEXT eval cycle. An empty array []
       means this process is finished and should be removed from the stack.
+    - notes: an object mapping binding names to short descriptions. Use this to
+      annotate what each binding contains. Notes persist across cycles and are
+      shown alongside binding values in the user message.
 
     ## Syscalls
 
@@ -934,31 +889,30 @@ defmodule Gizmo.Agent do
 
     - send(mailbox, msg): Send a message to a named mailbox. Non-blocking,
       fire-and-forget. The mailbox can be any registered service or agent.
-    - receive(): Block until a message arrives in your mailbox. The message
-      content is pushed onto your args stack (accessible as $1, $2, etc.)
-      and your messages queue.
-    - fork(n, frames): Spawn a child process. Pop the top n frames from your
-      stack, push the given frames onto the child's stack. The child's mailbox
-      ID is pushed onto your args stack.
+    - receive(dest): Block until a message arrives in your mailbox. The message
+      content is stored in the binding named by `dest` and is accessible as
+      `${dest}` on the next cycle. Also pushed to your messages queue.
+    - fork(n, frames, dest): Spawn a child process. Pop the top n frames from
+      your stack, push the given frames onto the child's stack. The child's
+      mailbox ID is stored in the binding named by `dest`.
     - join(msg): Send msg to your parent's mailbox, then terminate.
 
     Only include the ops you actually need. Do NOT include ops you don't use.
 
-    ## Args visibility
+    ## Bindings visibility
 
-    The current args stack values are shown in the user message as:
-      $1 = <value>
-      $2 = <value>
+    The current bindings are shown in the user message as:
+      ${name} = <value>
+      ${name} = <value> (note)
       ...
-    You can read these to make decisions (e.g. check if $1 is "quit").
-    Use $1, $2 etc. in your ops and frames — they will be interpolated to
-    the actual values before execution.
+    You can read these to make decisions (e.g. check if ${input} is "quit").
+    Use ${name} in your ops and frames — they will be interpolated to the
+    actual values before execution.
 
     ## Interpolation
 
     In message strings and frames, you can use:
-    - $n — positional arg from the args stack (1-indexed, $1 is most recent)
-    - ${name} — named value from the blackboard key-value store
+    - ${name} — named binding from receive or fork results
     - $$ — literal dollar sign
     - @N — inject frame N (0-indexed) from your current context stack verbatim
     - @name — inject the contents of a named section (see below)
@@ -969,28 +923,30 @@ defmodule Gizmo.Agent do
       content here
       @@end
 
-    Section content injected via @name is quoted verbatim (no $n interpolation
-    is applied to the injected text).
+    Section content injected via @name is quoted verbatim (no ${name}
+    interpolation is applied to the injected text).
 
     ## Well-known mailboxes
 
     - human: The user's terminal. Send messages here to display text.
-    - human_input: Send a prompt string here, then receive to get the user's
-      typed input. The user's typed line is pushed onto your args stack as $1.
+    - human_input: Send a prompt string here, then receive with a dest name
+      to get the user's typed input. The result is stored in ${dest}.
     - bash: Shell command execution. Send a command string, receive the output.
-      The output is pushed onto your args stack as $1.
+      The output is stored in ${dest}.
     - blackboard: Key-value store. Send {read, key} or {write, key, value},
-      then receive the result. Read returns the value as $1. Write returns "ok".
+      then receive the result. Read returns the value in ${dest}. Write
+      returns "ok".
     - exception: Error notification sink. The runtime sends error tuples here
       when an agent exceeds retry or cycle limits. You do not normally send
       to this mailbox yourself.
 
     ## Important timing rule
 
-    Interpolation ($1, @name, etc.) is resolved BEFORE ops execute. If you
-    issue a receive and then a send with $1 in the same cycle, $1 refers to
-    the PREVIOUS args stack value, not what you just received. To use a
-    received value, return a continuation frame and use $1 on the next cycle.
+    Interpolation (${name}, @name, etc.) is resolved BEFORE ops execute. If
+    you issue a receive and then a send with ${result} in the same cycle,
+    ${result} refers to the PREVIOUS binding value, not what you just received.
+    To use a received value, return a continuation frame and use ${dest} on
+    the next cycle.
 
     ## Writing good continuation frames
 
@@ -1020,8 +976,8 @@ defmodule Gizmo.Agent do
 
     5. If you must write a continuation frame (no named section available),
        write a COMPLETE prompt. Bad: "step2". Good: "You received the bash
-       output in $1. Send 'Result: $1' to 'human', then terminate with empty
-       frames []."
+       output in ${output}. Send 'Result: ${output}' to 'human', then
+       terminate with empty frames []."
 
     6. When terminating (frames: []), do NOT issue a receive. Just send any
        final messages and return empty frames.
@@ -1055,9 +1011,7 @@ defmodule Gizmo.Agent do
       Gizmo.Mailbox.register(mailbox_id)
 
       # Start per-agent services
-      args_stack_mb = Gizmo.Mailbox.generate_id("args")
       msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
-      {:ok, args_stack} = Gizmo.Services.ArgsStack.start_link(args_stack_mb)
       {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
 
       send(caller, {:agent_ready, mailbox_id})
@@ -1068,7 +1022,6 @@ defmodule Gizmo.Agent do
         chat_fn: chat_fn,
         verbose: verbose,
         receive_timeout: receive_timeout,
-        args_stack: args_stack,
         msgs_queue: msgs_queue,
         boot_frame: List.first(frames)
       }
@@ -1076,7 +1029,6 @@ defmodule Gizmo.Agent do
       eval_loop(frames, state)
 
       # Cleanup
-      GenServer.stop(args_stack)
       GenServer.stop(msgs_queue)
       Gizmo.Mailbox.unregister(mailbox_id)
     end)
@@ -1115,32 +1067,30 @@ defmodule Gizmo.Agent do
 
   defp eval_loop([], %{boot_frame: nil}), do: :ok
   defp eval_loop([], %{boot_frame: boot_frame} = state) do
-    eval_loop([boot_frame], state, 0, 0, %{})
+    eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
   end
-  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{})
+  defp eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{}, %{}, %{})
 
-  defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections), do: :ok
-  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, _cycles, _persisted_sections) do
-    eval_loop([boot_frame], state, 0, 0, %{})
+  defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
+  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, _cycles, _persisted_sections, _bindings, _binding_notes) do
+    eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
   end
 
-  defp eval_loop(_context_stack, state, _retries, cycles, _persisted_sections) when cycles >= @max_eval_cycles do
+  defp eval_loop(_context_stack, state, _retries, cycles, _persisted_sections, _bindings, _binding_notes) when cycles >= @max_eval_cycles do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{@max_eval_cycles}) reached, terminating")
     error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
-  defp eval_loop(context_stack, state, retries, _cycles, _persisted_sections) when retries >= @max_eval_retries do
+  defp eval_loop(context_stack, state, retries, _cycles, _persisted_sections, _bindings, _binding_notes) when retries >= @max_eval_retries do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
     failing_frame = List.first(context_stack) || ""
     error_info = {:max_retries_exceeded, state.mailbox_id, retries, failing_frame}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
-  defp eval_loop(context_stack, state, retries, cycles, persisted_sections) do
+  defp eval_loop(context_stack, state, retries, cycles, persisted_sections, bindings, binding_notes) do
     system_prompt = runtime_prompt() <> "\n\n---\n\n" <> Enum.join(context_stack, "\n\n---\n\n")
-    args = Gizmo.Services.ArgsStack.to_list(state.args_stack)
-    bindings = %{}
     # Merge: current frame sections override persisted, but old ones survive
     current_sections = Gizmo.Interpolation.extract_sections(context_stack)
     sections = Map.merge(persisted_sections, current_sections)
@@ -1150,77 +1100,86 @@ defmodule Gizmo.Agent do
     if state.verbose do
       IO.puts(Gizmo.Format.separator(id))
       IO.puts(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
-      IO.puts(Gizmo.Format.args_line(id, args))
+      IO.puts(Gizmo.Format.bindings_line(id, bindings, binding_notes))
     end
 
-    user_content = case args do
-      [] -> "Begin."
-      _ ->
-        arg_lines = args
-        |> Enum.with_index(1)
-        |> Enum.map(fn {val, i} -> "$#{i} = #{val}" end)
-        |> Enum.join("\n")
-        "Begin.\n\nCurrent args:\n#{arg_lines}"
+    user_content = if map_size(bindings) == 0 do
+      "Begin."
+    else
+      binding_lines = bindings
+      |> Enum.sort()
+      |> Enum.map(fn {key, val} ->
+        case Map.get(binding_notes, key) do
+          nil -> "${#{key}} = #{val}"
+          note -> "${#{key}} = #{val} (#{note})"
+        end
+      end)
+      |> Enum.join("\n")
+      "Begin.\n\nCurrent bindings:\n#{binding_lines}"
     end
 
     case state.chat_fn.(system_prompt, [%{role: "user", content: user_content}], []) do
       {:ok, response} ->
-        interpolated = Gizmo.LLM.interpolate_response(response, args, bindings, sections)
+        interpolated = Gizmo.LLM.interpolate_response(response, bindings, sections)
 
         if state.verbose do
           for op <- interpolated.ops do
             case op do
               {:send, mb, msg} -> IO.puts(Gizmo.Format.op_send(id, mb, msg))
-              :receive -> IO.puts(Gizmo.Format.op_receive(id, state.receive_timeout))
-              {:fork, n, cf} -> IO.puts(Gizmo.Format.op_fork(id, n, cf))
+              {:receive, dest} -> IO.puts(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
+              {:fork, n, cf, dest} -> IO.puts(Gizmo.Format.op_fork(id, n, cf, dest))
               {:join, msg} -> IO.puts(Gizmo.Format.op_join(id, msg, state.parent))
             end
           end
           IO.puts(Gizmo.Format.frames_line(id, interpolated.frames))
         end
 
-        # Execute ops — may modify context_stack via fork
-        remaining_stack = execute_ops(interpolated.ops, interpolated.frames, state)
+        # Merge notes from this cycle's response into binding_notes
+        new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
-        case remaining_stack do
+        # Execute ops — may modify context_stack via fork, updates bindings
+        result = execute_ops(interpolated.ops, interpolated.frames, state, bindings)
+
+        case result do
           :exit -> :ok
-          new_stack -> eval_loop(new_stack, state, 0, cycles + 1, sections)
+          {new_stack, new_bindings} ->
+            eval_loop(new_stack, state, 0, cycles + 1, sections, new_bindings, new_binding_notes)
         end
 
       {:error, reason} ->
         IO.puts(:stderr, Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
-        eval_loop(context_stack, state, retries + 1, cycles + 1, sections)
+        eval_loop(context_stack, state, retries + 1, cycles + 1, sections, bindings, binding_notes)
     end
   end
 
-  defp execute_ops(ops, frames, state) do
-    Enum.reduce_while(ops, frames, fn op, current_frames ->
-      case execute_op(op, current_frames, state) do
-        {:cont, new_frames} -> {:cont, new_frames}
+  defp execute_ops(ops, frames, state, bindings) do
+    Enum.reduce_while(ops, {frames, bindings}, fn op, {current_frames, current_bindings} ->
+      case execute_op(op, current_frames, state, current_bindings) do
+        {:cont, new_frames, new_bindings} -> {:cont, {new_frames, new_bindings}}
         :exit -> {:halt, :exit}
       end
     end)
   end
 
-  defp execute_op({:send, mailbox, msg}, frames, state) do
+  defp execute_op({:send, mailbox, msg}, frames, state, bindings) do
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
-    {:cont, frames}
+    {:cont, frames, bindings}
   end
 
-  defp execute_op(:receive, frames, state) do
-    receive do
+  defp execute_op({:receive, dest}, frames, state, bindings) do
+    message = receive do
       {:mailbox_msg, _to, {from_mb, message}} ->
-        Gizmo.Services.ArgsStack.push(state.args_stack, message)
         Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
+        message
     after
       state.receive_timeout ->
-        Gizmo.Services.ArgsStack.push(state.args_stack, "timeout")
+        "timeout"
     end
 
-    {:cont, frames}
+    {:cont, frames, Map.put(bindings, dest, message)}
   end
 
-  defp execute_op({:fork, n, child_frames}, frames, state) do
+  defp execute_op({:fork, n, child_frames, dest}, frames, state, bindings) do
     # Pop n frames from top of current stack (top = beginning of list)
     _popped = Enum.take(frames, n)
     remaining_frames = Enum.drop(frames, n)
@@ -1248,11 +1207,10 @@ defmodule Gizmo.Agent do
       end
     end)
 
-    Gizmo.Services.ArgsStack.push(state.args_stack, child_mb)
-    {:cont, remaining_frames}
+    {:cont, remaining_frames, Map.put(bindings, dest, child_mb)}
   end
 
-  defp execute_op({:join, msg}, _frames, state) do
+  defp execute_op({:join, msg}, _frames, state, _bindings) do
     if state.parent do
       Gizmo.Mailbox.route(state.parent, {state.mailbox_id, msg})
     end
@@ -1345,34 +1303,25 @@ defmodule Gizmo.CLI do
     # 2. Interpolation tests
     IO.puts("--- Interpolation ---")
 
-    text = "Hello $1, your project is ${project}. Cost: $$5. Unknown: $99 and ${nope}."
-    result = Gizmo.Interpolation.resolve(text, ["world"], %{"project" => "gizmo"})
+    text = "Hello ${name}, your project is ${project}. Cost: $$5. Unknown: ${nope}."
+    result = Gizmo.Interpolation.resolve(text, %{"name" => "world", "project" => "gizmo"})
     IO.puts("Input:  #{text}")
     IO.puts("Output: #{result}")
-    expected = "Hello world, your project is gizmo. Cost: $5. Unknown: $99 and ${nope}."
+    expected = "Hello world, your project is gizmo. Cost: $5. Unknown: ${nope}."
     failures = failures ++ assert_eq("basic interpolation", result, expected)
 
-    # Empty args/bindings
+    # Empty bindings
     failures = failures ++ assert_eq(
-      "empty args/bindings",
-      Gizmo.Interpolation.resolve("$1 ${x}", [], %{}),
-      "$1 ${x}"
+      "empty bindings",
+      Gizmo.Interpolation.resolve("${x}", %{}),
+      "${x}"
     )
 
     # Dollar escape at end of string
     failures = failures ++ assert_eq(
       "dollar escape at end",
-      Gizmo.Interpolation.resolve("price: $$", [], %{}),
+      Gizmo.Interpolation.resolve("price: $$", %{}),
       "price: $"
-    )
-
-    # Nested reference: ${$1} — named resolution leaves ${$1} as-is (no binding
-    # named "$1"), then positional resolves $1 inside the braces, yielding ${key}.
-    # This is a known quirk: positional resolution doesn't respect brace boundaries.
-    failures = failures ++ assert_eq(
-      "nested ${$1} (positional leaks into braces)",
-      Gizmo.Interpolation.resolve("${$1}", ["key"], %{}),
-      "${key}"
     )
 
     # @N frame reference
@@ -1384,7 +1333,7 @@ defmodule Gizmo.CLI do
     )
     failures = failures ++ assert_eq(
       "@N frame ref resolve",
-      Gizmo.Interpolation.resolve("prefix @0 suffix", [], %{}, frame_sections),
+      Gizmo.Interpolation.resolve("prefix @0 suffix", %{}, frame_sections),
       "prefix frame zero suffix"
     )
 
@@ -1398,28 +1347,28 @@ defmodule Gizmo.CLI do
     )
     failures = failures ++ assert_eq(
       "named section resolve",
-      Gizmo.Interpolation.resolve("say: @greet", [], %{}, named_sections),
+      Gizmo.Interpolation.resolve("say: @greet", %{}, named_sections),
       "say: hello world"
     )
 
-    # Section quoting (no $ interpolation in injected content)
+    # Section quoting ($ in section not resolved as binding)
     failures = failures ++ assert_eq(
       "section quoting ($ in section not resolved)",
-      Gizmo.Interpolation.resolve("info: @price", ["Alice"], %{}, %{"price" => "cost is $1"}),
-      "info: cost is $1"
+      Gizmo.Interpolation.resolve("info: @price", %{"name" => "Alice"}, %{"price" => "cost is ${name}"}),
+      "info: cost is ${name}"
     )
 
     # @@ escape
     failures = failures ++ assert_eq(
       "@@ escape",
-      Gizmo.Interpolation.resolve("email: user@@host", [], %{}, %{}),
+      Gizmo.Interpolation.resolve("email: user@@host", %{}, %{}),
       "email: user@host"
     )
 
     # Mixed @ and $
     failures = failures ++ assert_eq(
       "mixed @ and $",
-      Gizmo.Interpolation.resolve("@0 says $1", ["hi"], %{}, %{"0" => "bot"}),
+      Gizmo.Interpolation.resolve("@0 says ${greeting}", %{"greeting" => "hi"}, %{"0" => "bot"}),
       "bot says hi"
     )
 
@@ -1432,20 +1381,22 @@ defmodule Gizmo.CLI do
     good_input = %{
       "ops" => [
         %{"op" => "send", "mailbox" => "human", "msg" => "hello"},
-        %{"op" => "receive"},
-        %{"op" => "fork", "n" => 2, "frames" => ["f1", "f2"]},
+        %{"op" => "receive", "dest" => "msg"},
+        %{"op" => "fork", "n" => 2, "frames" => ["f1", "f2"], "dest" => "child"},
         %{"op" => "join", "msg" => "done"}
       ],
-      "frames" => ["frame1"]
+      "frames" => ["frame1"],
+      "notes" => %{"msg" => "received message"}
     }
     {:ok, good_result} = Gizmo.LLM.normalize_eval(good_input)
     failures = failures ++ assert_eq("valid ops count", length(good_result.ops), 4)
     failures = failures ++ assert_eq("valid ops parse", good_result.ops, [
       {:send, "human", "hello"},
-      :receive,
-      {:fork, 2, ["f1", "f2"]},
+      {:receive, "msg"},
+      {:fork, 2, ["f1", "f2"], "child"},
       {:join, "done"}
     ])
+    failures = failures ++ assert_eq("notes parsed", good_result.notes, %{"msg" => "received message"})
     IO.puts("  valid ops: OK")
 
     # send missing mailbox
@@ -1456,13 +1407,21 @@ defmodule Gizmo.CLI do
     bad_send2 = %{"ops" => [%{"op" => "send", "mailbox" => "x"}], "frames" => []}
     failures = failures ++ assert_error_op("send missing msg", Gizmo.LLM.normalize_eval(bad_send2), :invalid_op, "send")
 
+    # receive missing dest
+    bad_recv = %{"ops" => [%{"op" => "receive"}], "frames" => []}
+    failures = failures ++ assert_error_op("receive missing dest", Gizmo.LLM.normalize_eval(bad_recv), :invalid_op, "receive")
+
     # fork missing n
-    bad_fork = %{"ops" => [%{"op" => "fork", "frames" => []}], "frames" => []}
+    bad_fork = %{"ops" => [%{"op" => "fork", "frames" => [], "dest" => "c"}], "frames" => []}
     failures = failures ++ assert_error_op("fork missing n", Gizmo.LLM.normalize_eval(bad_fork), :invalid_op, "fork")
 
     # fork missing frames
-    bad_fork2 = %{"ops" => [%{"op" => "fork", "n" => 1}], "frames" => []}
+    bad_fork2 = %{"ops" => [%{"op" => "fork", "n" => 1, "dest" => "c"}], "frames" => []}
     failures = failures ++ assert_error_op("fork missing frames", Gizmo.LLM.normalize_eval(bad_fork2), :invalid_op, "fork")
+
+    # fork missing dest
+    bad_fork3 = %{"ops" => [%{"op" => "fork", "n" => 1, "frames" => []}], "frames" => []}
+    failures = failures ++ assert_error_op("fork missing dest", Gizmo.LLM.normalize_eval(bad_fork3), :invalid_op, "fork")
 
     # join missing msg
     bad_join = %{"ops" => [%{"op" => "join"}], "frames" => []}
@@ -1521,15 +1480,16 @@ defmodule Gizmo.CLI do
 
     eval_resp = %{
       ops: [
-        {:send, "human", "Hello $1, status: ${status}"},
-        :receive,
-        {:fork, 2, ["child frame $1"]},
+        {:send, "human", "Hello ${name}, status: ${status}"},
+        {:receive, "reply"},
+        {:fork, 2, ["child frame ${name}"], "child"},
         {:join, "result: ${result}"}
       ],
-      frames: ["next frame $1 ${ctx}"]
+      frames: ["next frame ${name} ${ctx}"],
+      notes: %{"name" => "the user's name"}
     }
 
-    interpolated = Gizmo.LLM.interpolate_response(eval_resp, ["Alice"], %{"status" => "ok", "result" => "42", "ctx" => "main"})
+    interpolated = Gizmo.LLM.interpolate_response(eval_resp, %{"name" => "Alice", "status" => "ok", "result" => "42", "ctx" => "main"})
 
     failures = failures ++ assert_eq("interpolate send msg",
       Enum.at(interpolated.ops, 0),
@@ -1537,11 +1497,11 @@ defmodule Gizmo.CLI do
     )
     failures = failures ++ assert_eq("interpolate receive unchanged",
       Enum.at(interpolated.ops, 1),
-      :receive
+      {:receive, "reply"}
     )
     failures = failures ++ assert_eq("interpolate fork frames",
       Enum.at(interpolated.ops, 2),
-      {:fork, 2, ["child frame Alice"]}
+      {:fork, 2, ["child frame Alice"], "child"}
     )
     failures = failures ++ assert_eq("interpolate join msg",
       Enum.at(interpolated.ops, 3),
@@ -1550,6 +1510,10 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("interpolate response frames",
       interpolated.frames,
       ["next frame Alice main"]
+    )
+    failures = failures ++ assert_eq("interpolate notes passthrough",
+      interpolated.notes,
+      %{"name" => "the user's name"}
     )
 
     IO.puts("")
@@ -1617,19 +1581,6 @@ defmodule Gizmo.CLI do
 
     # Ensure registry is started
     {:ok, _} = Gizmo.Mailbox.start()
-
-    # ArgsStack
-    {:ok, as_pid} = Gizmo.Services.ArgsStack.start_link(Gizmo.Mailbox.generate_id("args_stack"))
-    :ok = Gizmo.Services.ArgsStack.push(as_pid, "a")
-    :ok = Gizmo.Services.ArgsStack.push(as_pid, "b")
-    :ok = Gizmo.Services.ArgsStack.push(as_pid, "c")
-    failures = failures ++ assert_eq("args_stack peek 0", Gizmo.Services.ArgsStack.peek(as_pid, 0), {:ok, "c"})
-    failures = failures ++ assert_eq("args_stack peek 2", Gizmo.Services.ArgsStack.peek(as_pid, 2), {:ok, "a"})
-    failures = failures ++ assert_eq("args_stack peek out of range", Gizmo.Services.ArgsStack.peek(as_pid, 5), {:error, :out_of_range})
-    {:ok, popped} = Gizmo.Services.ArgsStack.pop(as_pid)
-    failures = failures ++ assert_eq("args_stack pop top", popped, "c")
-    failures = failures ++ assert_eq("args_stack to_list after pop", Gizmo.Services.ArgsStack.to_list(as_pid), ["b", "a"])
-    GenServer.stop(as_pid)
 
     # MessagesQueue
     {:ok, mq_pid} = Gizmo.Services.MessagesQueue.start_link(Gizmo.Mailbox.generate_id("msg_queue"))
@@ -1744,7 +1695,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(test_target_mb)
 
     one_shot_chat_fn = fn _system, _messages, _opts ->
-      {:ok, %{ops: [{:send, test_target_mb, "hi"}], frames: []}}
+      {:ok, %{ops: [{:send, test_target_mb, "hi"}, {:join, ""}], frames: [], notes: %{}}}
     end
 
     {:ok, _agent_mb, agent_pid} = Gizmo.Agent.start(["one shot frame"],
@@ -1768,8 +1719,8 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.unregister(test_target_mb)
 
     # Test 2: Receive + timeout
-    # Cycle 1: receive (times out → "timeout" pushed to args), frame "got it"
-    # Cycle 2: send $1 to a test mailbox (interpolated to "timeout"), then exit
+    # Cycle 1: receive with dest "msg" (times out → bindings["msg"] = "timeout"), frame "got it"
+    # Cycle 2: send ${msg} to a test mailbox (interpolated to "timeout"), then exit
     timeout_test_mb = Gizmo.Mailbox.generate_id("timeout_test")
     Gizmo.Mailbox.register(timeout_test_mb)
     cycle2_counter = :counters.new(1, [:atomics])
@@ -1779,9 +1730,9 @@ defmodule Gizmo.CLI do
       :counters.add(cycle2_counter, 1, 1)
 
       if c == 0 do
-        {:ok, %{ops: [:receive], frames: ["got it"]}}
+        {:ok, %{ops: [{:receive, "msg"}], frames: ["got it"], notes: %{}}}
       else
-        {:ok, %{ops: [{:send, timeout_test_mb, "$1"}], frames: []}}
+        {:ok, %{ops: [{:send, timeout_test_mb, "${msg}"}], frames: [], notes: %{}}}
       end
     end
 
@@ -1790,13 +1741,13 @@ defmodule Gizmo.CLI do
 
     timeout_ref = Process.monitor(timeout_pid)
 
-    # Receive the message sent in cycle 2 — $1 should be interpolated to "timeout"
+    # Receive the message sent in cycle 2 — ${msg} should be interpolated to "timeout"
     timeout_sent_msg = receive do
       {:mailbox_msg, ^timeout_test_mb, {_from, msg}} -> msg
     after
       5_000 -> :no_message
     end
-    failures = failures ++ assert_eq("receive timeout pushes 'timeout' to args", timeout_sent_msg, "timeout")
+    failures = failures ++ assert_eq("receive timeout stores 'timeout' in binding", timeout_sent_msg, "timeout")
 
     receive do
       {:DOWN, ^timeout_ref, :process, ^timeout_pid, _} -> :ok
@@ -1817,14 +1768,17 @@ defmodule Gizmo.CLI do
       cond do
         # First call: parent cycle 0 — fork a child, then receive
         c == 0 ->
-          {:ok, %{ops: [{:fork, 0, ["child frame"]}, :receive], frames: ["parent waiting"]}}
+          {:ok, %{ops: [{:fork, 0, ["child frame"], "worker"}, {:receive, "result"}], frames: ["parent waiting"], notes: %{}}}
         # Second call: child cycle 0 — join with result
         String.contains?(system, "child frame") ->
-          {:ok, %{ops: [{:join, "result from child"}], frames: []}}
-        # Third call: parent cycle 1 — capture the args and exit
-        true ->
+          {:ok, %{ops: [{:join, "result from child"}], frames: [], notes: %{}}}
+        # Third call: parent cycle 1 — capture the system and exit
+        c == 2 ->
           Agent.update(fork_result_agent, fn _ -> system end)
-          {:ok, %{ops: [], frames: []}}
+          {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+        # Idle re-entry: do nothing
+        true ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
       end
     end
 
@@ -1847,9 +1801,18 @@ defmodule Gizmo.CLI do
     concat_captured = Agent.start_link(fn -> nil end)
     {:ok, concat_agent} = concat_captured
 
+    concat_cycle = :counters.new(1, [:atomics])
+
     concat_chat_fn = fn system, _messages, _opts ->
-      Agent.update(concat_agent, fn _ -> system end)
-      {:ok, %{ops: [], frames: []}}
+      c = :counters.get(concat_cycle, 1)
+      :counters.add(concat_cycle, 1, 1)
+
+      if c == 0 do
+        Agent.update(concat_agent, fn _ -> system end)
+        {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+      else
+        {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
     end
 
     {:ok, _concat_mb, concat_pid} = Gizmo.Agent.start(["frame A", "frame B"],
@@ -1879,15 +1842,15 @@ defmodule Gizmo.CLI do
       case c do
         0 ->
           # Cycle 0: go idle (frames: []) — boot frame will self-replace
-          {:ok, %{ops: [], frames: []}}
+          {:ok, %{ops: [], frames: [], notes: %{}}}
         1 ->
           # Cycle 1: boot frame re-evaluated, issue a receive to wait for work
-          {:ok, %{ops: [:receive], frames: ["waiting for work"]}}
+          {:ok, %{ops: [{:receive, "input"}], frames: ["waiting for work"], notes: %{}}}
         2 ->
-          # Cycle 2: got the message in $1, forward it and terminate via join
-          {:ok, %{ops: [{:send, idle_test_mb, "$1"}, {:join, "done"}], frames: []}}
+          # Cycle 2: got the message in ${input}, forward it and terminate via join
+          {:ok, %{ops: [{:send, idle_test_mb, "${input}"}, {:join, "done"}], frames: [], notes: %{}}}
         _ ->
-          {:ok, %{ops: [], frames: []}}
+          {:ok, %{ops: [], frames: [], notes: %{}}}
       end
     end
 
@@ -2014,26 +1977,30 @@ defmodule Gizmo.CLI do
       cond do
         # Parent cycle 0: fork a child that will crash, then receive
         c == 0 ->
-          {:ok, %{ops: [{:fork, 0, ["crash frame"]}, :receive], frames: ["parent waiting for child death"]}}
+          {:ok, %{ops: [{:fork, 0, ["crash frame"], "worker"}, {:receive, "death_msg"}], frames: ["parent waiting for child death"], notes: %{}}}
         # Child: always raises
         String.contains?(system, "crash frame") ->
           raise "deliberate child crash"
-        # Parent cycle 1: got death notification in $1
+        # Parent cycle 1: got death notification in ${death_msg}, exit cleanly
+        c == 2 ->
+          {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+        # Idle re-entry: do nothing
         true ->
-          {:ok, %{ops: [], frames: []}}
+          {:ok, %{ops: [], frames: [], notes: %{}}}
       end
     end
 
     child_death_result = Agent.start_link(fn -> nil end)
     {:ok, cd_agent} = child_death_result
 
-    # Wrap to capture args on parent's second call
+    # Wrap to capture user message on parent's second call (bindings are in user message)
     cd_chat_fn = fn system, messages, opts ->
       result = child_death_chat_fn.(system, messages, opts)
       c = :counters.get(child_death_cycle, 1)
       # After cycle counter is 3, parent is on its second call (c was 2 when called)
-      if c >= 3 do
-        Agent.update(cd_agent, fn _ -> system end)
+      if c == 3 do
+        user_msg = hd(messages)[:content] || hd(messages)["content"] || ""
+        Agent.update(cd_agent, fn _ -> user_msg end)
       end
       result
     end
@@ -2054,6 +2021,65 @@ defmodule Gizmo.CLI do
       cd_result != nil && String.contains?(to_string(cd_result), "child_died:"), true)
     Agent.stop(cd_agent)
 
+    # Test 8: dest/notes round-trip — verify bindings appear in user message with notes
+    notes_test_mb = Gizmo.Mailbox.generate_id("notes_test")
+    Gizmo.Mailbox.register(notes_test_mb)
+    notes_cycle = :counters.new(1, [:atomics])
+    notes_captured = Agent.start_link(fn -> nil end)
+    {:ok, notes_capture_agent} = notes_captured
+
+    notes_chat_fn = fn _system, messages, _opts ->
+      c = :counters.get(notes_cycle, 1)
+      :counters.add(notes_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # Cycle 0: receive with dest "data", annotate with notes
+          {:ok, %{ops: [{:receive, "data"}], frames: ["check data"], notes: %{"data" => "response from service"}}}
+        1 ->
+          # Cycle 1: capture the user message content, then exit
+          user_msg = case messages do
+            [%{content: content} | _] -> content
+            _ -> "no user message"
+          end
+          Agent.update(notes_capture_agent, fn _ -> user_msg end)
+          {:ok, %{ops: [{:send, notes_test_mb, "${data}"}], frames: [], notes: %{}}}
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, notes_agent_mb, notes_pid} = Gizmo.Agent.start(["notes test frame"],
+      chat_fn: notes_chat_fn, receive_timeout: 2_000)
+
+    # Send a message so the receive in cycle 0 completes
+    Process.sleep(50)
+    Gizmo.Mailbox.route(notes_agent_mb, {"test_sender", "hello_data"})
+
+    notes_ref = Process.monitor(notes_pid)
+
+    # Receive the forwarded message
+    notes_fwd = receive do
+      {:mailbox_msg, ^notes_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("dest/notes: binding value forwarded", notes_fwd, "hello_data")
+
+    receive do
+      {:DOWN, ^notes_ref, :process, ^notes_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    notes_user_msg = Agent.get(notes_capture_agent, & &1)
+    failures = failures ++ assert_eq("dest/notes: bindings shown in user message",
+      notes_user_msg != nil && String.contains?(to_string(notes_user_msg), "${data} = hello_data"), true)
+    failures = failures ++ assert_eq("dest/notes: notes shown in user message",
+      notes_user_msg != nil && String.contains?(to_string(notes_user_msg), "(response from service)"), true)
+    Agent.stop(notes_capture_agent)
+    Gizmo.Mailbox.unregister(notes_test_mb)
+
     IO.puts("")
 
     # 9. LLM test (only if API key is set)
@@ -2066,31 +2092,34 @@ defmodule Gizmo.CLI do
 
       ## eval_response contract
 
-      The tool takes two fields:
+      The tool takes three fields:
 
       - ops: a list of syscall operations to execute, in order. Available ops:
         - send(mailbox, msg): send a message to a named mailbox
-        - receive: block until a message arrives
-        - fork(n, frames): spawn a child process with the given frames
+        - receive(dest): block until a message arrives, store in ${dest}
+        - fork(n, frames, dest): spawn a child, store child mailbox ID in ${dest}
         - join(msg): terminate and send msg to parent
 
       - frames: replacement frames for your context stack. These define what you
         will see as your system prompt on the NEXT eval cycle. An empty array []
         means this process is finished and should be removed from the stack.
 
+      - notes: an object mapping binding names to short descriptions.
+
       ## Your task
 
       You are a one-shot greeter. Send a short hello to the 'human' mailbox,
-      then terminate by returning an empty frames array.
+      then terminate by returning an empty frames array. Set notes to {}.
       """
 
       case Gizmo.LLM.Anthropic.chat(
              smoke_system,
              [%{role: "user", content: "Begin."}]
            ) do
-        {:ok, %{ops: ops, frames: frames}} ->
+        {:ok, %{ops: ops, frames: frames, notes: notes}} ->
           IO.puts("Ops:    #{inspect(ops)}")
           IO.puts("Frames: #{inspect(frames)}")
+          IO.puts("Notes:  #{inspect(notes)}")
 
         {:error, reason} ->
           IO.puts("Error: #{inspect(reason)}")

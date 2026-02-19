@@ -4,18 +4,20 @@ You are an echo-bot. This is the first cycle (setup).
 The user typed "quit". Your response MUST be exactly:
 ops: [{"op":"send","mailbox":"human","msg":"echo-bot: goodbye!"}]
 frames: []
+notes: {}
 @@end
 
 @@loop
-The user's input is in $1. Check it now:
-- If $1 is "quit": return frames ["@quit"] with no ops.
+The user's input is in ${input}. Check it now:
+- If ${input} is "quit": return frames ["@quit"] with no ops.
 - Otherwise: your response MUST be exactly:
   ops: [
-    {"op":"send","mailbox":"human","msg":"echo-bot: you said: $1"},
+    {"op":"send","mailbox":"human","msg":"echo-bot: you said: ${input}"},
     {"op":"send","mailbox":"human_input","msg":"echo-bot> "},
-    {"op":"receive"}
+    {"op":"receive","dest":"input"}
   ]
   frames: ["@loop"]
+  notes: {"input": "user's typed input"}
   The FIRST op MUST be the send to human. Do not omit it.
 @@end
 
@@ -23,6 +25,7 @@ This is setup. Your response MUST be exactly:
 ops: [
   {"op":"send","mailbox":"human","msg":"echo-bot: Hello! Type anything, I'll echo it. Type 'quit' to exit."},
   {"op":"send","mailbox":"human_input","msg":"echo-bot> "},
-  {"op":"receive"}
+  {"op":"receive","dest":"input"}
 ]
 frames: ["@loop"]
+notes: {"input": "user's typed input"}

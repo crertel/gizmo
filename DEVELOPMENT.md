@@ -18,7 +18,7 @@ Get a working call to Claude and back, returning structured JSON.
 - [x] JSON encoding/decoding via Req (`:json` option)
 - [x] Both clients normalize response to `{:ok, %{ops: [...], frames: [...]}}` tuples
 - [x] Handle API errors, rate limits, retries (`Gizmo.LLM.Retry`, exponential backoff on 429/5xx)
-- [ ] Streaming support (optional, can defer)
+- [x] ~Streaming support~ — removed, see DEAD_ENDS.md
 
 ## Stage 2: Structured Output (replaces text Parser)
 
@@ -34,13 +34,13 @@ defines the ops array and frames array directly.
 
 ## Stage 3: Interpolation
 
-Resolve `$n` and `${name}` references in text.
+Resolve `${name}` references in text.
 
-- [x] `$n` positional resolution against an args list
-- [x] `${name}` named resolution against a key-value map
+- [x] `${name}` named resolution against a bindings map (populated by `receive(dest)` and `fork(dest)`)
 - [x] Escaping (`$$` for literal `$`)
-- [x] Apply interpolation to frame text and message content (`interpolate_response/4`)
+- [x] Apply interpolation to frame text and message content (`interpolate_response/3`)
 - [x] Unit tests (in-process smoke tests via `--test`)
+- Note: `$n` positional args stack was replaced by named bindings via `dest`
 
 ## Stage 4: Mailbox Router
 
@@ -55,10 +55,9 @@ Central message routing registry.
 
 Implement the service processes that back the well-known mailboxes.
 
-### 5a: Args Stack
-- [x] GenServer holding a list
-- [x] Handle `{push, value}`, `{peek, n}`, `{pop}`
-- [x] Registered in mailbox router
+### 5a: Args Stack (removed)
+- Replaced by named bindings via `dest` field on `receive` and `fork` ops.
+  Bindings are threaded through the eval loop as a plain map — no GenServer needed.
 
 ### 5b: Messages Queue
 - [x] GenServer holding a `:queue`
@@ -86,7 +85,7 @@ Implement the service processes that back the well-known mailboxes.
 
 The GenServer that runs the eval loop.
 
-- [x] State: mailbox_id, parent, chat_fn, verbose, receive_timeout, args_stack, msgs_queue
+- [x] State: mailbox_id, parent, chat_fn, verbose, receive_timeout, msgs_queue (bindings threaded through eval_loop)
 - [x] Boot frame loaded on init
 - [x] Eval loop implementation:
   - Concatenate context stack as system prompt
@@ -96,7 +95,7 @@ The GenServer that runs the eval loop.
   - Push replacement frames
   - Loop
 - [x] `send` op: interpolate msg, route via mailbox router
-- [x] `receive` op: block until message arrives, push to messages queue + args stack
+- [x] `receive` op: block until message arrives, store in bindings[dest] + messages queue
 - [x] Idle behavior: boot frame self-replaces, checks mailbox
 - [x] Error handling: retry on LLM failure (3x)
 - [x] Exception mailbox on retry exhaustion (routes to "exception" service and terminates)
@@ -137,8 +136,8 @@ Production-grade process management.
 ## Stage 10: Polish and Hardening
 
 - [ ] Logging: structured logs for eval cycles, message routing, errors
-- [ ] Telemetry: eval cycle count, LLM latency, message throughput
-- [ ] Boot frame templating: parameterize mailbox registry in boot frames
+- [x] ~Telemetry~ — removed, see DEAD_ENDS.md
+- [x] ~Boot frame templating~ — removed, see DEAD_ENDS.md
 - [ ] Config: LLM model selection, timeouts, retry counts
 - [ ] Documentation: module docs, usage examples
 
@@ -146,7 +145,6 @@ Production-grade process management.
 
 These are explicitly out of scope for the initial build but noted for later:
 
-- Frame tagging (code/quote, security taint tracking)
 - Selective receive (pattern matching on messages)
 - Context summarization service
 - Persistence (durable stacks/mailboxes across restarts)

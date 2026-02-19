@@ -18,7 +18,7 @@ Edit the `## Your task` section, then run:
 
 ```
 elixir gizmo.exs my_task.txt
-elixir gizmo.exs -v my_task.txt        # verbose (shows ops, frames, args)
+elixir gizmo.exs -v my_task.txt        # verbose (shows ops, frames, bindings)
 elixir gizmo.exs --thinking my_task.txt # enable extended thinking
 ```
 
@@ -44,7 +44,8 @@ Understanding the eval loop is critical for writing good prompts.
    Multiple frames are joined with "\n\n---\n\n".
    The runtime preamble is appended automatically after the frames.
 2. The LLM is called with this system prompt.
-3. The LLM returns: ops (syscalls to execute) and frames (new context stack).
+3. The LLM returns: ops (syscalls to execute), frames (new context stack),
+   and notes (annotations for bindings).
 4. Interpolation runs on the returned ops and frames BEFORE ops execute.
 5. Ops execute sequentially (send, receive, fork, join).
 6. The returned frames become the new context stack.
@@ -52,46 +53,37 @@ Understanding the eval loop is critical for writing good prompts.
 ```
 
 **Key timing rule:** Interpolation happens *before* ops run. If you issue a
-`receive` op and a `send` op with `$1` in the same eval cycle, the `$1`
-refers to whatever was on the args stack *before* the receive, not the value
-the receive will produce. To use a received value, return a continuation frame
-and reference `$1` on the *next* cycle.
+`receive` op and a `send` op with `${output}` in the same eval cycle, the
+`${output}` refers to whatever was in the bindings *before* the receive, not
+the value the receive will produce. To use a received value, return a
+continuation frame and reference `${output}` on the *next* cycle.
 
 ## Interpolation reference
 
 All interpolation applies to the ops and frames the LLM returns. It does
 **not** apply to the system prompt the LLM sees — the LLM sees raw text
-including `$1`, `@0`, section markers, etc.
+including `${name}`, `@0`, section markers, etc.
 
-### `$n` — positional args
+### `${name}` — named bindings via `dest`
 
-The args stack holds values pushed by `receive` and `fork`. `$1` is the most
-recent value, `$2` the one before that, etc. (1-indexed.)
+The bindings map holds values produced by `receive` and `fork` ops. Each of
+these ops has a `dest` field that names where the result is stored.
 
 ```
-# Agent receives a message containing "hello"
-# On the next cycle, args stack is ["hello"]
+# Agent issues: receive with dest "output"
+# The received message "hello" is stored in bindings as output = "hello"
+# On the next cycle, bindings show: ${output} = hello
 # The LLM returns:
-  ops:    [send("human", "you said: $1")]
+  ops:    [send("human", "you said: ${output}")]
   frames: []
+  notes:  {}
 
 # After interpolation:
   ops:    [send("human", "you said: hello")]
 ```
 
-Unresolved positional refs are left as-is. If the args stack has only one
-entry, `$2` stays as the literal string `$2`.
-
-### `${name}` — blackboard bindings
-
-Reads from the blackboard key-value store. (Note: blackboard bindings are not
-yet wired into the eval loop — this syntax is reserved for future use.)
-
-```
-# If blackboard has key "color" = "red":
-  "The color is ${color}" → "The color is red"
-  "Unknown: ${nope}"      → "Unknown: ${nope}"   (left as-is)
-```
+Unresolved binding refs are left as-is. If there's no binding named "foo",
+`${foo}` stays as the literal string `${foo}`.
 
 ### `$$` — literal dollar sign
 
@@ -101,7 +93,6 @@ as an interpolation reference.
 ```
   "Price: $$5"     → "Price: $5"
   "Escape: $$$$"   → "Escape: $$"
-  "Keep: $$$1"     → "Keep: $hello"  (if $1 = "hello": $$ → $, then $1 → hello)
 ```
 
 ### `@N` — frame references
@@ -186,14 +177,13 @@ Interpolation resolves in this order:
 1. `@@` → escape sentinel (so `@@end` markers aren't confused with `@end` refs)
 2. `$$` → escape sentinel
 3. `@name` / `@N` → inject section content (with `$` in content escaped)
-4. `${name}` → blackboard bindings
-5. `$n` → positional args
-6. Restore escape sentinels to literal `@` and `$`
+4. `${name}` → named bindings
+5. Restore escape sentinels to literal `@` and `$`
 
 The key consequence: section content is injected *before* `$` interpolation,
-but all `$` characters in the injected content are escaped. So `$1` inside
-a section stays as literal `$1` in the output — it won't be resolved against
-the args stack. This is the "quoted verbatim" guarantee.
+but all `$` characters in the injected content are escaped. So `${name}` inside
+a section stays as literal `${name}` in the output — it won't be resolved
+against the bindings. This is the "quoted verbatim" guarantee.
 
 ## Patterns
 
@@ -211,7 +201,8 @@ The LLM returns:
 ```json
 {
   "ops": [{"op": "send", "mailbox": "human", "msg": "Hello!"}],
-  "frames": []
+  "frames": [],
+  "notes": {}
 }
 ```
 
@@ -227,26 +218,28 @@ the context stack entirely — the original boot frame is gone.
 You are a system inspector. Do the following in order:
 
 1. Send the command "uname -a" to the 'bash' mailbox.
-2. Receive the result (it will appear as $1 on your next eval).
-3. Send a message to 'human' that says: "System info: $1"
+2. Receive the result with dest "output" (it will appear as ${output} on
+   your next eval).
+3. Send a message to 'human' that says: "System info: ${output}"
 4. Terminate with an empty frames array.
 
-Start by sending the bash command and issuing a receive, then set your
-frames to a continuation prompt that reminds you to forward the result
-to human once you have it.
+Start by sending the bash command and issuing a receive with dest "output",
+then set your frames to a continuation prompt that reminds you to forward
+the result to human once you have it.
 ```
 
-Cycle 1: LLM sends the bash command, issues receive, returns a frame like
-"You received system info in $1. Send it to human and terminate."
+Cycle 1: LLM sends the bash command, issues receive with dest "output",
+returns a frame like "You received system info in ${output}. Send it to
+human and terminate."
 
-Cycle 2: `$1` now contains the bash output. LLM sends it to human, returns
-`[]`.
+Cycle 2: `${output}` now contains the bash output. LLM sends it to human,
+returns `[]`.
 
 **Tip:** Tell the LLM to write *real prompts* as continuation frames, not
 shorthand labels. A frame like `"step2"` gives the LLM nothing to work with
-on the next cycle. A frame like `"You have the bash result in $1. Send
-'System info: $1' to human, then return empty frames to terminate."` is much
-better.
+on the next cycle. A frame like `"You have the bash result in ${output}. Send
+'System info: ${output}' to human, then return empty frames to terminate."`
+is much better.
 
 ### Loops with `@0`
 
@@ -268,18 +261,19 @@ You are an interactive echo-bot. This frame handles first-time setup.
 @@loop
 You are an interactive echo-bot, in the middle of a loop iteration.
 
-The user's most recent input is in $1. Decide what to do:
+The user's most recent input is in ${input}. Decide what to do:
 
-- If $1 is "quit": send "echo-bot: goodbye!" to 'human', then terminate
-  with an empty frames array [].
-- Otherwise: send "echo-bot: you said: $1" to 'human', then prompt for
-  the next input by sending "echo-bot> " to 'human_input', then receive.
-  Return frames: ["@loop"] to continue the loop.
+- If ${input} is "quit": send "echo-bot: goodbye!" to 'human', then
+  terminate with an empty frames array [].
+- Otherwise: send "echo-bot: you said: ${input}" to 'human', then prompt
+  for the next input by sending "echo-bot> " to 'human_input', then
+  receive with dest "input". Return frames: ["@loop"] to continue the loop.
 @@end
 
 First-time setup:
 1. Send a greeting to 'human'.
-2. Send the prompt "echo-bot> " to 'human_input', then receive.
+2. Send the prompt "echo-bot> " to 'human_input', then receive with dest
+   "input".
 3. Return frames: ["@loop"] to enter the loop.
 
 After this first cycle, the @loop section takes over for all subsequent
@@ -289,8 +283,8 @@ iterations. You will NOT see this setup frame again.
 Cycle 1 (setup frame): LLM greets, prompts, receives. Returns `["@loop"]`.
 After interpolation, the context stack becomes the loop body text.
 
-Cycle 2+ (loop body): LLM sees user input in `$1`, echoes or quits. Returns
-`["@loop"]` to keep going, or `[]` to stop.
+Cycle 2+ (loop body): LLM sees user input in `${input}`, echoes or quits.
+Returns `["@loop"]` to keep going, or `[]` to stop.
 
 This pattern cleanly separates one-time setup from the repeating loop.
 
@@ -304,16 +298,15 @@ in the parent's frame, and reference it with `@worker` in the fork frames.
 You are a supervisor that delegates work to a child process.
 
 @@worker
-Send the command 'date +%s' to 'bash', receive the result, then join with
-the message 'timestamp: $1'. Use a continuation frame between the
-send+receive and the join so you remember what to do next.
+Send the command 'date +%s' to 'bash', receive the result with dest "ts",
+then join with the message 'timestamp: ${ts}'. Use a continuation frame
+between the send+receive and the join so you remember what to do next.
 @@end
 
 1. Send a message to 'human': "Supervisor: spawning worker..."
-2. Fork a child with 0 frames popped from your stack, and give the child
-   these frames: ["@worker"]
-3. Receive the child's join message (it will become $1).
-4. Send to 'human': "Supervisor: child reported: $1"
+2. Fork a child with n=0, frames: ["@worker"], and dest "child"
+3. Receive the child's join message with dest "result".
+4. Send to 'human': "Supervisor: child reported: ${result}"
 5. Terminate with an empty frames array.
 ```
 
@@ -322,37 +315,39 @@ expands it to the worker section text. The child process gets this as its
 frame, and the runtime automatically appends the runtime preamble — so the
 child knows about syscalls, interpolation, etc. without you repeating it.
 
-The `$1` in the worker section text (`'timestamp: $1'`) is safe because
-section content is quoted verbatim. The `$1` survives as literal text in
-the child's prompt, where the child's own interpolation will resolve it
-against the child's own args stack.
+The `${ts}` in the worker section text is safe because section content is
+quoted verbatim. The `${ts}` survives as literal text in the child's prompt,
+where the child's own interpolation will resolve it against the child's own
+bindings.
 
 ## Common pitfalls
 
-### 1. Using `$1` from a `receive` in the same cycle
+### 1. Using `${dest}` from a `receive` in the same cycle
 
 **Wrong:**
 ```json
 {
   "ops": [
-    {"op": "receive"},
-    {"op": "send", "mailbox": "human", "msg": "Got: $1"}
+    {"op": "receive", "dest": "data"},
+    {"op": "send", "mailbox": "human", "msg": "Got: ${data}"}
   ],
-  "frames": []
+  "frames": [],
+  "notes": {}
 }
 ```
 
-The `$1` in the send is interpolated *before* the receive runs, so it refers
-to whatever was previously on the args stack (or stays as literal `$1` if
-the stack was empty).
+The `${data}` in the send is interpolated *before* the receive runs, so it
+refers to whatever was previously in that binding (or stays as literal
+`${data}` if the binding didn't exist).
 
-**Right:** Issue the receive, return a continuation frame, and use `$1` on
-the next cycle:
+**Right:** Issue the receive, return a continuation frame, and use `${data}`
+on the next cycle:
 
 ```json
 {
-  "ops": [{"op": "receive"}],
-  "frames": ["Send the received value ($1) to human, then terminate."]
+  "ops": [{"op": "receive", "dest": "data"}],
+  "frames": ["Send the received value (${data}) to human, then terminate."],
+  "notes": {"data": "the received value"}
 }
 ```
 
@@ -363,7 +358,7 @@ the next cycle:
 The LLM sees `"step2"` as its entire system prompt on the next cycle. It
 has no idea what step 2 is.
 
-**Right:** `frames: ["You received the bash output in $1. Send 'Result: $1' to 'human' and terminate with empty frames."]`
+**Right:** `frames: ["You received the bash output in ${output}. Send 'Result: ${output}' to 'human' and terminate with empty frames."]`
 
 Write continuation frames as if you're writing instructions for a new agent
 that knows nothing about what happened before.
@@ -400,8 +395,8 @@ arrives.
 Each cycle should do one logical step. Don't pre-issue ops for future steps.
 For example, don't send to `bash` and then immediately try to forward the
 result to `human` in the same cycle — the result isn't available yet. Send
-to `bash`, receive, return a continuation frame, then send to `human` on the
-next cycle.
+to `bash`, receive with a dest name, return a continuation frame, then send
+to `human` on the next cycle.
 
 ## Mailbox protocols
 
@@ -421,7 +416,8 @@ Send a prompt string, then receive to get the user's typed input.
 {"op": "send", "mailbox": "human_input", "msg": "Enter your name: "}
 ```
 
-Then issue a `receive`. The user's typed line (trimmed) is pushed as `$1`.
+Then issue a `receive` with a dest name. The user's typed line (trimmed)
+is stored in `${dest}`.
 
 ### bash
 
@@ -431,8 +427,8 @@ Send a shell command string, then receive the output.
 {"op": "send", "mailbox": "bash", "msg": "uname -a"}
 ```
 
-Then issue a `receive`. stdout (with stderr merged) is pushed as `$1`.
-On failure, the message is `"error: exit code N: ..."`.
+Then issue a `receive` with a dest name. stdout (with stderr merged) is
+stored in `${dest}`. On failure, the message is `"error: exit code N: ..."`.
 
 ### blackboard
 
@@ -441,8 +437,8 @@ Key-value store. Send commands as strings:
 - **Write:** `{write, key, value}` or `write key value`
 - **Read:** `{read, key}` or `read key`
 
-Then receive. Write returns `"ok"` as `$1`. Read returns the value (or empty
-string if the key doesn't exist).
+Then receive with a dest name. Write returns `"ok"` in `${dest}`. Read
+returns the value (or empty string if the key doesn't exist).
 
 Both comma-separated and space-separated formats are accepted. Braces are
 optional.
@@ -451,7 +447,7 @@ optional.
 
 | Flag | Effect |
 |------|--------|
-| `-v`, `--verbose` | Print ops, frames, and args each cycle |
+| `-v`, `--verbose` | Print ops, frames, and bindings each cycle |
 | `--thinking` | Enable extended thinking (Anthropic only) |
 | `--test` | Run built-in smoke tests |
 | `--init <file>` | Generate a starter boot frame |
