@@ -215,8 +215,9 @@ defmodule Gizmo.LLM do
 
   defp validate_op(%{"op" => "spawn"} = op) do
     with :ok <- require_list(op, "frames", "spawn"),
-         :ok <- require_string(op, "dest", "spawn") do
-      {:ok, {:spawn, op["frames"], op["dest"]}}
+         :ok <- require_string(op, "dest", "spawn"),
+         {:ok, spawn_opts} <- validate_spawn_opts(op) do
+      {:ok, {:spawn, op["frames"], op["dest"], spawn_opts}}
     end
   end
 
@@ -229,6 +230,23 @@ defmodule Gizmo.LLM do
 
   defp validate_op(%{"op" => name}), do: {:error, {:unknown_op, name}}
   defp validate_op(_), do: {:error, {:invalid_op, nil, "missing op field"}}
+
+  defp validate_spawn_opts(op) do
+    opts = %{}
+
+    with {:ok, opts} <- validate_spawn_bool(op, "grind", :grind, opts),
+         {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts) do
+      {:ok, opts}
+    end
+  end
+
+  defp validate_spawn_bool(op, json_key, atom_key, opts) do
+    case op[json_key] do
+      nil -> {:ok, opts}
+      v when is_boolean(v) -> {:ok, Map.put(opts, atom_key, v)}
+      _ -> {:error, {:invalid_op, "spawn", "#{json_key} must be a boolean"}}
+    end
+  end
 
   defp require_string(op, field, op_name) do
     case op[field] do
@@ -261,9 +279,9 @@ defmodule Gizmo.LLM do
           {:send, Gizmo.Interpolation.resolve(mailbox, bindings, sections),
            Gizmo.Interpolation.resolve(msg, bindings, sections)}
 
-        {:spawn, spawn_frames, dest} ->
+        {:spawn, spawn_frames, dest, spawn_opts} ->
           {:spawn,
-           Enum.map(spawn_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)), dest}
+           Enum.map(spawn_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)), dest, spawn_opts}
 
         {:trap, pattern, handler_frames} ->
           {:trap, pattern,
@@ -543,9 +561,9 @@ defmodule Gizmo.Mailbox do
     end
   end
 
-  @doc "Register the calling process under `mailbox_id`."
-  def register(mailbox_id) do
-    case Registry.register(@registry, mailbox_id, nil) do
+  @doc "Register the calling process under `mailbox_id` with optional parent."
+  def register(mailbox_id, parent \\ nil) do
+    case Registry.register(@registry, mailbox_id, parent) do
       {:ok, _} -> :ok
       {:error, {:already_registered, _}} -> {:error, {:already_registered, mailbox_id}}
     end
@@ -555,6 +573,14 @@ defmodule Gizmo.Mailbox do
   def lookup(mailbox_id) do
     case Registry.lookup(@registry, mailbox_id) do
       [{pid, _}] -> {:ok, pid}
+      [] -> {:error, {:not_found, mailbox_id}}
+    end
+  end
+
+  @doc "Look up the PID and parent registered under `mailbox_id`."
+  def lookup_with_parent(mailbox_id) do
+    case Registry.lookup(@registry, mailbox_id) do
+      [{pid, parent}] -> {:ok, pid, parent}
       [] -> {:error, {:not_found, mailbox_id}}
     end
   end
@@ -845,6 +871,66 @@ defmodule Gizmo.Services.Exception do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Reaper — force-kill descendant agents on request
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Reaper do
+  use GenServer
+
+  def start_link(mailbox_id \\ "reaper") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {caller_mb, target_mb}}, state) do
+    case Gizmo.Mailbox.lookup_with_parent(target_mb) do
+      {:ok, target_pid, _parent} ->
+        if ancestor?(caller_mb, target_mb) do
+          Process.exit(target_pid, :shutdown)
+        else
+          IO.puts(:stderr, "[reaper] denied: #{caller_mb} is not an ancestor of #{target_mb}")
+        end
+
+      {:error, _} ->
+        IO.puts(:stderr, "[reaper] target not found: #{target_mb}")
+    end
+
+    {:noreply, state}
+  end
+
+  defp ancestor?(caller_mb, target_mb) do
+    walk_ancestors(caller_mb, target_mb, MapSet.new())
+  end
+
+  defp walk_ancestors(caller_mb, current_mb, visited) do
+    if MapSet.member?(visited, current_mb) do
+      false
+    else
+      case Gizmo.Mailbox.lookup_with_parent(current_mb) do
+        {:ok, _pid, nil} ->
+          false
+
+        {:ok, _pid, parent_mb} ->
+          if parent_mb == caller_mb do
+            true
+          else
+            walk_ancestors(caller_mb, parent_mb, MapSet.put(visited, current_mb))
+          end
+
+        {:error, _} ->
+          false
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Services.Watchdog — periodic tick messages to a target mailbox
 # -----------------------------------------------------------------------------
 
@@ -907,7 +993,7 @@ defmodule Gizmo.Agent.Wrapper do
     grind = Keyword.get(opts, :grind, false)
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
-    Gizmo.Mailbox.register(mailbox_id)
+    Gizmo.Mailbox.register(mailbox_id, parent)
 
     msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
     {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
@@ -955,6 +1041,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Human, "human"},
       {Gizmo.Services.HumanInput, "human_input"},
       {Gizmo.Services.Exception, "exception"},
+      {Gizmo.Services.Reaper, "reaper"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -1004,9 +1091,12 @@ defmodule Gizmo.Agent do
       do NOT need receive — messages arrive automatically as ${_msg} between
       cycles. Use receive only in grind mode or when you need to explicitly
       block mid-cycle.
-    - spawn(frames, dest): Create a child process with the given frames as its
-      context stack. The child's mailbox ID is stored in the binding named by
-      `dest`. The child receives ${_parent} bound to your mailbox ID.
+    - spawn(frames, dest, [grind], [idle]): Create a child process with the given
+      frames as its context stack. The child's mailbox ID is stored in the binding
+      named by `dest`. The child receives ${_parent} bound to your mailbox ID.
+      Optional: set "grind": true/false to override the child's loop mode
+      (default: inherit parent). Set "idle": true/false to control whether the
+      child restores its boot frame on empty frames (default: inherit parent).
     - trap(pattern, frames): Register an interrupt handler. When a message
       matching the regex `pattern` arrives between cycles, the handler frames
       are prepended to your context stack. The message is bound to
@@ -1069,6 +1159,9 @@ defmodule Gizmo.Agent do
     - exception: Error notification sink. The runtime sends error tuples here
       when an agent exceeds retry or cycle limits. You do not normally send
       to this mailbox yourself.
+    - reaper: Force-kill a descendant agent. Send the target's mailbox ID.
+      The reaper verifies you are an ancestor before killing. Fire-and-forget.
+      The target's parent receives a child_died: notification automatically.
 
     ## Message-driven model
 
@@ -1312,7 +1405,7 @@ defmodule Gizmo.Agent do
             case op do
               {:send, mb, msg} -> IO.puts(Gizmo.Format.op_send(id, mb, msg))
               {:receive, dest} -> IO.puts(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
-              {:spawn, cf, dest} -> IO.puts(Gizmo.Format.op_spawn(id, cf, dest))
+              {:spawn, cf, dest, _opts} -> IO.puts(Gizmo.Format.op_spawn(id, cf, dest))
               {:trap, _pattern, []} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
               {:trap, pattern, _} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
             end
@@ -1358,15 +1451,20 @@ defmodule Gizmo.Agent do
     {:cont, frames, Map.put(bindings, dest, message), trap}
   end
 
-  defp execute_op({:spawn, child_frames, dest}, frames, state, bindings, trap) do
+  defp execute_op({:spawn, child_frames, dest, spawn_opts}, frames, state, bindings, trap) do
+    child_grind = Map.get(spawn_opts, :grind, state.grind)
+    child_quit_on_exhaust = if Map.has_key?(spawn_opts, :idle),
+      do: !spawn_opts.idle,
+      else: state.quit_on_exhaust
+
     {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames,
       parent: state.mailbox_id,
       chat_fn: state.chat_fn,
       verbose: state.verbose,
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
-      quit_on_exhaust: state.quit_on_exhaust,
-      grind: state.grind
+      quit_on_exhaust: child_quit_on_exhaust,
+      grind: child_grind
     )
 
     # Monitor child: on abnormal exit, notify parent mailbox
@@ -1599,7 +1697,7 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("valid ops parse", good_result.ops, [
       {:send, "human", "hello"},
       {:receive, "msg"},
-      {:spawn, ["f1", "f2"], "child"},
+      {:spawn, ["f1", "f2"], "child", %{}},
       {:trap, "^alert:", ["handler"]}
     ])
     failures = failures ++ assert_eq("notes parsed", good_result.notes, %{"msg" => "received message"})
@@ -1624,6 +1722,30 @@ defmodule Gizmo.CLI do
     # spawn missing dest
     bad_spawn2 = %{"ops" => [%{"op" => "spawn", "frames" => ["f"]}], "frames" => []}
     failures = failures ++ assert_error_op("spawn missing dest", Gizmo.LLM.normalize_eval(bad_spawn2), :invalid_op, "spawn")
+
+    # spawn with grind option
+    spawn_grind = %{"ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => true}], "frames" => []}
+    {:ok, spawn_grind_result} = Gizmo.LLM.normalize_eval(spawn_grind)
+    failures = failures ++ assert_eq("spawn with grind: true", hd(spawn_grind_result.ops), {:spawn, ["f"], "c", %{grind: true}})
+
+    # spawn with idle option
+    spawn_idle = %{"ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "idle" => true}], "frames" => []}
+    {:ok, spawn_idle_result} = Gizmo.LLM.normalize_eval(spawn_idle)
+    failures = failures ++ assert_eq("spawn with idle: true", hd(spawn_idle_result.ops), {:spawn, ["f"], "c", %{idle: true}})
+
+    # spawn with both options
+    spawn_both = %{"ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => true, "idle" => false}], "frames" => []}
+    {:ok, spawn_both_result} = Gizmo.LLM.normalize_eval(spawn_both)
+    failures = failures ++ assert_eq("spawn with grind+idle", hd(spawn_both_result.ops), {:spawn, ["f"], "c", %{grind: true, idle: false}})
+
+    # spawn with no options → empty map
+    spawn_no_opts = %{"ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c"}], "frames" => []}
+    {:ok, spawn_no_opts_result} = Gizmo.LLM.normalize_eval(spawn_no_opts)
+    failures = failures ++ assert_eq("spawn with no opts → empty map", hd(spawn_no_opts_result.ops), {:spawn, ["f"], "c", %{}})
+
+    # spawn with non-bool grind → error
+    bad_spawn_grind = %{"ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => "yes"}], "frames" => []}
+    failures = failures ++ assert_error_op("spawn grind non-bool", Gizmo.LLM.normalize_eval(bad_spawn_grind), :invalid_op, "spawn")
 
     # fork is now unknown
     bad_fork = %{"ops" => [%{"op" => "fork", "n" => 1, "frames" => [], "dest" => "c"}], "frames" => []}
@@ -1710,7 +1832,7 @@ defmodule Gizmo.CLI do
       ops: [
         {:send, "human", "Hello ${name}, status: ${status}"},
         {:receive, "reply"},
-        {:spawn, ["child frame ${name}"], "child"},
+        {:spawn, ["child frame ${name}"], "child", %{grind: true}},
         {:send, "${_parent}", "result: ${result}"}
       ],
       frames: ["next frame ${name} ${ctx}"],
@@ -1729,7 +1851,7 @@ defmodule Gizmo.CLI do
     )
     failures = failures ++ assert_eq("interpolate spawn frames",
       Enum.at(interpolated.ops, 2),
-      {:spawn, ["child frame Alice"], "child"}
+      {:spawn, ["child frame Alice"], "child", %{grind: true}}
     )
     failures = failures ++ assert_eq("interpolate send to parent",
       Enum.at(interpolated.ops, 3),
@@ -1817,6 +1939,24 @@ defmodule Gizmo.CLI do
       Gizmo.Mailbox.lookup(test_mb),
       {:error, {:not_found, test_mb}}
     )
+
+    # lookup_with_parent returns stored parent
+    lwp_mb = Gizmo.Mailbox.generate_id("lwp_test")
+    Gizmo.Mailbox.register(lwp_mb, "parent_mb_123")
+    failures = failures ++ assert_eq("lookup_with_parent returns stored parent",
+      Gizmo.Mailbox.lookup_with_parent(lwp_mb),
+      {:ok, self(), "parent_mb_123"}
+    )
+    Gizmo.Mailbox.unregister(lwp_mb)
+
+    # lookup_with_parent returns nil for default registration
+    lwp_mb2 = Gizmo.Mailbox.generate_id("lwp_test2")
+    Gizmo.Mailbox.register(lwp_mb2)
+    failures = failures ++ assert_eq("lookup_with_parent returns nil for default",
+      Gizmo.Mailbox.lookup_with_parent(lwp_mb2),
+      {:ok, self(), nil}
+    )
+    Gizmo.Mailbox.unregister(lwp_mb2)
 
     IO.puts("")
 
@@ -2015,7 +2155,7 @@ defmodule Gizmo.CLI do
           {:ok, %{ops: [], frames: [], notes: %{}}}
         # Parent cycle 0: spawn a child, then receive
         true ->
-          {:ok, %{ops: [{:spawn, ["child frame"], "worker"}, {:receive, "result"}], frames: ["parent waiting"], notes: %{}}}
+          {:ok, %{ops: [{:spawn, ["child frame"], "worker", %{}}, {:receive, "result"}], frames: ["parent waiting"], notes: %{}}}
       end
     end
 
@@ -2214,7 +2354,7 @@ defmodule Gizmo.CLI do
       cond do
         # Parent cycle 0: spawn a child that will crash, then receive
         c == 0 ->
-          {:ok, %{ops: [{:spawn, ["crash frame"], "worker"}, {:receive, "death_msg"}], frames: ["parent waiting for child death"], notes: %{}}}
+          {:ok, %{ops: [{:spawn, ["crash frame"], "worker", %{}}, {:receive, "death_msg"}], frames: ["parent waiting for child death"], notes: %{}}}
         # Child: always raises
         String.contains?(system, "crash frame") ->
           raise "deliberate child crash"
@@ -2442,7 +2582,7 @@ defmodule Gizmo.CLI do
     {:ok, _} = Gizmo.Supervision.start_link()
 
     # Test 1: All well-known services are registered
-    failures = Enum.reduce(["blackboard", "bash", "human", "human_input", "exception"], failures, fn svc, acc ->
+    failures = Enum.reduce(["blackboard", "bash", "human", "human_input", "exception", "reaper"], failures, fn svc, acc ->
       acc ++ assert_eq("supervised service '#{svc}' registered",
         elem(Gizmo.Mailbox.lookup(svc), 0), :ok)
     end)
@@ -2720,7 +2860,235 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 12. LLM test (only if API key is set)
+    # 12. Reaper tests
+    IO.puts("--- Reaper ---")
+
+    {:ok, _} = Gizmo.Supervision.start_link()
+
+    # Test 1: Parent kills child via reaper
+    # Parent uses grind: true so cycle 0 fires immediately.
+    # Child idles in message-driven mode (no grind).
+    # Parent spawns child, sends child's mb to reaper, then uses receive to wait for death notification.
+    reaper_test_mb = Gizmo.Mailbox.generate_id("reaper_test")
+    Gizmo.Mailbox.register(reaper_test_mb)
+    reaper_parent_cycle = :counters.new(1, [:atomics])
+
+    reaper_chat_fn = fn system, _messages, _opts ->
+      # Child: just idle (message-driven, will sleep waiting for messages)
+      if String.contains?(system, "reaper child frame") do
+        {:ok, %{ops: [], frames: ["reaper child frame"], notes: %{}}}
+      else
+        c = :counters.get(reaper_parent_cycle, 1)
+        :counters.add(reaper_parent_cycle, 1, 1)
+
+        case c do
+          # Parent cycle 0: spawn child
+          0 ->
+            {:ok, %{ops: [{:spawn, ["reaper child frame"], "kid", %{}}], frames: ["parent: send kill to reaper"], notes: %{}}}
+
+          # Parent cycle 1: send child's mb to reaper, then receive death notification
+          1 ->
+            {:ok, %{ops: [
+              {:send, "reaper", "${kid}"},
+              {:receive, "death_note"}
+            ], frames: ["parent: forward death notification"], notes: %{}}}
+
+          # Parent cycle 2: forward the death notification to test and exit
+          2 ->
+            {:ok, %{ops: [{:send, reaper_test_mb, "${death_note}"}], frames: [], notes: %{}}}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _reaper_parent_mb, reaper_parent_pid} = Gizmo.Agent.start(["parent: spawn child"],
+      chat_fn: reaper_chat_fn, receive_timeout: 5_000, grind: true)
+
+    reaper_parent_ref = Process.monitor(reaper_parent_pid)
+
+    reaper_result = receive do
+      {:mailbox_msg, ^reaper_test_mb, {_from, msg}} -> msg
+    after
+      10_000 -> :no_message
+    end
+
+    receive do
+      {:DOWN, ^reaper_parent_ref, :process, ^reaper_parent_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures = failures ++ assert_eq("reaper: parent kills child",
+      reaper_result != :no_message && String.contains?(to_string(reaper_result), "child_died:"), true)
+
+    Gizmo.Mailbox.unregister(reaper_test_mb)
+
+    # Test 2: Non-ancestor kill denied — two unrelated agents, one tries to kill the other
+    reaper_deny_mb = Gizmo.Mailbox.generate_id("reaper_deny")
+    Gizmo.Mailbox.register(reaper_deny_mb)
+    deny_cycle = :counters.new(1, [:atomics])
+
+    # Start target agent — message-driven, so it idles waiting for messages
+    target_chat_fn = fn _system, _messages, _opts ->
+      {:ok, %{ops: [], frames: ["deny target frame"], notes: %{}}}
+    end
+
+    {:ok, target_mb, target_pid} = Gizmo.Agent.start(["deny target frame"],
+      chat_fn: target_chat_fn, receive_timeout: 30_000)
+
+    # Attacker agent: sends target_mb to reaper on cycle 0, then exits
+    attacker_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(deny_cycle, 1)
+      :counters.add(deny_cycle, 1, 1)
+
+      case c do
+        0 ->
+          {:ok, %{ops: [{:send, "reaper", target_mb}], frames: ["attacker: done"], notes: %{}}}
+        _ ->
+          {:ok, %{ops: [{:send, reaper_deny_mb, "done"}], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, _attacker_mb, _attacker_pid} = Gizmo.Agent.start(["attacker: try to kill target"],
+      chat_fn: attacker_chat_fn, receive_timeout: 5_000, grind: true)
+
+    # Wait for attacker to signal it's done
+    receive do
+      {:mailbox_msg, ^reaper_deny_mb, {_from, "done"}} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    # Give reaper time to process
+    Process.sleep(200)
+
+    # Target should still be alive since attacker is not its ancestor
+    failures = failures ++ assert_eq("reaper: non-ancestor kill denied",
+      Process.alive?(target_pid), true)
+
+    # Cleanup
+    Process.exit(target_pid, :kill)
+    Process.sleep(100)
+    Gizmo.Mailbox.unregister(reaper_deny_mb)
+
+    IO.puts("")
+
+    # 13. Spawn opts (grind/idle override) integration tests
+    IO.puts("--- Spawn Opts ---")
+
+    # Test 1: Grind parent spawns message-driven child (grind: false)
+    # Parent is grind, child should wait for messages (not spin).
+    # Child: on receiving a message, sends it back to test mailbox and exits.
+    # Parent: spawns child with grind: false, sends it a message, then exits.
+    spawn_opts_test_mb = Gizmo.Mailbox.generate_id("spawn_opts_test")
+    Gizmo.Mailbox.register(spawn_opts_test_mb)
+    spawn_opts_cycle = :counters.new(1, [:atomics])
+
+    spawn_opts_child_cycle = :counters.new(1, [:atomics])
+
+    spawn_opts_chat_fn = fn system, _messages, _opts ->
+      if String.contains?(system, "msg-child") do
+        child_c = :counters.get(spawn_opts_child_cycle, 1)
+        :counters.add(spawn_opts_child_cycle, 1, 1)
+
+        case child_c do
+          # Child cycle 0 (init): stay alive, wait for real message
+          0 -> {:ok, %{ops: [], frames: ["msg-child"], notes: %{}}}
+          # Child cycle 1+: forward _msg to test mailbox and exit
+          _ -> {:ok, %{ops: [{:send, spawn_opts_test_mb, "${_msg}"}], frames: [], notes: %{}}}
+        end
+      else
+        c = :counters.get(spawn_opts_cycle, 1)
+        :counters.add(spawn_opts_cycle, 1, 1)
+
+        case c do
+          0 ->
+            # Parent cycle 0: spawn message-driven child
+            {:ok, %{ops: [{:spawn, ["msg-child"], "kid", %{grind: false}}], frames: ["parent: send to child"], notes: %{}}}
+          1 ->
+            # Parent cycle 1: send message to child, then exit
+            {:ok, %{ops: [{:send, "${kid}", "hello from parent"}], frames: [], notes: %{}}}
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _so_mb, so_pid} = Gizmo.Agent.start(["parent: spawn msg child"],
+      chat_fn: spawn_opts_chat_fn, receive_timeout: 5_000, grind: true)
+
+    so_ref = Process.monitor(so_pid)
+    so_result = receive do
+      {:mailbox_msg, ^spawn_opts_test_mb, {_from, msg}} -> msg
+    after
+      10_000 -> :no_message
+    end
+
+    receive do
+      {:DOWN, ^so_ref, :process, ^so_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures = failures ++ assert_eq("spawn opts: grind parent, msg-driven child",
+      so_result, "hello from parent")
+    Gizmo.Mailbox.unregister(spawn_opts_test_mb)
+
+    # Test 2: Message-driven parent spawns grind child (grind: true)
+    # Parent is message-driven, child should loop without waiting for messages.
+    # Child: grind mode, sends result to test mailbox on cycle 0 and exits.
+    spawn_opts_test_mb2 = Gizmo.Mailbox.generate_id("spawn_opts_test2")
+    Gizmo.Mailbox.register(spawn_opts_test_mb2)
+    spawn_opts_cycle2 = :counters.new(1, [:atomics])
+
+    spawn_opts_chat_fn2 = fn system, _messages, _opts ->
+      if String.contains?(system, "grind-child") do
+        # Child: grind mode, sends result and exits immediately
+        {:ok, %{ops: [{:send, spawn_opts_test_mb2, "grind child done"}], frames: [], notes: %{}}}
+      else
+        c = :counters.get(spawn_opts_cycle2, 1)
+        :counters.add(spawn_opts_cycle2, 1, 1)
+
+        case c do
+          0 ->
+            # Parent cycle 0: spawn grind child, then exit
+            {:ok, %{ops: [{:spawn, ["grind-child"], "kid", %{grind: true}}], frames: [], notes: %{}}}
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    # Parent is message-driven (grind: false), but child should grind
+    {:ok, so_mb2, so_pid2} = Gizmo.Agent.start(["parent: spawn grind child"],
+      chat_fn: spawn_opts_chat_fn2, receive_timeout: 5_000, grind: false)
+
+    # Send a message to parent to kick off its first cycle (it's message-driven)
+    Gizmo.Mailbox.route(so_mb2, {"test", "start"})
+
+    so_ref2 = Process.monitor(so_pid2)
+    so_result2 = receive do
+      {:mailbox_msg, ^spawn_opts_test_mb2, {_from, msg}} -> msg
+    after
+      10_000 -> :no_message
+    end
+
+    receive do
+      {:DOWN, ^so_ref2, :process, ^so_pid2, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures = failures ++ assert_eq("spawn opts: msg-driven parent, grind child",
+      so_result2, "grind child done")
+    Gizmo.Mailbox.unregister(spawn_opts_test_mb2)
+
+    IO.puts("")
+
+    # 14. LLM test (only if API key is set)
+    # (renumbered from 12 to make room for reaper and spawn opts tests)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do

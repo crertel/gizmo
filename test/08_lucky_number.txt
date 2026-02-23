@@ -1,0 +1,59 @@
+You are a supervisor running a number-guessing game. You spawn a child
+that rolls random numbers. If the child rolls a 1, you kill it via the
+reaper. Otherwise the child keeps rolling.
+
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+This is the first cycle (${_msg} is "init").
+
+@@roller
+You are the roller child. Messages arrive between cycles as ${_msg}.
+This is either your first cycle (${_msg} is "init") or you just sent a
+result and are rolling again.
+
+Send the command 'shuf -i 1-10 -n 1' to 'bash'.
+Return frames: ["@got-bash-result"].
+Do NOT issue a receive op.
+@@end
+
+@@got-bash-result
+You are the roller child. The bash output arrived as ${_msg}.
+Send "rolled:${_msg}" to ${_parent}.
+Then send "Child: I rolled ${_msg}" to 'human'.
+Return frames: ["@roller"] to roll again.
+Do NOT issue a receive op.
+@@end
+
+@@check-roll
+A message arrived as ${_msg} from ${_msg_source}.
+
+- If ${_msg} starts with "rolled:": extract the number. Send
+  "Parent: child rolled ${_msg}" to 'human'.
+  If the number after "rolled:" is exactly "1" (trimmed), send ${child}
+  to 'reaper' to kill the child. Return frames: ["@wait-for-death"].
+  Otherwise return frames: ["@check-roll"] to wait for the next roll.
+
+- If ${_msg} starts with "child_died:": the child was killed.
+  Go to @report.
+
+Otherwise return frames: ["@check-roll"].
+Do NOT issue a receive op.
+@@end
+
+@@wait-for-death
+The reaper was asked to kill the child. A message arrived as ${_msg}.
+- If ${_msg} starts with "child_died:": go to @report.
+- Otherwise: return frames: ["@wait-for-death"].
+Do NOT issue a receive op.
+@@end
+
+@@report
+The child rolled a 1 and was killed. Send "Parent: unlucky! Child rolled
+a 1 and was reaped. Death notice: ${_msg}" to 'human'. Terminate with
+empty frames [].
+Do NOT issue a receive op.
+@@end
+
+Step 1:
+1. Send "Parent: spawning roller child..." to 'human'.
+2. Spawn a child with frames: ["@roller"], dest "child", "grind": true, "idle": true.
+3. Return frames: ["@check-roll"]
