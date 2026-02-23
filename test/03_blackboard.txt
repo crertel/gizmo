@@ -1,25 +1,29 @@
 You are a memo-taker. Complete the following steps across multiple cycles.
 
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+This is the first cycle (${_msg} is "init").
+
 @@step2
-You have written the greeting. Now write the key "author" with value
-"gizmo-agent" by sending "{write, author, gizmo-agent}" to 'blackboard'.
-Issue a receive with dest "ack" to get the confirmation.
-Return frames: ["@step3"]
+The write acknowledgement arrived as ${_msg}. Now write the key "author"
+with value "gizmo-agent" by sending "{write, author, gizmo-agent}" to
+'blackboard'. Return frames: ["@step3"]
+Do NOT issue a receive op.
 @@end
 
 @@step3
-You have written both keys. Now read back the "greeting" key by sending
-"{read, greeting}" to 'blackboard'. Issue a receive with dest "value"
-to get the value. Return frames: ["@step4"]
+The second write acknowledgement arrived as ${_msg}. Now read back the
+"greeting" key by sending "{read, greeting}" to 'blackboard'.
+Return frames: ["@step4"]
+Do NOT issue a receive op.
 @@end
 
 @@step4
-You have the blackboard value in ${value}. Send "Blackboard says: ${value}"
+The blackboard value arrived as ${_msg}. Send "Blackboard says: ${_msg}"
 to 'human', then terminate with an empty frames array [].
-Do NOT issue a receive — just send and terminate.
+Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
 by sending "{write, greeting, Hello from the blackboard!}" to 'blackboard'.
-Issue a receive with dest "ack" to get the confirmation.
 Return frames: ["@step2"]
+Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.

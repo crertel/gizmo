@@ -172,6 +172,189 @@ burned 50 LLM calls before the runtime killed it.
 
 ### What replaced it
 
-- `--quit-on-exhaust` — agents terminate on empty frames instead of idling.
+- Terminate-on-exhaust is now the default — agents exit on empty frames.
+- `--idle` — opt-in to restore boot frame and idle on empty frames.
 - `--max-cycles N` — configurable cycle limit, with 0 meaning unlimited.
-- Both options propagate to forked children.
+- Both options propagate to spawned children.
+
+## Grinding Eval Loop as Default
+
+**Introduced:** Stage 6 (Agent Process)
+**Changed:** Stage 12 (Message-Driven Eval Loop)
+
+The eval loop originally ran as a hot grind — call the LLM, execute ops, loop
+immediately. This was the simplest implementation and matched the "rewrite rule"
+mental model.
+
+### Why it didn't work
+
+- **Wasted LLM calls.** A one-shot hello agent burned 50 calls spinning on an
+  idle boot frame before the cycle limit killed it. Each idle cycle was a full
+  LLM round-trip that returned "nothing to do."
+- **Didn't match the actor model.** Processes should react to messages, not
+  spin. A process with no work should sleep, not poll.
+- **Complicated fork/join.** The parent had to pair `fork` + `receive` in the
+  same op list to avoid spinning while waiting for the child. This was fragile
+  and unnatural — in the actor model, you fork and naturally wake when the
+  child's join message (or death notification) arrives.
+- **No interrupt mechanism.** Without inter-cycle message checking, there was no
+  way to preempt an agent's current work when a high-priority message arrived.
+
+### What replaced it
+
+- **Message-driven eval loop** (default). Agents sleep between cycles via
+  `receive` and wake when a message arrives. `${_msg}` and `${_msg_source}`
+  bindings provide the wake reason.
+- **Grind mode** (`--grind`). Opt-in hot loop for worker agents that need to
+  churn without external stimulus. Preserves the original behavior.
+- **Trap op.** Single-slot interrupt handler that fires when an inter-cycle
+  message matches a regex pattern. `trap(pattern, [])` clears the trap.
+  Enables priority handling and simplified fork/join (parent sleeps, child's
+  join message wakes it).
+- **Watchdog service.** Periodic tick messages for agents that need a heartbeat.
+
+## `untrap` as a Separate Op
+
+**Introduced:** Stage 12 (initial implementation)
+**Removed:** Stage 12 (same stage, during review)
+
+The initial trap design had two ops: `trap(pattern, frames)` to register an
+interrupt handler and `untrap()` to clear it.
+
+### Why it didn't work
+
+- **`trap(pattern, [])` and `untrap()` are the same instruction.** From the
+  LLM's perspective, "set handler frames to empty" and "clear the trap" have
+  no meaningful observable difference. In both cases, no frames get prepended
+  to the stack on match.
+- **The only distinction was an implementation leak.** `trap(pattern, [])` would
+  still match messages and bind `${_interrupt}`, while `untrap()` would prevent
+  matching entirely. But an LLM has no reason to want "match and bind but don't
+  do anything" — that's a runtime bookkeeping detail, not a useful semantic.
+- **Two ops for one concept.** Having both created ambiguity: an LLM that wanted
+  to stop trapping could reasonably reach for either one. Worse, `trap(".*", [])`
+  when the LLM meant `untrap` would silently do the wrong thing (still matching,
+  still binding `_interrupt`).
+
+### What replaced it
+
+`trap(pattern, [])` with empty frames clears the trap. One op, no ambiguity.
+Empty handler frames = nothing to prepend = no trap.
+
+## `fork`/`join` as Process Calculus Primitives
+
+**Introduced:** Stage 8 (Fork and Join)
+**Removed:** Stage 12 (replaced by `spawn` + message-driven wake)
+
+The original op set was `send`, `receive`, `fork`, `join` — modeled on process
+calculus. `fork(n, frames, dest)` spawned a child and popped `n` frames from the
+parent's stack. `join(msg)` sent a message to the parent and terminated.
+
+### Why it didn't work
+
+- **`join` is `send` + empty frames.** `join(msg)` sends a message to the parent
+  and terminates. But `send(parent, msg)` with `frames: []` does the same thing.
+  Once the eval loop became message-driven, the parent naturally wakes when the
+  child's message arrives — no special "join" protocol needed. `join` was
+  syntactic sugar that gave the LLM two ways to say "I'm done, here's my result."
+- **`fork`'s `n` parameter was vestigial.** The `n` parameter popped frames from
+  the parent's returned stack, but the LLM already controls what frames it
+  returns for itself. It can just return fewer frames. The pop-during-execution
+  mechanism solved a problem that doesn't exist.
+- **Implicit parent routing was a hidden dependency.** `join` implicitly knew the
+  parent's mailbox ID via `state.parent`, but this was invisible to the LLM. The
+  child couldn't send to the parent any other way, creating an asymmetry: the
+  parent had `${child_mb}` as a binding, but the child had no corresponding
+  `${parent_mb}`. The runtime hid the parent address behind a special op instead
+  of making it a normal binding.
+- **The terminology obscured what was really an actor system.** "Fork" implies
+  splitting a process. "Spawn" is the actor model term for creating a new process
+  with work to do. Once the eval loop became message-driven and agents started
+  sleeping between cycles, the system was an actor system in everything but name.
+
+### What replaced it
+
+- **`spawn(frames, dest)`** — create a child process with the given frames, store
+  its mailbox ID in `dest`. No `n` parameter, no stack splitting.
+- **`_self` and `_parent` bindings** — the runtime provides every agent its own
+  mailbox ID as `${_self}`, and children get `${_parent}` pointing to their
+  spawner. The LLM can send to either address with the normal `send` op.
+- **Termination is just `frames: []`.** No special op needed. To terminate with
+  a result, `send` first, then return empty frames.
+- **Op set evolution:** `send`, `receive`, `fork`, `join` → `send`, `receive`,
+  `fork`, `join`, `trap`, `untrap` → `send`, `receive`, `fork`, `join`, `trap`
+  → `send`, `receive`, `spawn`, `trap`.
+
+## Idle-by-Default (Boot Frame Restore on Empty Frames)
+
+**Introduced:** Stage 6 (Agent Process)
+**Changed:** Stage 12 (terminate-on-exhaust becomes default)
+
+When an agent returned `frames: []`, the runtime restored the boot frame and
+idled, waiting for new work. `--quit-on-exhaust` was added in Stage 10 as an
+opt-in flag to terminate instead.
+
+### Why it didn't work
+
+- **Wrong default for most agents.** One-shot and multi-step agents are the
+  common case. They do their work, return `frames: []`, and expect to stop.
+  Having to pass `--quit-on-exhaust` every time was friction for the normal path.
+- **Surprising for LLM-authored prompts.** An LLM following the runtime prompt's
+  instruction to "return empty frames to terminate" would find its agent idling
+  instead. The semantics didn't match the documentation.
+- **Long-running agents are opt-in, not the default.** Daemon-style agents that
+  should idle and wait for work are a specialized pattern, not the common case.
+
+### What replaced it
+
+Terminate-on-exhaust is now the default. `--idle` is the opt-in flag for agents
+that should restore the boot frame and wait for messages on empty frames.
+
+## Deferred Frame Transitions in Message-Driven Mode
+
+**Discovered:** Stage 12 (test frame 05_loop.txt)
+
+Test frames 05 and 06 used a two-step quit pattern: the `@loop` frame returned
+`frames: ["@quit"]` with no ops, expecting the `@quit` frame to execute on the
+next cycle and send the goodbye message.
+
+### Why it didn't work
+
+In message-driven mode, every cycle starts by blocking on `maybe_wait_for_message`.
+Returning `frames: ["@quit"]` means the next cycle blocks waiting for a mailbox
+message before evaluating the `@quit` frame. Since quit happens when the user is
+done, no message arrives — the agent hangs forever.
+
+This is correct behavior for the runtime: the agent has frames to process but
+needs a message to trigger the next cycle. The bug was in the prompt design.
+
+### What replaced it
+
+Inline the quit behavior directly. Instead of `frames: ["@quit"]`, the `@loop`
+frame sends the goodbye message and returns `frames: []` in the same cycle.
+
+**Rule of thumb:** In message-driven mode, any frame transition that doesn't
+need new input should be handled in the current cycle, not deferred to a new
+frame that would block on a message.
+
+## Split Output Across Human and HumanInput Services
+
+**Discovered:** Stage 12 (test frame 05_loop.txt)
+
+Test frames sent the echo/response to the `human` service and the input prompt
+to `human_input` as two separate ops. The expectation was that `human` would
+print first (since its op came first), then `human_input` would print the prompt.
+
+### Why it didn't work
+
+Both services are separate GenServers. Mailbox routing delivers messages
+asynchronously. Even though the `send` to `human` executes before the `send`
+to `human_input`, the GenServers process their messages independently. The
+`human_input` service can print its prompt before `human` prints the response,
+producing garbled output like `echo-bot> echo-bot: you said: hello`.
+
+### What replaced it
+
+Combine output and prompt into a single send to `human_input`, separated by a
+newline. Since `human_input` is one GenServer, it processes sequentially: print
+the combined text, then block on `IO.gets`. Output ordering is guaranteed.

@@ -1,2 +1,3 @@
 .nix-hex/
 .nix-mix/
+erl_crash.dump

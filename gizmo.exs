@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–9: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput, Fork/Join, Supervision
+# Gizmo — Stages 0–12: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput, Spawn, Supervision, CLI, Message-Driven Eval
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -51,14 +51,10 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)}   #{@yellow}receive#{@reset} → #{@bold}${#{dest}}#{@reset} #{@dim}(timeout: #{timeout}ms)#{@reset}"
   end
 
-  def op_fork(id, n, child_frames, dest) do
+  def op_spawn(id, child_frames, dest) do
     n_child = length(child_frames)
     child_label = if n_child == 1, do: "1 frame", else: "#{n_child} frames"
-    "#{agent_tag(id)}   #{@magenta}fork#{@reset} n=#{n}, child gets #{child_label} → #{@bold}${#{dest}}#{@reset}"
-  end
-
-  def op_join(id, msg, parent) do
-    "#{agent_tag(id)}   #{@blue}join#{@reset} → #{@bold}#{parent}#{@reset} ← #{truncate(msg, 80)}"
+    "#{agent_tag(id)}   #{@magenta}spawn#{@reset} #{child_label} → #{@bold}${#{dest}}#{@reset}"
   end
 
   def frames_line(id, frames) do
@@ -98,8 +94,8 @@ defmodule Gizmo.LLM do
   @type op ::
           %{op: String.t(), mailbox: String.t(), msg: String.t()}
           | %{op: String.t(), dest: String.t()}
-          | %{op: String.t(), n: integer(), frames: [String.t()], dest: String.t()}
-          | %{op: String.t(), msg: String.t()}
+          | %{op: String.t(), frames: [String.t()], dest: String.t()}
+          | %{op: String.t(), pattern: String.t(), frames: [String.t()]}
 
   @type eval_response :: %{ops: [op()], frames: [String.t()], notes: map()}
 
@@ -124,8 +120,12 @@ defmodule Gizmo.LLM do
             properties: %{
               op: %{
                 type: "string",
-                enum: ["send", "receive", "fork", "join"],
-                description: "The syscall to invoke."
+                enum: ["send", "receive", "spawn", "trap"],
+                description: "The op to invoke."
+              },
+              pattern: %{
+                type: "string",
+                description: "Regex pattern for trap interrupt matching."
               },
               mailbox: %{
                 type: "string",
@@ -133,20 +133,16 @@ defmodule Gizmo.LLM do
               },
               msg: %{
                 type: "string",
-                description: "Message content (for send and join)."
-              },
-              n: %{
-                type: "integer",
-                description: "Number of frames to pop from parent stack (for fork)."
+                description: "Message content (for send)."
               },
               frames: %{
                 type: "array",
                 items: %{type: "string"},
-                description: "Frames to push onto child stack (for fork)."
+                description: "Frames for child process (for spawn) or handler (for trap)."
               },
               dest: %{
                 type: "string",
-                description: "Binding name for the result (for receive and fork)."
+                description: "Binding name for the result (for receive and spawn)."
               }
             }
           }
@@ -217,17 +213,17 @@ defmodule Gizmo.LLM do
     end
   end
 
-  defp validate_op(%{"op" => "fork"} = op) do
-    with :ok <- require_integer(op, "n", "fork"),
-         :ok <- require_list(op, "frames", "fork"),
-         :ok <- require_string(op, "dest", "fork") do
-      {:ok, {:fork, op["n"], op["frames"], op["dest"]}}
+  defp validate_op(%{"op" => "spawn"} = op) do
+    with :ok <- require_list(op, "frames", "spawn"),
+         :ok <- require_string(op, "dest", "spawn") do
+      {:ok, {:spawn, op["frames"], op["dest"]}}
     end
   end
 
-  defp validate_op(%{"op" => "join"} = op) do
-    with :ok <- require_string(op, "msg", "join") do
-      {:ok, {:join, op["msg"]}}
+  defp validate_op(%{"op" => "trap"} = op) do
+    with :ok <- require_string(op, "pattern", "trap"),
+         :ok <- require_list(op, "frames", "trap") do
+      {:ok, {:trap, op["pattern"], op["frames"]}}
     end
   end
 
@@ -239,14 +235,6 @@ defmodule Gizmo.LLM do
       v when is_binary(v) -> :ok
       nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
       _ -> {:error, {:invalid_op, op_name, "#{field} must be a string"}}
-    end
-  end
-
-  defp require_integer(op, field, op_name) do
-    case op[field] do
-      v when is_integer(v) -> :ok
-      nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
-      _ -> {:error, {:invalid_op, op_name, "#{field} must be an integer"}}
     end
   end
 
@@ -270,14 +258,16 @@ defmodule Gizmo.LLM do
     interpolated_ops =
       Enum.map(ops, fn
         {:send, mailbox, msg} ->
-          {:send, mailbox, Gizmo.Interpolation.resolve(msg, bindings, sections)}
+          {:send, Gizmo.Interpolation.resolve(mailbox, bindings, sections),
+           Gizmo.Interpolation.resolve(msg, bindings, sections)}
 
-        {:join, msg} ->
-          {:join, Gizmo.Interpolation.resolve(msg, bindings, sections)}
+        {:spawn, spawn_frames, dest} ->
+          {:spawn,
+           Enum.map(spawn_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)), dest}
 
-        {:fork, n, fork_frames, dest} ->
-          {:fork, n,
-           Enum.map(fork_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)), dest}
+        {:trap, pattern, handler_frames} ->
+          {:trap, pattern,
+           Enum.map(handler_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections))}
 
         other ->
           other
@@ -855,6 +845,48 @@ defmodule Gizmo.Services.Exception do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Watchdog — periodic tick messages to a target mailbox
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Watchdog do
+  use GenServer
+
+  def start_link({target_mailbox_id, interval_ms}) do
+    GenServer.start_link(__MODULE__, {target_mailbox_id, interval_ms})
+  end
+
+  @impl true
+  def init({target_mailbox_id, interval_ms}) do
+    # Resolve the target PID and monitor it
+    case Gizmo.Mailbox.lookup(target_mailbox_id) do
+      {:ok, target_pid} ->
+        ref = Process.monitor(target_pid)
+        schedule_tick(interval_ms)
+        {:ok, %{target: target_mailbox_id, interval: interval_ms, monitor_ref: ref}}
+
+      {:error, _} ->
+        {:stop, {:target_not_found, target_mailbox_id}}
+    end
+  end
+
+  @impl true
+  def handle_info(:tick, state) do
+    Gizmo.Mailbox.route(state.target, {"watchdog", "watchdog:tick"})
+    schedule_tick(state.interval)
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
+    # Target died, stop the watchdog
+    {:stop, :normal, state}
+  end
+
+  defp schedule_tick(interval_ms) do
+    Process.send_after(self(), :tick, interval_ms)
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent.Wrapper — OTP-compatible wrapper for agent processes
 # -----------------------------------------------------------------------------
 
@@ -871,7 +903,8 @@ defmodule Gizmo.Agent.Wrapper do
     verbose = Keyword.get(opts, :verbose, false)
     receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
-    quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, false)
+    quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, true)
+    grind = Keyword.get(opts, :grind, false)
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
     Gizmo.Mailbox.register(mailbox_id)
@@ -890,11 +923,18 @@ defmodule Gizmo.Agent.Wrapper do
       receive_timeout: receive_timeout,
       max_cycles: max_cycles,
       quit_on_exhaust: quit_on_exhaust,
+      grind: grind,
       msgs_queue: msgs_queue,
       boot_frame: List.first(frames)
     }
 
-    Gizmo.Agent.eval_loop(frames, state)
+    # Runtime-provided bindings: _self always, _parent if spawned by another agent
+    init_bindings = %{"_self" => mailbox_id}
+    init_bindings = if parent, do: Map.put(init_bindings, "_parent", parent), else: init_bindings
+    init_notes = %{"_self" => "this agent's mailbox ID"}
+    init_notes = if parent, do: Map.put(init_notes, "_parent", "parent agent's mailbox ID"), else: init_notes
+
+    Gizmo.Agent.eval_loop(frames, state, init_bindings, init_notes)
 
     # Cleanup
     GenServer.stop(msgs_queue)
@@ -944,7 +984,7 @@ defmodule Gizmo.Agent do
 
     The tool takes three fields:
 
-    - ops: a list of syscall operations to execute, in order.
+    - ops: a list of operations to execute, in order.
     - frames: replacement frames for your context stack. These define what you
       will see as your system prompt on the NEXT eval cycle. An empty array []
       means this process is finished and should be removed from the stack.
@@ -952,21 +992,40 @@ defmodule Gizmo.Agent do
       annotate what each binding contains. Notes persist across cycles and are
       shown alongside binding values in the user message.
 
-    ## Syscalls
+    ## Ops
 
-    You have exactly four syscalls, issued via ops:
+    You have four ops, issued via the ops array:
 
     - send(mailbox, msg): Send a message to a named mailbox. Non-blocking,
       fire-and-forget. The mailbox can be any registered service or agent.
     - receive(dest): Block until a message arrives in your mailbox. The message
-      content is stored in the binding named by `dest` and is accessible as
-      `${dest}` on the next cycle. Also pushed to your messages queue.
-    - fork(n, frames, dest): Spawn a child process. Pop the top n frames from
-      your stack, push the given frames onto the child's stack. The child's
-      mailbox ID is stored in the binding named by `dest`.
-    - join(msg): Send msg to your parent's mailbox, then terminate.
+      content is stored in the binding named by `dest`. Also pushed to your
+      messages queue. NOTE: In message-driven mode (the default), you usually
+      do NOT need receive — messages arrive automatically as ${_msg} between
+      cycles. Use receive only in grind mode or when you need to explicitly
+      block mid-cycle.
+    - spawn(frames, dest): Create a child process with the given frames as its
+      context stack. The child's mailbox ID is stored in the binding named by
+      `dest`. The child receives ${_parent} bound to your mailbox ID.
+    - trap(pattern, frames): Register an interrupt handler. When a message
+      matching the regex `pattern` arrives between cycles, the handler frames
+      are prepended to your context stack. The message is bound to
+      ${_interrupt} and ${_interrupt_source}. The trap persists until
+      cleared. Only one trap can be active at a time; a new trap replaces
+      the old one. To clear a trap, call trap with an empty frames array.
+
+    To terminate, return frames: []. To terminate with a result, send the
+    result first (e.g. send(${_parent}, msg)), then return frames: [].
 
     Only include the ops you actually need. Do NOT include ops you don't use.
+
+    ## Runtime bindings
+
+    The runtime provides these bindings automatically:
+    - ${_self}: Your own mailbox ID. Use this when you need to tell other
+      agents or services where to reply.
+    - ${_parent}: Your parent's mailbox ID (only set for spawned children).
+      Use this to send results back to the agent that spawned you.
 
     ## Bindings visibility
 
@@ -974,14 +1033,14 @@ defmodule Gizmo.Agent do
       ${name} = <value>
       ${name} = <value> (note)
       ...
-    You can read these to make decisions (e.g. check if ${input} is "quit").
+    You can read these to make decisions (e.g. check if ${_msg} is "quit").
     Use ${name} in your ops and frames — they will be interpolated to the
     actual values before execution.
 
     ## Interpolation
 
     In message strings and frames, you can use:
-    - ${name} — named binding from receive or fork results
+    - ${name} — named binding from receive or spawn results
     - $$ — literal dollar sign
     - @N — inject frame N (0-indexed) from your current context stack verbatim
     - @name — inject the contents of a named section (see below)
@@ -998,24 +1057,56 @@ defmodule Gizmo.Agent do
     ## Well-known mailboxes
 
     - human: The user's terminal. Send messages here to display text.
-    - human_input: Send a prompt string here, then receive with a dest name
-      to get the user's typed input. The result is stored in ${dest}.
-    - bash: Shell command execution. Send a command string, receive the output.
-      The output is stored in ${dest}.
-    - blackboard: Key-value store. Send {read, key} or {write, key, value},
-      then receive the result. Read returns the value in ${dest}. Write
-      returns "ok".
+      Fire-and-forget — no response comes back.
+    - human_input: Send a prompt string here. The user's typed input arrives
+      as ${_msg} on your next cycle.
+    - bash: Shell command execution. Send a command string. The output arrives
+      as ${_msg} on your next cycle. Return a continuation frame so you
+      remember what to do with the result.
+    - blackboard: Key-value store. Send {read, key} or {write, key, value}.
+      The result arrives as ${_msg} on your next cycle. Read returns the
+      value, write returns "ok".
     - exception: Error notification sink. The runtime sends error tuples here
       when an agent exceeds retry or cycle limits. You do not normally send
       to this mailbox yourself.
 
+    ## Message-driven model
+
+    By default, your process sleeps between eval cycles and only wakes when
+    a message arrives in your mailbox. The runtime automatically binds:
+
+    - ${_msg}: Content of the message that woke you this cycle.
+    - ${_msg_source}: Mailbox ID of the sender.
+
+    On the first cycle, ${_msg} = "init" and ${_msg_source} = "runtime" —
+    no actual message is needed to start.
+
+    If a watchdog timer is configured, it sends periodic "watchdog:tick"
+    messages from source "watchdog", giving you a heartbeat even without
+    external messages.
+
+    ## Trap (interrupt handler)
+
+    Use trap(pattern, frames) to register an interrupt handler. When a
+    message matching the regex pattern arrives between cycles:
+    - The handler frames are prepended to your context stack.
+    - ${_interrupt} and ${_interrupt_source} are bound to the message.
+    - ${_msg} and ${_msg_source} are also bound as usual.
+
+    The trap persists across cycles — it fires again on the next matching
+    message. Handler frames are consumed normally by the eval cycle (you
+    return new frames which replace them). The original stack frames
+    underneath resurface as handler frames drain.
+
+    Use trap(pattern, []) with an empty frames array to clear the trap.
+
     ## Important timing rule
 
-    Interpolation (${name}, @name, etc.) is resolved BEFORE ops execute. If
-    you issue a receive and then a send with ${result} in the same cycle,
-    ${result} refers to the PREVIOUS binding value, not what you just received.
-    To use a received value, return a continuation frame and use ${dest} on
-    the next cycle.
+    Interpolation (${name}, @name, etc.) is resolved BEFORE ops execute.
+    This means ${_msg} in your ops refers to the message that woke you THIS
+    cycle. If you send a request to bash or blackboard, the response won't
+    arrive until the NEXT cycle as a new ${_msg}. Return a continuation
+    frame describing what to do with the response when it arrives.
 
     ## Writing good continuation frames
 
@@ -1033,23 +1124,23 @@ defmodule Gizmo.Agent do
        interpolated by the runtime and produce unexpected results. Only use
        @name references as standalone frame entries like ["@step2"].
 
-    3. DO NOT pair every send with a receive. Only issue a receive when you
-       actually need to wait for a response. Sending to 'human' is fire-and-
-       forget — no receive needed. Sending to 'bash' or 'blackboard' requires
-       a receive to get the result. Sending to 'human_input' requires a
-       receive to get the user's typed input.
+    3. DO NOT issue receive ops in message-driven mode (the default). All
+       responses arrive automatically as ${_msg} on the next cycle. Sending
+       to 'human' is fire-and-forget. Sending to 'bash', 'blackboard', or
+       'human_input' produces a response that arrives as ${_msg} — return a
+       continuation frame to handle it on the next cycle.
 
     4. ONLY issue ops you need THIS cycle. Do not pre-issue ops for future
        steps. Each cycle should do one logical step, then hand off to the next
        frame.
 
     5. If you must write a continuation frame (no named section available),
-       write a COMPLETE prompt. Bad: "step2". Good: "You received the bash
-       output in ${output}. Send 'Result: ${output}' to 'human', then
-       terminate with empty frames []."
+       write a COMPLETE prompt. Bad: "step2". Good: "The bash output arrived
+       as ${_msg}. Send 'Result: ${_msg}' to 'human', then terminate with
+       empty frames []."
 
-    6. When terminating (frames: []), do NOT issue a receive. Just send any
-       final messages and return empty frames.
+    6. When terminating (frames: []), just send any final messages and
+       return empty frames. Do NOT return continuation frames after [].
     """
   end
 
@@ -1057,13 +1148,12 @@ defmodule Gizmo.Agent do
   Spawn an agent process under the DynamicSupervisor. Returns {:ok, mailbox_id, pid}.
 
   Agents run as :temporary children — they are not restarted on exit.
-  If frames is non-empty, the first frame is saved as the boot frame. When the
-  context stack drains to [], the boot frame is re-pushed so the agent idles
-  and waits for new work. Agents that want to terminate should use join, which
-  exits before the idle clause fires.
+  By default, agents terminate when frames drain to []. With quit_on_exhaust: false
+  (--idle), the first frame is saved as the boot frame and re-pushed when the
+  context stack drains, so the agent idles and waits for new work.
 
   Options:
-    - parent: parent mailbox_id (for join)
+    - parent: parent mailbox_id (provides ${_parent} binding)
     - chat_fn: fn(system, messages, opts) -> {:ok, eval_response} (default: Anthropic)
     - verbose: boolean
     - receive_timeout: ms (default 30_000)
@@ -1105,34 +1195,86 @@ defmodule Gizmo.Agent do
 
   @max_eval_retries 3
 
-  def eval_loop([], %{boot_frame: nil}), do: :ok
-  def eval_loop([], %{quit_on_exhaust: true}), do: :ok
-  def eval_loop([], %{boot_frame: boot_frame} = state) do
-    eval_loop([boot_frame], state, 0, 0, %{}, %{}, %{})
+  def eval_loop(frames, state, init_bindings \\ %{}, init_notes \\ %{})
+  def eval_loop([], %{boot_frame: nil}, _init_bindings, _init_notes), do: :ok
+  def eval_loop([], %{quit_on_exhaust: true}, _init_bindings, _init_notes), do: :ok
+  def eval_loop([], %{boot_frame: boot_frame} = state, init_bindings, init_notes) do
+    loop = %{retries: 0, cycles: 0, persisted_sections: %{}, bindings: init_bindings, binding_notes: init_notes, trap: nil, init_bindings: init_bindings, init_notes: init_notes}
+    eval_loop_inner([boot_frame], state, loop)
   end
-  def eval_loop(context_stack, state), do: eval_loop(context_stack, state, 0, 0, %{}, %{}, %{})
-
-  defp eval_loop([], %{boot_frame: nil}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
-  defp eval_loop([], %{quit_on_exhaust: true}, _retries, _cycles, _persisted_sections, _bindings, _binding_notes), do: :ok
-  defp eval_loop([], %{boot_frame: boot_frame} = state, _retries, cycles, _persisted_sections, _bindings, _binding_notes) do
-    eval_loop([boot_frame], state, 0, cycles, %{}, %{}, %{})
+  def eval_loop(context_stack, state, init_bindings, init_notes) do
+    loop = %{retries: 0, cycles: 0, persisted_sections: %{}, bindings: init_bindings, binding_notes: init_notes, trap: nil, init_bindings: init_bindings, init_notes: init_notes}
+    eval_loop_inner(context_stack, state, loop)
   end
 
-  defp eval_loop(_context_stack, %{max_cycles: max_cycles} = state, _retries, cycles, _persisted_sections, _bindings, _binding_notes)
+  # Inter-cycle message wait: determines whether to block for a mailbox message.
+  # First cycle: no wait, bind _msg="init", _msg_source="runtime".
+  # Grind mode: no wait, loop immediately.
+  # Message-driven (default): block on receive, bind _msg/_msg_source, check trap.
+  defp maybe_wait_for_message(_state, %{cycles: 0}, bindings, binding_notes, context_stack) do
+    # First cycle: no wait, synthetic init message
+    bindings = bindings |> Map.put("_msg", "init") |> Map.put("_msg_source", "runtime")
+    binding_notes = binding_notes |> Map.put("_msg", "init message") |> Map.put("_msg_source", "message source")
+    {bindings, binding_notes, context_stack}
+  end
+
+  defp maybe_wait_for_message(%{grind: true}, _loop, bindings, binding_notes, context_stack) do
+    # Grind mode: no wait, loop immediately
+    {bindings, binding_notes, context_stack}
+  end
+
+  defp maybe_wait_for_message(state, %{trap: trap}, bindings, binding_notes, context_stack) do
+    # Message-driven: block until a message arrives
+    {msg_content, msg_source} = receive do
+      {:mailbox_msg, _to, {from_mb, message}} ->
+        Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
+        {message, from_mb}
+    end
+
+    bindings = bindings |> Map.put("_msg", msg_content) |> Map.put("_msg_source", msg_source)
+    binding_notes = binding_notes |> Map.put("_msg", "last received message") |> Map.put("_msg_source", "message source")
+
+    # Check trap
+    case trap do
+      {regex, handler_frames} when is_binary(msg_content) ->
+        if Regex.match?(regex, msg_content) do
+          # Trap fires: bind interrupt, prepend handler frames
+          bindings = bindings |> Map.put("_interrupt", msg_content) |> Map.put("_interrupt_source", msg_source)
+          binding_notes = binding_notes |> Map.put("_interrupt", "trapped interrupt message") |> Map.put("_interrupt_source", "interrupt source")
+          {bindings, binding_notes, handler_frames ++ context_stack}
+        else
+          {bindings, binding_notes, context_stack}
+        end
+
+      _ ->
+        {bindings, binding_notes, context_stack}
+    end
+  end
+
+  defp eval_loop_inner([], %{boot_frame: nil}, _loop), do: :ok
+  defp eval_loop_inner([], %{quit_on_exhaust: true}, _loop), do: :ok
+  defp eval_loop_inner([], %{boot_frame: boot_frame} = state, loop) do
+    eval_loop_inner([boot_frame], state, %{loop | retries: 0, persisted_sections: %{}, bindings: loop.init_bindings, binding_notes: loop.init_notes})
+  end
+
+  defp eval_loop_inner(_context_stack, %{max_cycles: max_cycles} = state, %{cycles: cycles})
        when max_cycles > 0 and cycles >= max_cycles do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{max_cycles}) reached, terminating")
     error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
-  defp eval_loop(context_stack, state, retries, _cycles, _persisted_sections, _bindings, _binding_notes) when retries >= @max_eval_retries do
+  defp eval_loop_inner(context_stack, state, %{retries: retries}) when retries >= @max_eval_retries do
     IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
     failing_frame = List.first(context_stack) || ""
     error_info = {:max_retries_exceeded, state.mailbox_id, retries, failing_frame}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
-  defp eval_loop(context_stack, state, retries, cycles, persisted_sections, bindings, binding_notes) do
+  defp eval_loop_inner(context_stack, state, %{retries: retries, cycles: cycles, persisted_sections: persisted_sections, bindings: bindings, binding_notes: binding_notes} = loop) do
+    # Inter-cycle message wait: block until a message arrives (unless grind or first cycle)
+    {bindings, binding_notes, context_stack} = maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
+
     system_prompt = runtime_prompt() <> "\n\n---\n\n" <> Enum.join(context_stack, "\n\n---\n\n")
     # Merge: current frame sections override persisted, but old ones survive
     current_sections = Gizmo.Interpolation.extract_sections(context_stack)
@@ -1170,8 +1312,9 @@ defmodule Gizmo.Agent do
             case op do
               {:send, mb, msg} -> IO.puts(Gizmo.Format.op_send(id, mb, msg))
               {:receive, dest} -> IO.puts(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
-              {:fork, n, cf, dest} -> IO.puts(Gizmo.Format.op_fork(id, n, cf, dest))
-              {:join, msg} -> IO.puts(Gizmo.Format.op_join(id, msg, state.parent))
+              {:spawn, cf, dest} -> IO.puts(Gizmo.Format.op_spawn(id, cf, dest))
+              {:trap, _pattern, []} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
+              {:trap, pattern, _} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
             end
           end
           IO.puts(Gizmo.Format.frames_line(id, interpolated.frames))
@@ -1180,36 +1323,29 @@ defmodule Gizmo.Agent do
         # Merge notes from this cycle's response into binding_notes
         new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
-        # Execute ops — may modify context_stack via fork, updates bindings
-        result = execute_ops(interpolated.ops, interpolated.frames, state, bindings)
-
-        case result do
-          :exit -> :ok
-          {new_stack, new_bindings} ->
-            eval_loop(new_stack, state, 0, cycles + 1, sections, new_bindings, new_binding_notes)
-        end
+        # Execute ops — may modify context_stack via spawn, updates bindings and trap
+        {new_stack, new_bindings, new_trap} = execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
+        eval_loop_inner(new_stack, state, %{loop | retries: 0, cycles: cycles + 1, persisted_sections: sections, bindings: new_bindings, binding_notes: new_binding_notes, trap: new_trap})
 
       {:error, reason} ->
         IO.puts(:stderr, Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
-        eval_loop(context_stack, state, retries + 1, cycles + 1, sections, bindings, binding_notes)
+        eval_loop_inner(context_stack, state, %{loop | retries: retries + 1, cycles: cycles + 1, persisted_sections: sections})
     end
   end
 
-  defp execute_ops(ops, frames, state, bindings) do
-    Enum.reduce_while(ops, {frames, bindings}, fn op, {current_frames, current_bindings} ->
-      case execute_op(op, current_frames, state, current_bindings) do
-        {:cont, new_frames, new_bindings} -> {:cont, {new_frames, new_bindings}}
-        :exit -> {:halt, :exit}
-      end
+  defp execute_ops(ops, frames, state, bindings, trap) do
+    Enum.reduce(ops, {frames, bindings, trap}, fn op, {current_frames, current_bindings, current_trap} ->
+      {:cont, new_frames, new_bindings, new_trap} = execute_op(op, current_frames, state, current_bindings, current_trap)
+      {new_frames, new_bindings, new_trap}
     end)
   end
 
-  defp execute_op({:send, mailbox, msg}, frames, state, bindings) do
+  defp execute_op({:send, mailbox, msg}, frames, state, bindings, trap) do
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
-    {:cont, frames, bindings}
+    {:cont, frames, bindings, trap}
   end
 
-  defp execute_op({:receive, dest}, frames, state, bindings) do
+  defp execute_op({:receive, dest}, frames, state, bindings, trap) do
     message = receive do
       {:mailbox_msg, _to, {from_mb, message}} ->
         Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
@@ -1219,27 +1355,24 @@ defmodule Gizmo.Agent do
         "timeout"
     end
 
-    {:cont, frames, Map.put(bindings, dest, message)}
+    {:cont, frames, Map.put(bindings, dest, message), trap}
   end
 
-  defp execute_op({:fork, n, child_frames, dest}, frames, state, bindings) do
-    # Pop n frames from top of current stack (top = beginning of list)
-    _popped = Enum.take(frames, n)
-    remaining_frames = Enum.drop(frames, n)
-
+  defp execute_op({:spawn, child_frames, dest}, frames, state, bindings, trap) do
     {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames,
       parent: state.mailbox_id,
       chat_fn: state.chat_fn,
       verbose: state.verbose,
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
-      quit_on_exhaust: state.quit_on_exhaust
+      quit_on_exhaust: state.quit_on_exhaust,
+      grind: state.grind
     )
 
     # Monitor child: on abnormal exit, notify parent mailbox
     parent_mb = state.mailbox_id
     verbose = state.verbose
-    spawn(fn ->
+    Kernel.spawn(fn ->
       ref = Process.monitor(child_pid)
       receive do
         {:DOWN, ^ref, :process, ^child_pid, :normal} ->
@@ -1252,15 +1385,17 @@ defmodule Gizmo.Agent do
       end
     end)
 
-    {:cont, remaining_frames, Map.put(bindings, dest, child_mb)}
+    {:cont, frames, Map.put(bindings, dest, child_mb), trap}
   end
 
-  defp execute_op({:join, msg}, _frames, state, _bindings) do
-    if state.parent do
-      Gizmo.Mailbox.route(state.parent, {state.mailbox_id, msg})
-    end
+  defp execute_op({:trap, _pattern, []}, frames, _state, bindings, _trap) do
+    # Empty handler frames = clear the trap
+    {:cont, frames, bindings, nil}
+  end
 
-    :exit
+  defp execute_op({:trap, pattern, handler_frames}, frames, _state, bindings, _trap) do
+    {:ok, regex} = Regex.compile(pattern)
+    {:cont, frames, bindings, {regex, handler_frames}}
   end
 end
 
@@ -1279,7 +1414,9 @@ defmodule Gizmo.CLI do
           thinking: :boolean,
           max_cycles: :integer,
           boot: :string,
-          quit_on_exhaust: :boolean
+          idle: :boolean,
+          grind: :boolean,
+          watchdog: :integer
         ],
         aliases: [v: :verbose]
       )
@@ -1309,7 +1446,9 @@ defmodule Gizmo.CLI do
       -v, --verbose       Enable verbose output
       --thinking          Enable extended thinking (Anthropic only)
       --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
-      --quit-on-exhaust   Terminate when frames are exhausted instead of idling
+      --idle              Idle (restore boot frame) when frames exhaust instead of terminating
+      --grind             Hot-loop eval (no inter-cycle message wait)
+      --watchdog N        Send periodic watchdog:tick messages every N ms
       --boot <file>       Separate boot frame file (used for idle recovery)
 
     Positional arguments:
@@ -1324,7 +1463,7 @@ defmodule Gizmo.CLI do
       elixir gizmo.exs task.txt                          # single file (boot = task)
       elixir gizmo.exs a.txt b.txt                       # multi-file (boot = a)
       elixir gizmo.exs --boot sys.txt task.txt            # separate boot frame
-      elixir gizmo.exs --quit-on-exhaust task.txt         # terminate on empty frames
+      elixir gizmo.exs --idle --boot sys.txt task.txt      # idle on empty frames (restore boot)
       elixir gizmo.exs --max-cycles 5 task.txt            # limit to 5 eval cycles
       elixir gizmo.exs --test                             # smoke tests
       elixir gizmo.exs --init boot.txt                    # create a starter boot frame
@@ -1449,8 +1588,8 @@ defmodule Gizmo.CLI do
       "ops" => [
         %{"op" => "send", "mailbox" => "human", "msg" => "hello"},
         %{"op" => "receive", "dest" => "msg"},
-        %{"op" => "fork", "n" => 2, "frames" => ["f1", "f2"], "dest" => "child"},
-        %{"op" => "join", "msg" => "done"}
+        %{"op" => "spawn", "frames" => ["f1", "f2"], "dest" => "child"},
+        %{"op" => "trap", "pattern" => "^alert:", "frames" => ["handler"]}
       ],
       "frames" => ["frame1"],
       "notes" => %{"msg" => "received message"}
@@ -1460,8 +1599,8 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("valid ops parse", good_result.ops, [
       {:send, "human", "hello"},
       {:receive, "msg"},
-      {:fork, 2, ["f1", "f2"], "child"},
-      {:join, "done"}
+      {:spawn, ["f1", "f2"], "child"},
+      {:trap, "^alert:", ["handler"]}
     ])
     failures = failures ++ assert_eq("notes parsed", good_result.notes, %{"msg" => "received message"})
     IO.puts("  valid ops: OK")
@@ -1478,21 +1617,43 @@ defmodule Gizmo.CLI do
     bad_recv = %{"ops" => [%{"op" => "receive"}], "frames" => []}
     failures = failures ++ assert_error_op("receive missing dest", Gizmo.LLM.normalize_eval(bad_recv), :invalid_op, "receive")
 
-    # fork missing n
-    bad_fork = %{"ops" => [%{"op" => "fork", "frames" => [], "dest" => "c"}], "frames" => []}
-    failures = failures ++ assert_error_op("fork missing n", Gizmo.LLM.normalize_eval(bad_fork), :invalid_op, "fork")
+    # spawn missing frames
+    bad_spawn = %{"ops" => [%{"op" => "spawn", "dest" => "c"}], "frames" => []}
+    failures = failures ++ assert_error_op("spawn missing frames", Gizmo.LLM.normalize_eval(bad_spawn), :invalid_op, "spawn")
 
-    # fork missing frames
-    bad_fork2 = %{"ops" => [%{"op" => "fork", "n" => 1, "dest" => "c"}], "frames" => []}
-    failures = failures ++ assert_error_op("fork missing frames", Gizmo.LLM.normalize_eval(bad_fork2), :invalid_op, "fork")
+    # spawn missing dest
+    bad_spawn2 = %{"ops" => [%{"op" => "spawn", "frames" => ["f"]}], "frames" => []}
+    failures = failures ++ assert_error_op("spawn missing dest", Gizmo.LLM.normalize_eval(bad_spawn2), :invalid_op, "spawn")
 
-    # fork missing dest
-    bad_fork3 = %{"ops" => [%{"op" => "fork", "n" => 1, "frames" => []}], "frames" => []}
-    failures = failures ++ assert_error_op("fork missing dest", Gizmo.LLM.normalize_eval(bad_fork3), :invalid_op, "fork")
+    # fork is now unknown
+    bad_fork = %{"ops" => [%{"op" => "fork", "n" => 1, "frames" => [], "dest" => "c"}], "frames" => []}
+    failures = failures ++ assert_eq("fork is unknown op", Gizmo.LLM.normalize_eval(bad_fork), {:error, {:unknown_op, "fork"}})
 
-    # join missing msg
-    bad_join = %{"ops" => [%{"op" => "join"}], "frames" => []}
-    failures = failures ++ assert_error_op("join missing msg", Gizmo.LLM.normalize_eval(bad_join), :invalid_op, "join")
+    # join is now unknown
+    bad_join = %{"ops" => [%{"op" => "join", "msg" => "done"}], "frames" => []}
+    failures = failures ++ assert_eq("join is unknown op", Gizmo.LLM.normalize_eval(bad_join), {:error, {:unknown_op, "join"}})
+
+    # trap valid
+    good_trap = %{"ops" => [%{"op" => "trap", "pattern" => "^hello", "frames" => ["handler frame"]}], "frames" => []}
+    {:ok, trap_result} = Gizmo.LLM.normalize_eval(good_trap)
+    failures = failures ++ assert_eq("trap valid", trap_result.ops, [{:trap, "^hello", ["handler frame"]}])
+
+    # trap missing pattern
+    bad_trap = %{"ops" => [%{"op" => "trap", "frames" => ["f"]}], "frames" => []}
+    failures = failures ++ assert_error_op("trap missing pattern", Gizmo.LLM.normalize_eval(bad_trap), :invalid_op, "trap")
+
+    # trap missing frames
+    bad_trap2 = %{"ops" => [%{"op" => "trap", "pattern" => ".*"}], "frames" => []}
+    failures = failures ++ assert_error_op("trap missing frames", Gizmo.LLM.normalize_eval(bad_trap2), :invalid_op, "trap")
+
+    # trap empty frames = clear trap (valid)
+    clear_trap = %{"ops" => [%{"op" => "trap", "pattern" => ".*", "frames" => []}], "frames" => []}
+    {:ok, clear_result} = Gizmo.LLM.normalize_eval(clear_trap)
+    failures = failures ++ assert_eq("trap empty frames (clear)", clear_result.ops, [{:trap, ".*", []}])
+
+    # untrap is now unknown
+    bad_untrap = %{"ops" => [%{"op" => "untrap"}], "frames" => []}
+    failures = failures ++ assert_eq("untrap is unknown op", Gizmo.LLM.normalize_eval(bad_untrap), {:error, {:unknown_op, "untrap"}})
 
     # unknown op
     bad_op = %{"ops" => [%{"op" => "explode"}], "frames" => []}
@@ -1549,14 +1710,14 @@ defmodule Gizmo.CLI do
       ops: [
         {:send, "human", "Hello ${name}, status: ${status}"},
         {:receive, "reply"},
-        {:fork, 2, ["child frame ${name}"], "child"},
-        {:join, "result: ${result}"}
+        {:spawn, ["child frame ${name}"], "child"},
+        {:send, "${_parent}", "result: ${result}"}
       ],
       frames: ["next frame ${name} ${ctx}"],
       notes: %{"name" => "the user's name"}
     }
 
-    interpolated = Gizmo.LLM.interpolate_response(eval_resp, %{"name" => "Alice", "status" => "ok", "result" => "42", "ctx" => "main"})
+    interpolated = Gizmo.LLM.interpolate_response(eval_resp, %{"name" => "Alice", "status" => "ok", "result" => "42", "ctx" => "main", "_parent" => "mb_parent_1"})
 
     failures = failures ++ assert_eq("interpolate send msg",
       Enum.at(interpolated.ops, 0),
@@ -1566,13 +1727,13 @@ defmodule Gizmo.CLI do
       Enum.at(interpolated.ops, 1),
       {:receive, "reply"}
     )
-    failures = failures ++ assert_eq("interpolate fork frames",
+    failures = failures ++ assert_eq("interpolate spawn frames",
       Enum.at(interpolated.ops, 2),
-      {:fork, 2, ["child frame Alice"], "child"}
+      {:spawn, ["child frame Alice"], "child"}
     )
-    failures = failures ++ assert_eq("interpolate join msg",
+    failures = failures ++ assert_eq("interpolate send to parent",
       Enum.at(interpolated.ops, 3),
-      {:join, "result: 42"}
+      {:send, "mb_parent_1", "result: 42"}
     )
     failures = failures ++ assert_eq("interpolate response frames",
       interpolated.frames,
@@ -1581,6 +1742,22 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("interpolate notes passthrough",
       interpolated.notes,
       %{"name" => "the user's name"}
+    )
+
+    # Interpolate trap op (handler frames get interpolated, pattern left as-is)
+    trap_resp = %{
+      ops: [{:trap, "^hello", ["handler for ${name}"]}, {:trap, ".*", []}],
+      frames: ["frame"],
+      notes: %{}
+    }
+    trap_interpolated = Gizmo.LLM.interpolate_response(trap_resp, %{"name" => "Alice"})
+    failures = failures ++ assert_eq("interpolate trap handler frames",
+      Enum.at(trap_interpolated.ops, 0),
+      {:trap, "^hello", ["handler for Alice"]}
+    )
+    failures = failures ++ assert_eq("interpolate trap clear passthrough",
+      Enum.at(trap_interpolated.ops, 1),
+      {:trap, ".*", []}
     )
 
     IO.puts("")
@@ -1762,11 +1939,11 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(test_target_mb)
 
     one_shot_chat_fn = fn _system, _messages, _opts ->
-      {:ok, %{ops: [{:send, test_target_mb, "hi"}, {:join, ""}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, test_target_mb, "hi"}], frames: [], notes: %{}}}
     end
 
     {:ok, _agent_mb, agent_pid} = Gizmo.Agent.start(["one shot frame"],
-      chat_fn: one_shot_chat_fn, receive_timeout: 100)
+      chat_fn: one_shot_chat_fn, receive_timeout: 100, grind: true)
 
     agent_ref = Process.monitor(agent_pid)
     send_result = receive do
@@ -1804,7 +1981,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, _timeout_mb, timeout_pid} = Gizmo.Agent.start(["initial frame"],
-      chat_fn: timeout_chat_fn, receive_timeout: 100)
+      chat_fn: timeout_chat_fn, receive_timeout: 100, grind: true)
 
     timeout_ref = Process.monitor(timeout_pid)
 
@@ -1823,46 +2000,39 @@ defmodule Gizmo.CLI do
     end
     Gizmo.Mailbox.unregister(timeout_test_mb)
 
-    # Test 3: Fork + join
-    fork_cycle = :counters.new(1, [:atomics])
-    fork_captured_result = Agent.start_link(fn -> nil end)
-    {:ok, fork_result_agent} = fork_captured_result
+    # Test 3: Spawn + send-to-parent
+    spawn_captured_result = Agent.start_link(fn -> nil end)
+    {:ok, spawn_result_agent} = spawn_captured_result
 
     combined_chat_fn = fn system, _messages, _opts ->
-      c = :counters.get(fork_cycle, 1)
-      :counters.add(fork_cycle, 1, 1)
-
       cond do
-        # First call: parent cycle 0 — fork a child, then receive
-        c == 0 ->
-          {:ok, %{ops: [{:fork, 0, ["child frame"], "worker"}, {:receive, "result"}], frames: ["parent waiting"], notes: %{}}}
-        # Second call: child cycle 0 — join with result
+        # Child: system contains "child frame" — send result to parent and terminate
         String.contains?(system, "child frame") ->
-          {:ok, %{ops: [{:join, "result from child"}], frames: [], notes: %{}}}
-        # Third call: parent cycle 1 — capture the system and exit
-        c == 2 ->
-          Agent.update(fork_result_agent, fn _ -> system end)
-          {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
-        # Idle re-entry: do nothing
-        true ->
+          {:ok, %{ops: [{:send, "${_parent}", "result from child"}], frames: [], notes: %{}}}
+        # Parent cycle 1+: system contains "parent waiting" — capture and exit
+        String.contains?(system, "parent waiting") ->
+          Agent.update(spawn_result_agent, fn _ -> system end)
           {:ok, %{ops: [], frames: [], notes: %{}}}
+        # Parent cycle 0: spawn a child, then receive
+        true ->
+          {:ok, %{ops: [{:spawn, ["child frame"], "worker"}, {:receive, "result"}], frames: ["parent waiting"], notes: %{}}}
       end
     end
 
-    {:ok, _fork_mb, fork_pid} = Gizmo.Agent.start(["parent frame"],
-      chat_fn: combined_chat_fn, receive_timeout: 5_000)
+    {:ok, _spawn_mb, spawn_pid} = Gizmo.Agent.start(["parent frame"],
+      chat_fn: combined_chat_fn, receive_timeout: 5_000, grind: true)
 
-    fork_ref = Process.monitor(fork_pid)
+    spawn_ref = Process.monitor(spawn_pid)
     receive do
-      {:DOWN, ^fork_ref, :process, ^fork_pid, _} -> :ok
+      {:DOWN, ^spawn_ref, :process, ^spawn_pid, _} -> :ok
     after
       10_000 -> :timeout
     end
 
-    fork_result = Agent.get(fork_result_agent, & &1)
-    failures = failures ++ assert_eq("fork+join parent receives result",
-      fork_result != nil && String.contains?(fork_result, "parent waiting"), true)
-    Agent.stop(fork_result_agent)
+    spawn_result = Agent.get(spawn_result_agent, & &1)
+    failures = failures ++ assert_eq("spawn: parent receives child result",
+      spawn_result != nil && String.contains?(spawn_result, "parent waiting"), true)
+    Agent.stop(spawn_result_agent)
 
     # Test 4: Multi-frame concat
     concat_captured = Agent.start_link(fn -> nil end)
@@ -1876,14 +2046,14 @@ defmodule Gizmo.CLI do
 
       if c == 0 do
         Agent.update(concat_agent, fn _ -> system end)
-        {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [], frames: [], notes: %{}}}
       else
         {:ok, %{ops: [], frames: [], notes: %{}}}
       end
     end
 
     {:ok, _concat_mb, concat_pid} = Gizmo.Agent.start(["frame A", "frame B"],
-      chat_fn: concat_chat_fn, receive_timeout: 100)
+      chat_fn: concat_chat_fn, receive_timeout: 100, grind: true)
 
     concat_ref = Process.monitor(concat_pid)
     receive do
@@ -1914,15 +2084,15 @@ defmodule Gizmo.CLI do
           # Cycle 1: boot frame re-evaluated, issue a receive to wait for work
           {:ok, %{ops: [{:receive, "input"}], frames: ["waiting for work"], notes: %{}}}
         2 ->
-          # Cycle 2: got the message in ${input}, forward it and terminate via join
-          {:ok, %{ops: [{:send, idle_test_mb, "${input}"}, {:join, "done"}], frames: [], notes: %{}}}
+          # Cycle 2: got the message in ${input}, forward it and terminate
+          {:ok, %{ops: [{:send, idle_test_mb, "${input}"}], frames: [], notes: %{}}}
         _ ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
       end
     end
 
     {:ok, idle_agent_mb, idle_pid} = Gizmo.Agent.start(["idle boot frame"],
-      chat_fn: idle_chat_fn, receive_timeout: 2_000)
+      chat_fn: idle_chat_fn, receive_timeout: 2_000, grind: true, quit_on_exhaust: false)
 
     # Give the agent time to go idle and come back on boot frame
     Process.sleep(100)
@@ -1995,7 +2165,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, _fail_mb, fail_pid} = Gizmo.Agent.start(["always fail frame"],
-      chat_fn: always_fail_fn, receive_timeout: 100)
+      chat_fn: always_fail_fn, receive_timeout: 100, grind: true)
 
     fail_ref = Process.monitor(fail_pid)
 
@@ -2042,15 +2212,15 @@ defmodule Gizmo.CLI do
       :counters.add(child_death_cycle, 1, 1)
 
       cond do
-        # Parent cycle 0: fork a child that will crash, then receive
+        # Parent cycle 0: spawn a child that will crash, then receive
         c == 0 ->
-          {:ok, %{ops: [{:fork, 0, ["crash frame"], "worker"}, {:receive, "death_msg"}], frames: ["parent waiting for child death"], notes: %{}}}
+          {:ok, %{ops: [{:spawn, ["crash frame"], "worker"}, {:receive, "death_msg"}], frames: ["parent waiting for child death"], notes: %{}}}
         # Child: always raises
         String.contains?(system, "crash frame") ->
           raise "deliberate child crash"
         # Parent cycle 1: got death notification in ${death_msg}, exit cleanly
         c == 2 ->
-          {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [], frames: [], notes: %{}}}
         # Idle re-entry: do nothing
         true ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -2073,7 +2243,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, _cd_mb, cd_pid} = Gizmo.Agent.start(["parent frame"],
-      chat_fn: cd_chat_fn, receive_timeout: 5_000)
+      chat_fn: cd_chat_fn, receive_timeout: 5_000, grind: true)
 
     cd_ref = Process.monitor(cd_pid)
     receive do
@@ -2117,7 +2287,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, notes_agent_mb, notes_pid} = Gizmo.Agent.start(["notes test frame"],
-      chat_fn: notes_chat_fn, receive_timeout: 2_000)
+      chat_fn: notes_chat_fn, receive_timeout: 2_000, grind: true)
 
     # Send a message so the receive in cycle 0 completes
     Process.sleep(50)
@@ -2164,7 +2334,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, _mc5_mb, mc5_pid} = Gizmo.Agent.start(["max cycles test"],
-      chat_fn: mc5_chat_fn, receive_timeout: 100, max_cycles: 5)
+      chat_fn: mc5_chat_fn, receive_timeout: 100, max_cycles: 5, grind: true)
 
     mc5_ref = Process.monitor(mc5_pid)
     receive do
@@ -2183,14 +2353,14 @@ defmodule Gizmo.CLI do
       c = :counters.get(mc0_cycle, 1)
       :counters.add(mc0_cycle, 1, 1)
       if c >= 54 do
-        {:ok, %{ops: [{:join, "done"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [], frames: [], notes: %{}}}
       else
         {:ok, %{ops: [], frames: ["keep going"], notes: %{}}}
       end
     end
 
     {:ok, _mc0_mb, mc0_pid} = Gizmo.Agent.start(["unlimited cycles test"],
-      chat_fn: mc0_chat_fn, receive_timeout: 100, max_cycles: 0)
+      chat_fn: mc0_chat_fn, receive_timeout: 100, max_cycles: 0, grind: true)
 
     mc0_ref = Process.monitor(mc0_pid)
     receive do
@@ -2202,7 +2372,7 @@ defmodule Gizmo.CLI do
     mc0_count = :counters.get(mc0_cycle, 1)
     failures = failures ++ assert_eq("max_cycles: 0 runs past 50 (unlimited)", mc0_count, 55)
 
-    # Test: quit_on_exhaust: true terminates on empty frames
+    # Test: default (quit_on_exhaust: true) terminates on empty frames
     qoe_cycle = :counters.new(1, [:atomics])
     qoe_test_mb = Gizmo.Mailbox.generate_id("qoe_test")
     Gizmo.Mailbox.register(qoe_test_mb)
@@ -2213,7 +2383,7 @@ defmodule Gizmo.CLI do
     end
 
     {:ok, _qoe_mb, qoe_pid} = Gizmo.Agent.start(["quit on exhaust test"],
-      chat_fn: qoe_chat_fn, receive_timeout: 100, quit_on_exhaust: true)
+      chat_fn: qoe_chat_fn, receive_timeout: 100, grind: true)
 
     qoe_ref = Process.monitor(qoe_pid)
 
@@ -2233,6 +2403,35 @@ defmodule Gizmo.CLI do
     qoe_count = :counters.get(qoe_cycle, 1)
     failures = failures ++ assert_eq("quit_on_exhaust: terminates after 1 cycle (no idle)", qoe_count, 1)
     Gizmo.Mailbox.unregister(qoe_test_mb)
+
+    # Test: idle mode (quit_on_exhaust: false) restores boot frame instead of terminating
+    idle_mode_cycle = :counters.new(1, [:atomics])
+    idle_mode_test_mb = Gizmo.Mailbox.generate_id("idle_test")
+    Gizmo.Mailbox.register(idle_mode_test_mb)
+
+    idle_mode_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.add(idle_mode_cycle, 1, 1) || :counters.get(idle_mode_cycle, 1)
+      if c <= 2 do
+        {:ok, %{ops: [{:send, idle_mode_test_mb, "cycle-#{c}"}], frames: [], notes: %{}}}
+      else
+        {:ok, %{ops: [{:send, idle_mode_test_mb, "cycle-#{c}"}], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, _idle_mode_mb, idle_mode_pid} = Gizmo.Agent.start(["idle mode boot frame"],
+      chat_fn: idle_mode_chat_fn, receive_timeout: 100, max_cycles: 3, grind: true, quit_on_exhaust: false)
+
+    idle_mode_ref = Process.monitor(idle_mode_pid)
+
+    receive do
+      {:DOWN, ^idle_mode_ref, :process, ^idle_mode_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    idle_mode_count = :counters.get(idle_mode_cycle, 1)
+    failures = failures ++ assert_eq("idle mode: boot frame restored, runs multiple cycles", idle_mode_count, 3)
+    Gizmo.Mailbox.unregister(idle_mode_test_mb)
 
     IO.puts("")
 
@@ -2264,11 +2463,11 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(sup_test_mb)
 
     sup_chat_fn = fn _system, _messages, _opts ->
-      {:ok, %{ops: [{:send, sup_test_mb, "hello"}, {:join, ""}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, sup_test_mb, "hello"}], frames: [], notes: %{}}}
     end
 
     {:ok, _sup_agent_mb, sup_agent_pid} = Gizmo.Agent.start(["supervised agent frame"],
-      chat_fn: sup_chat_fn, receive_timeout: 100)
+      chat_fn: sup_chat_fn, receive_timeout: 100, grind: true)
 
     sup_ref = Process.monitor(sup_agent_pid)
 
@@ -2295,7 +2494,233 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 11. LLM test (only if API key is set)
+    # 11. Message-driven eval loop tests
+    IO.puts("--- Message-Driven Eval Loop ---")
+
+    # Ensure supervision tree is started (idempotent)
+    {:ok, _} = Gizmo.Supervision.start_link()
+
+    # Test 1: First cycle _msg = "init"
+    init_test_mb = Gizmo.Mailbox.generate_id("init_test")
+    Gizmo.Mailbox.register(init_test_mb)
+    init_captured = Agent.start_link(fn -> nil end)
+    {:ok, init_capture_agent} = init_captured
+
+    init_chat_fn = fn _system, messages, _opts ->
+      user_msg = case messages do
+        [%{content: content} | _] -> content
+        _ -> "no user message"
+      end
+      Agent.update(init_capture_agent, fn _ -> user_msg end)
+      {:ok, %{ops: [{:send, init_test_mb, "${_msg}/${_msg_source}"}], frames: [], notes: %{}}}
+    end
+
+    {:ok, _init_mb, init_pid} = Gizmo.Agent.start(["init test frame"],
+      chat_fn: init_chat_fn, receive_timeout: 100)
+
+    init_ref = Process.monitor(init_pid)
+
+    init_msg = receive do
+      {:mailbox_msg, ^init_test_mb, {_from, msg}} -> msg
+    after
+      2_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("first cycle _msg=init", init_msg, "init/runtime")
+
+    receive do
+      {:DOWN, ^init_ref, :process, ^init_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+
+    init_user_msg = Agent.get(init_capture_agent, & &1)
+    failures = failures ++ assert_eq("first cycle bindings include _msg",
+      init_user_msg != nil && String.contains?(to_string(init_user_msg), "${_msg} = init"), true)
+    Agent.stop(init_capture_agent)
+    Gizmo.Mailbox.unregister(init_test_mb)
+
+    # Test 2: Message-driven wake — agent in reactive mode, send it a message
+    reactive_test_mb = Gizmo.Mailbox.generate_id("reactive_test")
+    Gizmo.Mailbox.register(reactive_test_mb)
+    reactive_cycle = :counters.new(1, [:atomics])
+
+    reactive_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(reactive_cycle, 1)
+      :counters.add(reactive_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # First cycle (init): just continue, no ops
+          {:ok, %{ops: [], frames: ["waiting for message"], notes: %{}}}
+        1 ->
+          # Second cycle (woke from message): forward _msg and exit
+          {:ok, %{ops: [{:send, reactive_test_mb, "${_msg}"}], frames: [], notes: %{}}}
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    # Start agent in message-driven (non-grind) mode
+    {:ok, reactive_agent_mb, reactive_pid} = Gizmo.Agent.start(["reactive frame"],
+      chat_fn: reactive_chat_fn, receive_timeout: 5_000)
+
+    # Give it time to complete first cycle and block on message wait
+    Process.sleep(100)
+    # Send it a message to wake it
+    Gizmo.Mailbox.route(reactive_agent_mb, {"test_sender", "wake_msg"})
+
+    reactive_ref = Process.monitor(reactive_pid)
+
+    reactive_result = receive do
+      {:mailbox_msg, ^reactive_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("message-driven wake: _msg bound", reactive_result, "wake_msg")
+
+    receive do
+      {:DOWN, ^reactive_ref, :process, ^reactive_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(reactive_test_mb)
+
+    # Test 3: Trap fires on matching message
+    trap_test_mb = Gizmo.Mailbox.generate_id("trap_test")
+    Gizmo.Mailbox.register(trap_test_mb)
+    trap_cycle = :counters.new(1, [:atomics])
+
+    trap_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(trap_cycle, 1)
+      :counters.add(trap_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # First cycle: register a trap and continue
+          {:ok, %{ops: [{:trap, "^alert:", ["Handle interrupt: ${_interrupt}"]}], frames: ["base frame"], notes: %{}}}
+        1 ->
+          # Second cycle: woke from trap match — forward the interrupt binding
+          {:ok, %{ops: [{:send, trap_test_mb, "${_interrupt}"}], frames: [], notes: %{}}}
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, trap_agent_mb, trap_pid} = Gizmo.Agent.start(["trap test frame"],
+      chat_fn: trap_chat_fn, receive_timeout: 5_000)
+
+    # Wait for first cycle to complete and trap to be registered
+    Process.sleep(100)
+    # Send a matching message
+    Gizmo.Mailbox.route(trap_agent_mb, {"alert_src", "alert:fire!"})
+
+    trap_ref = Process.monitor(trap_pid)
+
+    trap_result = receive do
+      {:mailbox_msg, ^trap_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("trap fires: _interrupt bound", trap_result, "alert:fire!")
+
+    receive do
+      {:DOWN, ^trap_ref, :process, ^trap_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(trap_test_mb)
+
+    # Test 4: Trap doesn't fire on non-matching message
+    notrap_test_mb = Gizmo.Mailbox.generate_id("notrap_test")
+    Gizmo.Mailbox.register(notrap_test_mb)
+    notrap_cycle = :counters.new(1, [:atomics])
+
+    notrap_chat_fn = fn _system, messages, _opts ->
+      c = :counters.get(notrap_cycle, 1)
+      :counters.add(notrap_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # Register trap that only matches "^alert:"
+          {:ok, %{ops: [{:trap, "^alert:", ["handler frame"]}], frames: ["base frame"], notes: %{}}}
+        1 ->
+          # Woke from non-matching message — check that _interrupt is NOT bound
+          # The user message should contain _msg but not _interrupt
+          user_msg = case messages do
+            [%{content: content} | _] -> content
+            _ -> ""
+          end
+          has_interrupt = String.contains?(to_string(user_msg), "${_interrupt}")
+          # Send both _msg and whether interrupt was bound
+          {:ok, %{ops: [{:send, notrap_test_mb, "${_msg}|interrupt=#{has_interrupt}"}], frames: [], notes: %{}}}
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, notrap_agent_mb, notrap_pid} = Gizmo.Agent.start(["notrap test frame"],
+      chat_fn: notrap_chat_fn, receive_timeout: 5_000)
+
+    Process.sleep(100)
+    # Send a NON-matching message
+    Gizmo.Mailbox.route(notrap_agent_mb, {"sender", "hello_normal"})
+
+    notrap_ref = Process.monitor(notrap_pid)
+
+    notrap_result = receive do
+      {:mailbox_msg, ^notrap_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    failures = failures ++ assert_eq("trap no-match: _msg bound, no interrupt",
+      notrap_result, "hello_normal|interrupt=false")
+
+    receive do
+      {:DOWN, ^notrap_ref, :process, ^notrap_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(notrap_test_mb)
+
+    # Test 5: Grind mode loops without external messages
+    grind_test_mb = Gizmo.Mailbox.generate_id("grind_test")
+    Gizmo.Mailbox.register(grind_test_mb)
+    grind_cycle = :counters.new(1, [:atomics])
+
+    grind_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(grind_cycle, 1)
+      :counters.add(grind_cycle, 1, 1)
+
+      if c < 3 do
+        {:ok, %{ops: [], frames: ["grind frame"], notes: %{}}}
+      else
+        {:ok, %{ops: [{:send, grind_test_mb, "ground_#{c}"}], frames: [], notes: %{}}}
+      end
+    end
+
+    {:ok, _grind_mb, grind_pid} = Gizmo.Agent.start(["grind test frame"],
+      chat_fn: grind_chat_fn, receive_timeout: 100, grind: true)
+
+    grind_ref = Process.monitor(grind_pid)
+
+    grind_result = receive do
+      {:mailbox_msg, ^grind_test_mb, {_from, msg}} -> msg
+    after
+      5_000 -> :no_message
+    end
+    # Should have looped 4 times (0,1,2 → keep going, 3 → send + exit)
+    failures = failures ++ assert_eq("grind mode loops without messages", grind_result, "ground_3")
+
+    receive do
+      {:DOWN, ^grind_ref, :process, ^grind_pid, _} -> :ok
+    after
+      2_000 -> :timeout
+    end
+    Gizmo.Mailbox.unregister(grind_test_mb)
+
+    IO.puts("")
+
+    # 12. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
@@ -2307,15 +2732,15 @@ defmodule Gizmo.CLI do
 
       The tool takes three fields:
 
-      - ops: a list of syscall operations to execute, in order. Available ops:
+      - ops: a list of operations to execute, in order. Available ops:
         - send(mailbox, msg): send a message to a named mailbox
         - receive(dest): block until a message arrives, store in ${dest}
-        - fork(n, frames, dest): spawn a child, store child mailbox ID in ${dest}
-        - join(msg): terminate and send msg to parent
+        - spawn(frames, dest): create a child process, store child mailbox ID in ${dest}
+        - trap(pattern, frames): register interrupt handler for matching messages
 
       - frames: replacement frames for your context stack. These define what you
         will see as your system prompt on the NEXT eval cycle. An empty array []
-        means this process is finished and should be removed from the stack.
+        means this process is finished and will terminate.
 
       - notes: an object mapping binding names to short descriptions.
 
@@ -2389,7 +2814,9 @@ defmodule Gizmo.CLI do
     thinking = opts[:thinking] || false
     boot_path = opts[:boot]
     max_cycles = opts[:max_cycles]
-    quit_on_exhaust = opts[:quit_on_exhaust] || false
+    idle = opts[:idle] || false
+    grind = opts[:grind] || false
+    watchdog_ms = opts[:watchdog]
 
     # Read all positional arg files
     task_frames = Enum.map(paths, fn path ->
@@ -2431,7 +2858,8 @@ defmodule Gizmo.CLI do
     end
 
     run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
-    run_opts = if quit_on_exhaust, do: Keyword.put(run_opts, :quit_on_exhaust, true), else: run_opts
+    run_opts = if idle, do: Keyword.put(run_opts, :quit_on_exhaust, false), else: run_opts
+    run_opts = if grind, do: Keyword.put(run_opts, :grind, true), else: run_opts
 
     # Signal traps for clean abort
     {:ok, _} = System.trap_signal(:sigterm, fn ->
@@ -2443,7 +2871,17 @@ defmodule Gizmo.CLI do
       System.halt(0)
     end)
 
-    Gizmo.Agent.start_root(frames, run_opts)
+    {:ok, _} = Gizmo.Supervision.start_link()
+    {:ok, agent_mb, agent_pid} = Gizmo.Agent.start(frames, run_opts)
+
+    if watchdog_ms do
+      Gizmo.Services.Watchdog.start_link({agent_mb, watchdog_ms})
+    end
+
+    ref = Process.monitor(agent_pid)
+    receive do
+      {:DOWN, ^ref, :process, ^agent_pid, _reason} -> :ok
+    end
   end
 end
 

@@ -1,8 +1,8 @@
 # Gizmo
 
 Gizmo is a minimal runtime for LLM agents modeled on process calculus and the
-BEAM. An agent is a process with a context stack, a mailbox, and four syscalls
-(`send`, `receive`, `fork`, `join`). Everything else — tool use, memory,
+BEAM. An agent is a process with a context stack, a mailbox, and four ops
+(`send`, `receive`, `spawn`, `trap`). Everything else — tool use, memory,
 multi-agent coordination, human interaction — is built on top as mailbox-backed
 services.
 
@@ -82,12 +82,14 @@ elixir gizmo.exs my_task.txt
 
 | Flag | Description |
 |------|-------------|
-| `-v` | Verbose mode — shows ops, frames, args each cycle |
+| `-v` | Verbose mode — shows ops, frames, bindings each cycle |
 | `--thinking` | Enable extended thinking |
 | `--init <file>` | Generate a starter boot frame file |
 | `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
-| `--quit-on-exhaust` | Terminate when frames are exhausted instead of idling |
+| `--idle` | Idle (restore boot frame) when frames exhaust instead of terminating |
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
+| `--grind` | Hot-loop mode (no inter-cycle message wait) |
+| `--watchdog <ms>` | Periodic tick messages at given interval |
 
 ### Positional arguments
 
@@ -104,7 +106,7 @@ and all positional files are task frames.
 
 ```bash
 # Run the hello-world test frame (one-shot, terminates cleanly)
-elixir gizmo.exs --quit-on-exhaust test/01_hello.txt
+elixir gizmo.exs test/01_hello.txt
 
 # Run the echo-bot loop in verbose mode
 elixir gizmo.exs -v test/05_loop.txt
@@ -125,7 +127,7 @@ test/              # Example boot frames
   01_hello.txt     # One-shot greeter
   02_bash.txt      # Shell command execution
   03_blackboard.txt # Key-value store usage
-  04_fork.txt      # Process forking
+  04_fork.txt      # Process spawning
   05_loop.txt      # Echo-bot loop
   06_chat.txt      # Multi-turn chatbot
 ARCHITECTURE.md    # Runtime design and process model
@@ -135,7 +137,7 @@ PROMPTING.md       # Guide for writing boot frames
 
 ## Further reading
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — process model, syscalls, message routing, supervision tree
+- [ARCHITECTURE.md](ARCHITECTURE.md) — process model, ops, message routing, supervision tree
 - [PROMPTING.md](PROMPTING.md) — how to write boot frames for Gizmo agents
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development stages and roadmap
 

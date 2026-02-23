@@ -26,17 +26,17 @@ The LLM returns structured JSON via a forced tool call (`eval_response`),
 eliminating the need for a text parser. The `eval_response` tool schema
 defines the ops array and frames array directly.
 
-- [x] `eval_response` tool schema with ops (send/receive/fork/join) and frames
+- [x] `eval_response` tool schema with ops (send/receive/spawn/trap) and frames
 - [x] Anthropic: forced via `tool_choice: {type: "tool", name: "eval_response"}`
 - [x] OpenAI: forced via `response_format: {type: "json_schema", ...}`
 - [x] Normalized to Elixir tuples: `{:send, mailbox, msg}`, `:receive`, etc.
-- [x] Validation of op fields (`validate_op/1` — send requires mailbox + msg, fork requires n + frames, etc.)
+- [x] Validation of op fields (`validate_op/1` — send requires mailbox + msg, spawn requires frames + dest, etc.)
 
 ## Stage 3: Interpolation
 
 Resolve `${name}` references in text.
 
-- [x] `${name}` named resolution against a bindings map (populated by `receive(dest)` and `fork(dest)`)
+- [x] `${name}` named resolution against a bindings map (populated by `receive(dest)` and `spawn(dest)`)
 - [x] Escaping (`$$` for literal `$`)
 - [x] Apply interpolation to frame text and message content (`interpolate_response/3`)
 - [x] Unit tests (in-process smoke tests via `--test`)
@@ -56,7 +56,7 @@ Central message routing registry.
 Implement the service processes that back the well-known mailboxes.
 
 ### 5a: Args Stack (removed)
-- Replaced by named bindings via `dest` field on `receive` and `fork` ops.
+- Replaced by named bindings via `dest` field on `receive` and `spawn` ops.
   Bindings are threaded through the eval loop as a plain map — no GenServer needed.
 
 ### 5b: Messages Queue
@@ -111,16 +111,18 @@ Wire everything together and run the addition example from the design doc.
 - [x] Verify args stack, messages queue, and blackboard work correctly (smoke tests)
 - [x] Manual testing via test frames (01–06), smoke tests via `--test`
 
-## Stage 8: Fork and Join
+## Stage 8: Spawn (formerly Fork and Join)
 
 Multi-process support.
 
-- [x] `fork` op: spawn child with `spawn_link` (not yet DynamicSupervisor)
+- [x] `spawn` op: create child process with given frames
 - [x] Register child mailbox in router
-- [x] Push child mailbox ID onto parent's args
-- [x] `join` op: send message to parent mailbox, terminate self
+- [x] Store child mailbox ID in binding `dest`
+- [x] `_self` and `_parent` runtime bindings for agent identity
+- [x] Termination: `send` to `${_parent}` + `frames: []` (no special op)
 - [x] Process.monitor for unexpected child death → notify parent
-- [x] Test: parent forks child, child does work, joins back (smoke test)
+- [x] Test: parent spawns child, child sends result, parent receives (smoke test)
+- Note: `fork`/`join` ops removed — see DEAD_ENDS.md
 
 ## Stage 9: Supervision and Error Recovery
 
@@ -140,12 +142,12 @@ Configurable cycle limits, stack exhaustion behavior, multi-file frame stacks,
 and signal handling.
 
 - [x] `--max-cycles N` — configurable eval cycle limit (default 50, 0 = unlimited)
-- [x] `--quit-on-exhaust` — terminate on empty frames instead of idling
+- [x] `--idle` — idle on empty frames instead of terminating (opt-in)
 - [x] `--boot <file>` — separate boot frame from task frames
 - [x] Multi-file positional args (stacked as frames)
-- [x] `max_cycles` and `quit_on_exhaust` propagated to forked children
+- [x] `max_cycles` and `quit_on_exhaust` (idle mode) propagated to spawned children
 - [x] SIGTERM and SIGQUIT signal traps for clean abort
-- [x] Tests: max_cycles limit, unlimited mode, quit_on_exhaust behavior
+- [x] Tests: max_cycles limit, unlimited mode, terminate-on-exhaust and idle mode
 
 ## Stage 11: Polish and Hardening
 
@@ -156,14 +158,49 @@ and signal handling.
 - [ ] Config: LLM model selection, timeouts, retry counts
 - [ ] Documentation: module docs, usage examples
 
+## Stage 12: Message-Driven Eval Loop with Trap Support
+
+Replace the hot-grind eval loop with a message-driven model. Agents sleep
+between cycles and wake on mailbox messages.
+
+- [x] Add `trap` op to schema and validation (empty frames = clear trap)
+- [x] ~`untrap` op~ — removed, `trap(pattern, [])` clears trap (see DEAD_ENDS.md)
+- [x] Refactor `eval_loop/7` to `eval_loop/3` with loop map
+- [x] Thread trap through `execute_ops`/`execute_op`
+- [x] Add `grind` flag (opt-in hot-loop for worker agents)
+- [x] Implement inter-cycle message wait (`maybe_wait_for_message`)
+  - First cycle: `${_msg} = "init"`, `${_msg_source} = "runtime"`
+  - Grind mode: no wait (preserves old behavior)
+  - Default: block on `receive`, bind `${_msg}` / `${_msg_source}`
+  - Trap match: bind `${_interrupt}` / `${_interrupt_source}`, prepend handler frames
+- [x] Replace `fork`/`join` with `spawn` + `_self`/`_parent` bindings (see DEAD_ENDS.md)
+- [x] Add `Gizmo.Services.Watchdog` — periodic tick messages to target mailbox
+- [x] Update `runtime_prompt()` with message-driven model, trap, watchdog docs
+- [x] CLI: `--grind`, `--watchdog <ms>` flags
+- [x] Existing tests updated with `grind: true` to preserve behavior
+- [x] New smoke tests: first cycle init, message-driven wake, trap fire, trap no-match, grind mode
+- [x] Op set evolution: `send, receive, fork, join` → `send, receive, spawn, trap`
+
+## Stage 13: Reaper Service
+
+Agent lifecycle management via a well-known `reaper` service. Agents can
+force-kill children lower in the supervision hierarchy by sending their
+mailbox ID to the reaper.
+
+- [ ] Store parent mailbox ID in Mailbox Registry value (currently `nil`)
+- [ ] `Gizmo.Services.Reaper` — well-known service that accepts kill requests
+- [ ] Ancestor check: walk parent chain from target to verify caller is ancestor
+- [ ] Kill via `Process.exit(pid, :shutdown)` — triggers existing child death monitor
+- [ ] Parent receives `child_died:` notification as usual (no special case)
+- [ ] Tests: parent kills child, grandparent kills grandchild, sibling rejected
+
 ## Deferred / Future
 
 These are explicitly out of scope for the initial build but noted for later:
 
-- Selective receive (pattern matching on messages)
+- ~Selective receive~ — partially addressed by trap (Stage 12)
 - Context summarization service
 - Persistence (durable stacks/mailboxes across restarts)
-- Args-on-fork semantics (copy vs. fresh)
 - Nested boot frames / sandboxing
 - Phoenix LiveView human adapter
 - Prompt injection defense

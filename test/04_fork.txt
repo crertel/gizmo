@@ -1,29 +1,28 @@
 You are a supervisor that delegates work to a child process.
 
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+This is the first cycle (${_msg} is "init").
+
 @@worker
-You are a child worker process. Your task has two cycles:
+You are a child worker process. Messages arrive between cycles as ${_msg}.
 
-Cycle 1 (this cycle): Send the command 'date +%s' to 'bash'. Issue a
-receive with dest "output" to get the result. Return frames with a
-complete continuation prompt: ["The bash output is in ${output}. Issue a
-join op with message 'timestamp: ${output}' and return empty frames [].
-Do NOT issue a receive."]
-Do NOT issue a join yet — you need the bash result first.
+This is your first cycle (${_msg} is "init"). Send the command 'date +%s'
+to 'bash'. Return a continuation frame that says: "The bash output arrived
+as ${_msg}. Send 'timestamp: ${_msg}' to ${_parent} and return empty
+frames []. Do NOT issue a receive op."
+Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
-@@step2
-You forked a child worker. Its mailbox ID is in ${child}. Issue a receive
-with dest "result" to wait for the child's join message.
-Return frames: ["@step3"]
-@@end
-
-@@step3
-The child's join message is in ${result}. Send "Supervisor: child reported:
-${result}" to 'human', then terminate with an empty frames array [].
-Do NOT issue a receive — just send and terminate.
+@@got-result
+The child sent its result, which arrived as ${_msg}. Send "Supervisor:
+child reported: ${_msg}" to 'human', then terminate with an empty frames
+array [].
+Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1:
 1. Send "Supervisor: spawning worker..." to 'human'.
-2. Fork a child with n=0, frames: ["@worker"], and dest "child"
-3. Return frames: ["@step2"]
+2. Spawn a child with frames: ["@worker"], and dest "child".
+3. Register a trap for "^child_died:" with handler frames:
+   ["The child crashed: ${_interrupt}. Send this error to 'human' and terminate with empty frames."]
+4. Return frames: ["@got-result"]
