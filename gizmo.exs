@@ -57,6 +57,15 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)}   #{@magenta}spawn#{@reset} #{child_label} → #{@bold}${#{dest}}#{@reset}"
   end
 
+  def agent_start(id, parent_id) do
+    parent_info = if parent_id, do: " #{@dim}parent=#{parent_id}#{@reset}", else: ""
+    "#{agent_tag(id)}   #{@green}online#{@reset}#{parent_info}"
+  end
+
+  def agent_stop(id) do
+    "#{agent_tag(id)}   #{@red}terminated#{@reset}"
+  end
+
   def frames_line(id, frames) do
     if frames == [] do
       "#{agent_tag(id)}   #{@red}frames: [] (will terminate)#{@reset}"
@@ -1001,6 +1010,10 @@ defmodule Gizmo.Agent.Wrapper do
     :proc_lib.init_ack({:ok, self()})
     send(caller, {:agent_ready, mailbox_id, self()})
 
+    if verbose do
+      IO.puts(Gizmo.Format.agent_start(mailbox_id, parent))
+    end
+
     state = %{
       mailbox_id: mailbox_id,
       parent: parent,
@@ -1021,6 +1034,10 @@ defmodule Gizmo.Agent.Wrapper do
     init_notes = if parent, do: Map.put(init_notes, "_parent", "parent agent's mailbox ID"), else: init_notes
 
     Gizmo.Agent.eval_loop(frames, state, init_bindings, init_notes)
+
+    if verbose do
+      IO.puts(Gizmo.Format.agent_stop(mailbox_id))
+    end
 
     # Cleanup
     GenServer.stop(msgs_queue)

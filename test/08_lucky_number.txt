@@ -6,21 +6,13 @@ Messages arrive between cycles as ${_msg} from ${_msg_source}.
 This is the first cycle (${_msg} is "init").
 
 @@roller
-You are the roller child. Messages arrive between cycles as ${_msg}.
-This is either your first cycle (${_msg} is "init") or you just sent a
-result and are rolling again.
+You are the roller child. Each cycle you roll a number and report it.
 
-Send the command 'shuf -i 1-10 -n 1' to 'bash'.
-Return frames: ["@got-bash-result"].
-Do NOT issue a receive op.
-@@end
-
-@@got-bash-result
-You are the roller child. The bash output arrived as ${_msg}.
-Send "rolled:${_msg}" to ${_parent}.
-Then send "Child: I rolled ${_msg}" to 'human'.
-Return frames: ["@roller"] to roll again.
-Do NOT issue a receive op.
+1. Send 'shuf -i 1-10 -n 1' to 'bash'.
+2. Receive the bash result into ${result}.
+3. Send "rolled:${result}" to ${_parent}.
+4. Send "Child: I rolled ${result}" to 'human'.
+Return frames: [].
 @@end
 
 @@check-roll
