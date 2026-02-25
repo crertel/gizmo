@@ -85,6 +85,18 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)} #{@dim}────────────────────────────────#{@reset}"
   end
 
+  def timing_line(id, llm_ms, cycle_ms) do
+    "#{agent_tag(id)}   #{@dim}⏱#{@reset} llm=#{llm_ms}ms cycle=#{cycle_ms}ms"
+  end
+
+  def full_prompt(id, system_prompt, user_content) do
+    "#{agent_tag(id)}   ┌─ system prompt ─────────────\n" <>
+    system_prompt <> "\n" <>
+    "#{agent_tag(id)}   ├─ user message ──────────────\n" <>
+    user_content <> "\n" <>
+    "#{agent_tag(id)}   └─────────────────────────────"
+  end
+
   defp truncate(s, max) do
     s = String.replace(s, "\n", "\\n")
     if String.length(s) > max do
@@ -93,6 +105,16 @@ defmodule Gizmo.Format do
       s
     end
   end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.LogFormatter — passthrough formatter for Logger (messages pre-formatted)
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.LogFormatter do
+  def format(%{msg: {:string, msg}}, _config), do: [msg, ?\n]
+  def format(%{msg: {:report, report}}, _config), do: [inspect(report), ?\n]
+  def format(%{msg: {fmt, args}}, _config), do: [:io_lib.format(fmt, args), ?\n]
 end
 
 # -----------------------------------------------------------------------------
@@ -152,6 +174,14 @@ defmodule Gizmo.LLM do
               dest: %{
                 type: "string",
                 description: "Binding name for the result (for receive and spawn)."
+              },
+              grind: %{
+                type: "boolean",
+                description: "Override child loop mode (for spawn). Default: inherit parent."
+              },
+              idle: %{
+                type: "boolean",
+                description: "Child restores boot frame on empty frames (for spawn). Default: inherit parent."
               }
             }
           }
@@ -843,6 +873,7 @@ end
 
 defmodule Gizmo.Services.Exception do
   use GenServer
+  require Logger
 
   def start_link(mailbox_id \\ "exception") do
     GenServer.start_link(__MODULE__, mailbox_id)
@@ -856,7 +887,7 @@ defmodule Gizmo.Services.Exception do
 
   @impl true
   def handle_info({:mailbox_msg, _mailbox_id, {from, error_info}}, state) do
-    IO.puts(:stderr, "[exception] from=#{from} #{format_error(error_info)}")
+    Logger.error("[exception] from=#{from} #{format_error(error_info)}")
     {:noreply, state}
   end
 
@@ -885,6 +916,7 @@ end
 
 defmodule Gizmo.Services.Reaper do
   use GenServer
+  require Logger
 
   def start_link(mailbox_id \\ "reaper") do
     GenServer.start_link(__MODULE__, mailbox_id)
@@ -903,11 +935,11 @@ defmodule Gizmo.Services.Reaper do
         if ancestor?(caller_mb, target_mb) do
           Process.exit(target_pid, :shutdown)
         else
-          IO.puts(:stderr, "[reaper] denied: #{caller_mb} is not an ancestor of #{target_mb}")
+          Logger.error("[reaper] denied: #{caller_mb} is not an ancestor of #{target_mb}")
         end
 
       {:error, _} ->
-        IO.puts(:stderr, "[reaper] target not found: #{target_mb}")
+        Logger.error("[reaper] target not found: #{target_mb}")
     end
 
     {:noreply, state}
@@ -945,6 +977,7 @@ end
 
 defmodule Gizmo.Services.Watchdog do
   use GenServer
+  require Logger
 
   def start_link(mailbox_id \\ "watchdog") do
     GenServer.start_link(__MODULE__, mailbox_id)
@@ -987,7 +1020,7 @@ defmodule Gizmo.Services.Watchdog do
           state
 
         :unknown ->
-          IO.puts(:stderr, "[watchdog] unknown command from #{sender_mb}: #{inspect(cmd)}")
+          Logger.error("[watchdog] unknown command from #{sender_mb}: #{inspect(cmd)}")
           state
       end
 
@@ -1112,6 +1145,7 @@ end
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Agent.Wrapper do
+  require Logger
   @default_receive_timeout 30_000
 
   def start_link({frames, opts, caller}) do
@@ -1121,14 +1155,16 @@ defmodule Gizmo.Agent.Wrapper do
   def init_agent({frames, opts, caller}) do
     chat_fn = Keyword.get(opts, :chat_fn, &Gizmo.LLM.Anthropic.chat/3)
     parent = Keyword.get(opts, :parent, nil)
-    verbose = Keyword.get(opts, :verbose, false)
     receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
     quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, true)
     grind = Keyword.get(opts, :grind, false)
+    log_timings = Keyword.get(opts, :log_timings, false)
+    log_full_prompts = Keyword.get(opts, :log_full_prompts, false)
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
     Gizmo.Mailbox.register(mailbox_id, parent)
+    Logger.metadata(agent_id: mailbox_id)
 
     msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
     {:ok, msgs_queue} = Gizmo.Services.MessagesQueue.start_link(msgs_queue_mb)
@@ -1136,19 +1172,18 @@ defmodule Gizmo.Agent.Wrapper do
     :proc_lib.init_ack({:ok, self()})
     send(caller, {:agent_ready, mailbox_id, self()})
 
-    if verbose do
-      IO.puts(Gizmo.Format.agent_start(mailbox_id, parent))
-    end
+    Logger.warning(Gizmo.Format.agent_start(mailbox_id, parent))
 
     state = %{
       mailbox_id: mailbox_id,
       parent: parent,
       chat_fn: chat_fn,
-      verbose: verbose,
       receive_timeout: receive_timeout,
       max_cycles: max_cycles,
       quit_on_exhaust: quit_on_exhaust,
       grind: grind,
+      log_timings: log_timings,
+      log_full_prompts: log_full_prompts,
       msgs_queue: msgs_queue,
       boot_frames: frames
     }
@@ -1161,9 +1196,7 @@ defmodule Gizmo.Agent.Wrapper do
 
     Gizmo.Agent.eval_loop(frames, state, init_bindings, init_notes)
 
-    if verbose do
-      IO.puts(Gizmo.Format.agent_stop(mailbox_id))
-    end
+    Logger.warning(Gizmo.Format.agent_stop(mailbox_id))
 
     # Cleanup
     GenServer.stop(msgs_queue)
@@ -1201,6 +1234,8 @@ end
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Agent do
+  require Logger
+
   @doc "Runtime preamble appended to every agent's system prompt."
   def runtime_prompt do
     """
@@ -1396,7 +1431,6 @@ defmodule Gizmo.Agent do
   Options:
     - parent: parent mailbox_id (provides ${_parent} binding)
     - chat_fn: fn(system, messages, opts) -> {:ok, eval_response} (default: Anthropic)
-    - verbose: boolean
     - receive_timeout: ms (default 30_000)
   """
   def start(frames, opts \\ []) do
@@ -1500,13 +1534,13 @@ defmodule Gizmo.Agent do
 
   defp eval_loop_inner(_context_stack, %{max_cycles: max_cycles} = state, %{cycles: cycles})
        when max_cycles > 0 and cycles >= max_cycles do
-    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max eval cycles (#{max_cycles}) reached, terminating")
+    Logger.error("[agent:#{state.mailbox_id}] max eval cycles (#{max_cycles}) reached, terminating")
     error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
   defp eval_loop_inner(context_stack, state, %{retries: retries}) when retries >= @max_eval_retries do
-    IO.puts(:stderr, "[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
+    Logger.error("[agent:#{state.mailbox_id}] max retries (#{@max_eval_retries}) exceeded, terminating")
     failing_frame = List.first(context_stack) || ""
     error_info = {:max_retries_exceeded, state.mailbox_id, retries, failing_frame}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
@@ -1523,11 +1557,9 @@ defmodule Gizmo.Agent do
 
     id = state.mailbox_id
 
-    if state.verbose do
-      IO.puts(Gizmo.Format.separator(id))
-      IO.puts(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
-      IO.puts(Gizmo.Format.bindings_line(id, bindings, binding_notes))
-    end
+    Logger.warning(Gizmo.Format.separator(id))
+    Logger.warning(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
+    Logger.debug(Gizmo.Format.bindings_line(id, bindings, binding_notes))
 
     user_content = if map_size(bindings) == 0 do
       "Begin."
@@ -1544,32 +1576,54 @@ defmodule Gizmo.Agent do
       "Begin.\n\nCurrent bindings:\n#{binding_lines}"
     end
 
+    if state.log_full_prompts do
+      Logger.flush()
+      IO.puts(:stderr, Gizmo.Format.full_prompt(id, system_prompt, user_content))
+    end
+
+    cycle_start = System.monotonic_time(:millisecond)
+    llm_start = System.monotonic_time(:millisecond)
+
     case state.chat_fn.(system_prompt, [%{role: "user", content: user_content}], []) do
       {:ok, response} ->
+        llm_ms = System.monotonic_time(:millisecond) - llm_start
+
         interpolated = Gizmo.LLM.interpolate_response(response, bindings, sections)
 
-        if state.verbose do
-          for op <- interpolated.ops do
-            case op do
-              {:send, mb, msg} -> IO.puts(Gizmo.Format.op_send(id, mb, msg))
-              {:receive, dest} -> IO.puts(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
-              {:spawn, cf, dest, _opts} -> IO.puts(Gizmo.Format.op_spawn(id, cf, dest))
-              {:trap, _pattern, []} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
-              {:trap, pattern, _} -> IO.puts("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
-            end
+        for op <- interpolated.ops do
+          case op do
+            {:send, mb, msg} -> Logger.info(Gizmo.Format.op_send(id, mb, msg))
+            {:receive, dest} -> Logger.info(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
+            {:spawn, cf, dest, _opts} -> Logger.info(Gizmo.Format.op_spawn(id, cf, dest))
+            {:trap, _pattern, []} -> Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
+            {:trap, pattern, _} -> Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
           end
-          IO.puts(Gizmo.Format.frames_line(id, interpolated.frames))
         end
+        Logger.warning(Gizmo.Format.frames_line(id, interpolated.frames))
 
         # Merge notes from this cycle's response into binding_notes
         new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
         # Execute ops — may modify context_stack via spawn, updates bindings and trap
         {new_stack, new_bindings, new_trap} = execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
+
+        cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+        if state.log_timings do
+          Logger.flush()
+          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms))
+        end
+
         eval_loop_inner(new_stack, state, %{loop | retries: 0, cycles: cycles + 1, persisted_sections: sections, bindings: new_bindings, binding_notes: new_binding_notes, trap: new_trap})
 
       {:error, reason} ->
-        IO.puts(:stderr, Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
+        llm_ms = System.monotonic_time(:millisecond) - llm_start
+        cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+        if state.log_timings do
+          Logger.flush()
+          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms))
+        end
+
+        Logger.error(Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
         eval_loop_inner(context_stack, state, %{loop | retries: retries + 1, cycles: cycles + 1, persisted_sections: sections})
     end
   end
@@ -1608,25 +1662,23 @@ defmodule Gizmo.Agent do
     {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames,
       parent: state.mailbox_id,
       chat_fn: state.chat_fn,
-      verbose: state.verbose,
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: child_quit_on_exhaust,
-      grind: child_grind
+      grind: child_grind,
+      log_timings: state.log_timings,
+      log_full_prompts: state.log_full_prompts
     )
 
     # Monitor child: on abnormal exit, notify parent mailbox
     parent_mb = state.mailbox_id
-    verbose = state.verbose
     Kernel.spawn(fn ->
       ref = Process.monitor(child_pid)
       receive do
         {:DOWN, ^ref, :process, ^child_pid, :normal} ->
           :ok
         {:DOWN, ^ref, :process, ^child_pid, reason} ->
-          if verbose do
-            IO.puts(:stderr, "[watcher] child #{child_mb} died: #{inspect(reason)}")
-          end
+          Logger.warning("[watcher] child #{child_mb} died: #{inspect(reason)}")
           Gizmo.Mailbox.route(parent_mb, {child_mb, "child_died:#{child_mb} reason=#{inspect(reason)}"})
       end
     end)
@@ -1650,25 +1702,32 @@ end
 # =============================================================================
 
 defmodule Gizmo.CLI do
+  require Logger
+
   def main do
+    argv = expand_verbose_flags(System.argv())
+
     {opts, args, _} =
-      OptionParser.parse(System.argv(),
+      OptionParser.parse(argv,
         strict: [
           test: :boolean,
-          verbose: :boolean,
+          verbose: :count,
           init: :string,
           thinking: :boolean,
           max_cycles: :integer,
           boot: :string,
           idle: :boolean,
           grind: :boolean,
-          watchdog: :integer
+          watchdog: :integer,
+          log_timings: :boolean,
+          log_full_prompts: :boolean
         ],
         aliases: [v: :verbose]
       )
 
     cond do
       opts[:test] ->
+        configure_logger(nil)
         run_tests()
 
       opts[:init] ->
@@ -1682,6 +1741,27 @@ defmodule Gizmo.CLI do
     end
   end
 
+  defp expand_verbose_flags(argv) do
+    Enum.flat_map(argv, fn
+      "-vv" -> ["-v", "-v"]
+      "-vvv" -> ["-v", "-v", "-v"]
+      other -> [other]
+    end)
+  end
+
+  defp configure_logger(verbosity) do
+    level = case verbosity do
+      nil -> :error
+      1   -> :warning
+      2   -> :info
+      n when n >= 3 -> :debug
+    end
+
+    Logger.configure(level: level)
+    :logger.update_handler_config(:default, :formatter, {Gizmo.LogFormatter, %{}})
+    :logger.update_handler_config(:default, :config, %{type: :standard_error})
+  end
+
   defp usage do
     IO.puts("""
     Usage: elixir gizmo.exs [options] <file> [file ...]
@@ -1689,13 +1769,17 @@ defmodule Gizmo.CLI do
     Options:
       --test              Run smoke tests, then exit
       --init <file>       Write a starter boot frame to <file>
-      -v, --verbose       Enable verbose output
+      -v                  Lifecycle + cycle headers + frames summary
+      -vv                 + ops per cycle (send, receive, spawn, trap)
+      -vvv                + bindings, full frame content
       --thinking          Enable extended thinking (Anthropic only)
       --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
       --idle              Idle (restore boot frame) when frames exhaust instead of terminating
       --grind             Hot-loop eval (no inter-cycle message wait)
       --watchdog N        Send periodic watchdog:tick messages every N ms
       --boot <file>       Separate boot frame file (used for idle recovery)
+      --log-timings       Show LLM and cycle timing per eval cycle
+      --log-full-prompts  Show full system prompt and user message each cycle
 
     Positional arguments:
       Without --boot: first file is the boot frame, rest are stacked on top.
@@ -3326,7 +3410,8 @@ defmodule Gizmo.CLI do
   end
 
   def run(paths, opts) when is_list(paths) do
-    verbose = opts[:verbose] || false
+    configure_logger(opts[:verbose])
+
     thinking = opts[:thinking] || false
     boot_path = opts[:boot]
     max_cycles = opts[:max_cycles]
@@ -3358,12 +3443,9 @@ defmodule Gizmo.CLI do
       {task_frames, List.first(task_frames)}
     end
 
-    if verbose do
-      IO.puts("Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}...")
-      IO.puts("")
-    end
+    Logger.warning("Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}...")
 
-    run_opts = [verbose: verbose]
+    run_opts = []
     run_opts = if thinking do
       chat_fn = fn system, messages, chat_opts ->
         Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))
@@ -3376,6 +3458,8 @@ defmodule Gizmo.CLI do
     run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
     run_opts = if idle, do: Keyword.put(run_opts, :quit_on_exhaust, false), else: run_opts
     run_opts = if grind, do: Keyword.put(run_opts, :grind, true), else: run_opts
+    run_opts = if opts[:log_timings], do: Keyword.put(run_opts, :log_timings, true), else: run_opts
+    run_opts = if opts[:log_full_prompts], do: Keyword.put(run_opts, :log_full_prompts, true), else: run_opts
 
     # Signal traps for clean abort
     {:ok, _} = System.trap_signal(:sigterm, fn ->
@@ -3398,6 +3482,8 @@ defmodule Gizmo.CLI do
     receive do
       {:DOWN, ^ref, :process, ^agent_pid, _reason} -> :ok
     end
+
+    Logger.flush()
   end
 end
 

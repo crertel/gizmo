@@ -18,7 +18,8 @@ Edit the `## Your task` section, then run:
 
 ```
 elixir gizmo.exs my_task.txt
-elixir gizmo.exs -v my_task.txt        # verbose (shows ops, frames, bindings)
+elixir gizmo.exs -v my_task.txt        # verbose (lifecycle, cycle headers, frames)
+elixir gizmo.exs -vvv my_task.txt      # max verbosity (+ ops, bindings)
 elixir gizmo.exs --thinking my_task.txt # enable extended thinking
 ```
 
@@ -670,7 +671,9 @@ To cancel all your timers:
 
 | Flag | Effect |
 |------|--------|
-| `-v`, `--verbose` | Print ops, frames, and bindings each cycle |
+| `-v` | Lifecycle events, cycle headers, frames summary |
+| `-vv` | + ops per cycle (send, receive, spawn, trap) |
+| `-vvv` | + bindings, full frame content |
 | `--thinking` | Enable extended thinking (Anthropic only) |
 | `--test` | Run built-in smoke tests |
 | `--init <file>` | Generate a starter boot frame |
@@ -679,6 +682,8 @@ To cancel all your timers:
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
 | `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
+| `--log-timings` | Show LLM and cycle timing per eval cycle |
+| `--log-full-prompts` | Show full system prompt and user message each cycle |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
 responding. This can help with complex multi-step tasks where the LLM needs
