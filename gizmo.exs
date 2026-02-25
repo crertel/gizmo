@@ -946,38 +946,164 @@ end
 defmodule Gizmo.Services.Watchdog do
   use GenServer
 
-  def start_link({target_mailbox_id, interval_ms}) do
-    GenServer.start_link(__MODULE__, {target_mailbox_id, interval_ms})
+  def start_link(mailbox_id \\ "watchdog") do
+    GenServer.start_link(__MODULE__, mailbox_id)
   end
 
   @impl true
-  def init({target_mailbox_id, interval_ms}) do
-    # Resolve the target PID and monitor it
-    case Gizmo.Mailbox.lookup(target_mailbox_id) do
-      {:ok, target_pid} ->
-        ref = Process.monitor(target_pid)
-        schedule_tick(interval_ms)
-        {:ok, %{target: target_mailbox_id, interval: interval_ms, monitor_ref: ref}}
-
-      {:error, _} ->
-        {:stop, {:target_not_found, target_mailbox_id}}
-    end
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, agents: %{}}}
   end
 
+  # State shape:
+  # agents: %{
+  #   agent_mb => %{
+  #     monitor_ref: ref,
+  #     timers: [%{type: :every | :after, interval: ms, id: ref, cancel_ref: timer_ref}, ...]
+  #   }
+  # }
+
   @impl true
-  def handle_info(:tick, state) do
-    Gizmo.Mailbox.route(state.target, {"watchdog", "watchdog:tick"})
-    schedule_tick(state.interval)
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
+    state = ensure_monitored(sender_mb, state)
+
+    state =
+      case parse_command(cmd) do
+        {:every, ms} ->
+          {id, cancel_ref} = schedule_fire(sender_mb, ms)
+          add_timer(state, sender_mb, %{type: :every, interval: ms, id: id, cancel_ref: cancel_ref})
+
+        {:after, ms} ->
+          {id, cancel_ref} = schedule_fire(sender_mb, ms)
+          add_timer(state, sender_mb, %{type: :after, interval: ms, id: id, cancel_ref: cancel_ref})
+
+        :cancel ->
+          cancel_all_timers(state, sender_mb)
+
+        :list ->
+          reply = format_timer_list(state, sender_mb)
+          Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, reply})
+          state
+
+        :unknown ->
+          IO.puts(:stderr, "[watchdog] unknown command from #{sender_mb}: #{inspect(cmd)}")
+          state
+      end
+
     {:noreply, state}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
-    # Target died, stop the watchdog
-    {:stop, :normal, state}
+  def handle_info({:fire, agent_mb, timer_id}, state) do
+    case get_in(state, [:agents, agent_mb]) do
+      nil ->
+        {:noreply, state}
+
+      agent_entry ->
+        case Enum.find(agent_entry.timers, &(&1.id == timer_id)) do
+          nil ->
+            {:noreply, state}
+
+          %{type: :every, interval: ms} ->
+            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
+            {new_id, new_cancel_ref} = schedule_fire(agent_mb, ms)
+            timers = Enum.map(agent_entry.timers, fn
+              t when t.id == timer_id -> %{t | id: new_id, cancel_ref: new_cancel_ref}
+              t -> t
+            end)
+            {:noreply, put_in(state, [:agents, agent_mb, :timers], timers)}
+
+          %{type: :after} ->
+            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
+            timers = Enum.reject(agent_entry.timers, &(&1.id == timer_id))
+            {:noreply, put_in(state, [:agents, agent_mb, :timers], timers)}
+        end
+    end
   end
 
-  defp schedule_tick(interval_ms) do
-    Process.send_after(self(), :tick, interval_ms)
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    case Enum.find(state.agents, fn {_mb, entry} -> entry.monitor_ref == ref end) do
+      {agent_mb, _entry} ->
+        state = cancel_all_timers(state, agent_mb)
+        {:noreply, %{state | agents: Map.delete(state.agents, agent_mb)}}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  defp parse_command(cmd) do
+    trimmed = String.trim(cmd)
+
+    cond do
+      match = Regex.run(~r/^every\s+(\d+)$/i, trimmed) ->
+        {:every, String.to_integer(Enum.at(match, 1))}
+
+      match = Regex.run(~r/^after\s+(\d+)$/i, trimmed) ->
+        {:after, String.to_integer(Enum.at(match, 1))}
+
+      trimmed =~ ~r/^cancel$/i ->
+        :cancel
+
+      trimmed =~ ~r/^list$/i ->
+        :list
+
+      true ->
+        :unknown
+    end
+  end
+
+  defp schedule_fire(agent_mb, ms) do
+    id = make_ref()
+    cancel_ref = Process.send_after(self(), {:fire, agent_mb, id}, ms)
+    {id, cancel_ref}
+  end
+
+  defp ensure_monitored(sender_mb, state) do
+    if Map.has_key?(state.agents, sender_mb) do
+      state
+    else
+      case Gizmo.Mailbox.lookup(sender_mb) do
+        {:ok, pid} ->
+          monitor_ref = Process.monitor(pid)
+          put_in(state, [:agents, sender_mb], %{monitor_ref: monitor_ref, timers: []})
+
+        {:error, _} ->
+          state
+      end
+    end
+  end
+
+  defp add_timer(state, agent_mb, timer) do
+    update_in(state, [:agents, agent_mb, :timers], &[timer | &1])
+  end
+
+  defp cancel_all_timers(state, agent_mb) do
+    case get_in(state, [:agents, agent_mb]) do
+      nil ->
+        state
+
+      agent_entry ->
+        Enum.each(agent_entry.timers, fn timer ->
+          Process.cancel_timer(timer.cancel_ref)
+        end)
+        put_in(state, [:agents, agent_mb, :timers], [])
+    end
+  end
+
+  defp format_timer_list(state, agent_mb) do
+    case get_in(state, [:agents, agent_mb]) do
+      nil ->
+        "none"
+
+      %{timers: []} ->
+        "none"
+
+      %{timers: timers} ->
+        timers
+        |> Enum.map(fn %{type: type, interval: ms} -> "#{type}:#{ms}" end)
+        |> Enum.join(", ")
+    end
   end
 end
 
@@ -1024,7 +1150,7 @@ defmodule Gizmo.Agent.Wrapper do
       quit_on_exhaust: quit_on_exhaust,
       grind: grind,
       msgs_queue: msgs_queue,
-      boot_frame: List.first(frames)
+      boot_frames: frames
     }
 
     # Runtime-provided bindings: _self always, _parent if spawned by another agent
@@ -1059,6 +1185,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.HumanInput, "human_input"},
       {Gizmo.Services.Exception, "exception"},
       {Gizmo.Services.Reaper, "reaper"},
+      {Gizmo.Services.Watchdog, "watchdog"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -1179,6 +1306,10 @@ defmodule Gizmo.Agent do
     - reaper: Force-kill a descendant agent. Send the target's mailbox ID.
       The reaper verifies you are an ancestor before killing. Fire-and-forget.
       The target's parent receives a child_died: notification automatically.
+    - watchdog: Timer service. Send "every N" for periodic ticks or
+      "after N" for a one-shot tick (N in milliseconds). Ticks arrive as
+      "watchdog:tick" from source "watchdog". Send "cancel" to clear all
+      your timers, or "list" to get a summary. Fire-and-forget except list.
 
     ## Message-driven model
 
@@ -1191,9 +1322,9 @@ defmodule Gizmo.Agent do
     On the first cycle, ${_msg} = "init" and ${_msg_source} = "runtime" —
     no actual message is needed to start.
 
-    If a watchdog timer is configured, it sends periodic "watchdog:tick"
-    messages from source "watchdog", giving you a heartbeat even without
-    external messages.
+    To get periodic heartbeats, send "every N" to the "watchdog" mailbox
+    (N in milliseconds). The watchdog delivers "watchdog:tick" from source
+    "watchdog" on each interval. Send "cancel" to stop all your timers.
 
     ## Trap (interrupt handler)
 
@@ -1259,7 +1390,7 @@ defmodule Gizmo.Agent do
 
   Agents run as :temporary children — they are not restarted on exit.
   By default, agents terminate when frames drain to []. With quit_on_exhaust: false
-  (--idle), the first frame is saved as the boot frame and re-pushed when the
+  (--idle), the initial frames are saved as boot frames and re-pushed when the
   context stack drains, so the agent idles and waits for new work.
 
   Options:
@@ -1306,11 +1437,11 @@ defmodule Gizmo.Agent do
   @max_eval_retries 3
 
   def eval_loop(frames, state, init_bindings \\ %{}, init_notes \\ %{})
-  def eval_loop([], %{boot_frame: nil}, _init_bindings, _init_notes), do: :ok
+  def eval_loop([], %{boot_frames: []}, _init_bindings, _init_notes), do: :ok
   def eval_loop([], %{quit_on_exhaust: true}, _init_bindings, _init_notes), do: :ok
-  def eval_loop([], %{boot_frame: boot_frame} = state, init_bindings, init_notes) do
+  def eval_loop([], %{boot_frames: boot_frames} = state, init_bindings, init_notes) do
     loop = %{retries: 0, cycles: 0, persisted_sections: %{}, bindings: init_bindings, binding_notes: init_notes, trap: nil, init_bindings: init_bindings, init_notes: init_notes}
-    eval_loop_inner([boot_frame], state, loop)
+    eval_loop_inner(boot_frames, state, loop)
   end
   def eval_loop(context_stack, state, init_bindings, init_notes) do
     loop = %{retries: 0, cycles: 0, persisted_sections: %{}, bindings: init_bindings, binding_notes: init_notes, trap: nil, init_bindings: init_bindings, init_notes: init_notes}
@@ -1361,10 +1492,10 @@ defmodule Gizmo.Agent do
     end
   end
 
-  defp eval_loop_inner([], %{boot_frame: nil}, _loop), do: :ok
+  defp eval_loop_inner([], %{boot_frames: []}, _loop), do: :ok
   defp eval_loop_inner([], %{quit_on_exhaust: true}, _loop), do: :ok
-  defp eval_loop_inner([], %{boot_frame: boot_frame} = state, loop) do
-    eval_loop_inner([boot_frame], state, %{loop | retries: 0, persisted_sections: %{}, bindings: loop.init_bindings, binding_notes: loop.init_notes})
+  defp eval_loop_inner([], %{boot_frames: boot_frames} = state, loop) do
+    eval_loop_inner(boot_frames, state, %{loop | retries: 0, persisted_sections: %{}, bindings: loop.init_bindings, binding_notes: loop.init_notes})
   end
 
   defp eval_loop_inner(_context_stack, %{max_cycles: max_cycles} = state, %{cycles: cycles})
@@ -2599,7 +2730,7 @@ defmodule Gizmo.CLI do
     {:ok, _} = Gizmo.Supervision.start_link()
 
     # Test 1: All well-known services are registered
-    failures = Enum.reduce(["blackboard", "bash", "human", "human_input", "exception", "reaper"], failures, fn svc, acc ->
+    failures = Enum.reduce(["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog"], failures, fn svc, acc ->
       acc ++ assert_eq("supervised service '#{svc}' registered",
         elem(Gizmo.Mailbox.lookup(svc), 0), :ok)
     end)
@@ -3260,7 +3391,7 @@ defmodule Gizmo.CLI do
     {:ok, agent_mb, agent_pid} = Gizmo.Agent.start(frames, run_opts)
 
     if watchdog_ms do
-      Gizmo.Services.Watchdog.start_link({agent_mb, watchdog_ms})
+      Gizmo.Mailbox.route("watchdog", {agent_mb, "every #{watchdog_ms}"})
     end
 
     ref = Process.monitor(agent_pid)

@@ -343,6 +343,117 @@ results back. The parent sleeps until the child's message arrives as
 crashes instead of completing normally — the watcher sends a death
 notification that the trap intercepts.
 
+### Grind child with receive (two-cycle roll)
+
+For a child that needs to call a service (like `bash`) and use the result
+autonomously in a tight loop, use the **two-cycle roll** pattern. The child
+runs in grind mode and uses `receive` to block for the service response,
+but reports the result on the *next* cycle — because interpolation runs
+before ops execute, so a binding from `receive` isn't available in the
+same cycle's ops.
+
+```
+@@roller
+You are the roller child. You autonomously roll random numbers in a
+tight loop (grind mode — you cycle continuously without waiting for
+messages between cycles).
+
+EVERY cycle, do ALL of these steps in order:
+1. If ${roll} is in your bindings: send "rolled:${roll}" to ${_parent}
+   and send "Child: I rolled ${roll}" to 'human'.
+2. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+3. Issue receive("roll") to block until bash responds.
+4. Return frames: ["@0"].
+
+On the first cycle ${roll} is not yet bound, so skip step 1.
+On every subsequent cycle ${roll} holds the previous bash result.
+@@end
+```
+
+Cycle 1 (no `${roll}`): Skip report. Send to bash, receive blocks,
+`roll` gets bound. Return `@0`.
+
+Cycle 2 (`${roll}` = "3"): Report "rolled:3" to parent. Send to bash,
+receive blocks, `roll` gets overwritten with new value. Return `@0`.
+
+Cycle 3+: Same as cycle 2 — report previous roll, start next roll.
+
+The key insight: `receive("roll")` in cycle N updates the binding, and
+`${roll}` in cycle N+1's ops is interpolated with that value *before*
+the new receive executes. So the child always reports the *previous*
+roll and starts the *next* one in the same cycle.
+
+Spawn the child with `"grind": true`:
+
+```json
+{"op": "spawn", "frames": ["@roller"], "dest": "child", "grind": true}
+```
+
+No `idle` needed — the child loops via `@0` and never returns empty
+frames.
+
+### Idle child with trap (parent-driven ping-pong)
+
+An alternative to the grind+receive pattern: the child runs in
+message-driven mode with `idle: true` and the parent drives each roll
+by sending `"roll"` messages. The parent uses a `trap` for child death
+handling instead of checking `child_died:` in every section.
+
+**Child (message-driven, idle):**
+
+```
+@@roller
+You are the roller child. You roll random numbers when asked.
+A message arrived as ${_msg} from ${_msg_source}.
+
+If ${_msg} is "init" or "roll":
+  1. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+  2. Return frames: ["@0"] to wait for the bash result.
+
+Otherwise (${_msg} is a bash result — a number):
+  1. Send "rolled:${_msg}" to ${_parent}.
+  2. Send "Child: I rolled ${_msg}" to 'human'.
+  3. Return frames: [] to go idle and wait for the next "roll" message.
+@@end
+```
+
+The child handles two message types: commands (`"init"`, `"roll"`) and
+bash results (numbers). On a command, it sends to bash and returns
+`["@0"]` to wait for the response. On a bash result, it reports to the
+parent and returns `[]` — idle mode restores the boot frame and the
+child sleeps until the parent sends `"roll"`.
+
+Spawn the child with `"idle": true`:
+
+```json
+{"op": "spawn", "frames": ["@roller"], "dest": "child", "idle": true}
+```
+
+**Parent (trap for death handling):**
+
+The parent registers a trap on spawn:
+
+```json
+{"op": "trap", "pattern": "^child_died:", "frames": ["@death-handler"]}
+```
+
+When `child_died:` arrives, the trap fires regardless of which frame
+the parent is in. The handler frames are prepended to the context stack
+and execute immediately. No need to check for `child_died:` in every
+section.
+
+**Key differences from grind+receive:**
+
+| | Grind + receive | Idle + trap |
+|---|---|---|
+| Child loop | grind mode, `receive` op | message-driven, `_msg` |
+| Child pacing | autonomous hot loop | parent-driven via "roll" |
+| Child death | explicit check in each section | trap fires anywhere |
+| Stale messages | child runs ahead, parent drains | none — clean ping-pong |
+
+The idle+trap pattern is simpler when you want tight parent control
+over the child's pacing and don't want to handle stale messages.
+
 ## Common pitfalls
 
 ### 1. Using `${_msg}` to reference a response that hasn't arrived yet
@@ -436,7 +547,45 @@ The `receive` op exists for grind-mode agents (`--grind`) that need to
 explicitly block mid-cycle. In the default message-driven mode, all
 responses arrive as `${_msg}` between cycles.
 
-### 7. Issuing too many ops in one cycle
+### 7. Using a `receive` result in the same cycle's ops or frames
+
+**Wrong:**
+```json
+{
+  "ops": [
+    {"op": "send", "mailbox": "bash", "msg": "shuf -i 1-6 -n 1"},
+    {"op": "receive", "dest": "roll"},
+    {"op": "send", "mailbox": "human", "msg": "You rolled ${roll}"}
+  ],
+  "frames": ["Report ${roll} to parent."],
+  "notes": {}
+}
+```
+
+Interpolation runs *before* ops execute. `${roll}` is resolved against
+the bindings from *before* this cycle's ops run — the `receive` hasn't
+happened yet. So `${roll}` is either unresolved (literal `${roll}`) or
+stale (from a previous cycle).
+
+**Right:** Use the two-cycle pattern. Receive on cycle N, use the binding
+on cycle N+1:
+
+```json
+{
+  "ops": [
+    {"op": "send", "mailbox": "bash", "msg": "shuf -i 1-6 -n 1"},
+    {"op": "receive", "dest": "roll"}
+  ],
+  "frames": ["@0"],
+  "notes": {}
+}
+```
+
+On the next cycle, `${roll}` is in the bindings and available for
+interpolation. See the "Grind child with receive" pattern for a
+complete example.
+
+### 8. Issuing too many ops in one cycle
 
 Each cycle should do one logical step. Don't pre-issue ops for future steps.
 For example, don't send to `bash` and then immediately try to forward the
@@ -484,6 +633,38 @@ on the next cycle.
 
 Both comma-separated and space-separated formats are accepted. Braces are
 optional.
+
+### watchdog
+
+Timer service. Send string commands to the `"watchdog"` mailbox. Ticks
+arrive as `"watchdog:tick"` from source `"watchdog"`.
+
+| Command | Behavior |
+|---|---|
+| `"every <ms>"` | Periodic ticks every `<ms>` milliseconds |
+| `"after <ms>"` | Single tick after `<ms>` milliseconds |
+| `"cancel"` | Cancel all timers for the sender |
+| `"list"` | List active timers (reply: `"every:5000, after:3000"` or `"none"`) |
+
+All commands are fire-and-forget except `list`, which sends a reply.
+Multiple timers stack — an agent can have several `every` and `after`
+timers simultaneously.
+
+```json
+{"op": "send", "mailbox": "watchdog", "msg": "every 5000"}
+```
+
+To use a one-shot delayed tick:
+
+```json
+{"op": "send", "mailbox": "watchdog", "msg": "after 3000"}
+```
+
+To cancel all your timers:
+
+```json
+{"op": "send", "mailbox": "watchdog", "msg": "cancel"}
+```
 
 ## CLI flags
 

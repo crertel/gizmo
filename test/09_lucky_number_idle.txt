@@ -1,0 +1,73 @@
+You are a supervisor running a number-guessing game. You spawn a child
+that rolls random numbers on a timer. The child registers itself with
+the watchdog service for periodic ticks and rolls autonomously — you
+do not send it any messages. You use a trap to handle child death from
+anywhere in your frame stack.
+
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+This is the first cycle (${_msg} is "init").
+
+@@roller
+You are the roller child. You roll random numbers on a watchdog timer.
+You are message-driven with idle enabled — you sleep between rolls,
+waking only when a message arrives.
+
+A message arrived as ${_msg} from ${_msg_source}.
+
+If ${_msg} is "init":
+  1. Send "every 2000" to 'watchdog' to start periodic ticks.
+  2. Return frames: [] to go idle and wait for the first tick.
+
+If ${_msg_source} is "watchdog":
+  1. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+  2. Return frames: ["@1"] to switch to the wait-roll state.
+
+If ${_msg_source} is "bash" (shouldn't happen in this state):
+  Return frames: [] to go idle.
+@@end
+
+@@wait-roll
+You sent a bash command last cycle and are waiting for the result.
+A message arrived as ${_msg} from ${_msg_source}.
+
+If ${_msg_source} is "bash":
+  1. Send "rolled:${_msg}" to ${_parent}.
+  2. Send "Child: I rolled ${_msg}" to 'human'.
+  3. Return frames: [] to go idle and wait for the next tick.
+
+If ${_msg_source} is "watchdog":
+  Ignore this tick — still waiting for bash. Return frames: ["@0"].
+
+Otherwise: return frames: ["@0"].
+Do NOT issue a receive op.
+@@end
+
+@@check-roll
+A message arrived as ${_msg} from ${_msg_source}.
+
+If ${_msg} starts with "rolled:":
+  Send "Parent: child ${_msg}" to 'human'.
+  Extract the number after "rolled:" and trim whitespace.
+  If the number is "1":
+    Send ${child} to 'reaper' to kill the child.
+  Return frames: ["@check-roll"].
+
+Otherwise: return frames: ["@check-roll"].
+Do NOT issue a receive op.
+@@end
+
+@@death-handler
+The child died. The death notification arrived as ${_interrupt}.
+Send "Parent: child was reaped! ${_interrupt}" to 'human'.
+Terminate with empty frames [].
+Do NOT issue a receive op.
+@@end
+
+Step 1:
+1. Send "Parent: spawning roller child..." to 'human'.
+2. Spawn a child with:
+   - frames: ["@roller", "@wait-roll"]
+   - dest: "child"
+   - "idle": true   ← IMPORTANT: the child must idle, not terminate, on empty frames
+3. Register a trap: pattern "^child_died:", frames ["@death-handler"].
+4. Return frames: ["@check-roll"].

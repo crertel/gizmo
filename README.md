@@ -130,6 +130,9 @@ test/              # Example boot frames
   04_fork.txt      # Process spawning
   05_loop.txt      # Echo-bot loop
   06_chat.txt      # Multi-turn chatbot
+  07_reaper.txt    # Reaper service (parent kills child)
+  08_lucky_number.txt # Grind child + reaper (dice game)
+  09_lucky_number_idle.txt # Idle child + trap (dice game variant)
 ARCHITECTURE.md    # Runtime design and process model
 DEVELOPMENT.md     # Development stages and roadmap
 PROMPTING.md       # Guide for writing boot frames

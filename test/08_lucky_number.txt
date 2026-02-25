@@ -1,51 +1,56 @@
 You are a supervisor running a number-guessing game. You spawn a child
-that rolls random numbers. If the child rolls a 1, you kill it via the
-reaper. Otherwise the child keeps rolling.
+that rolls random numbers autonomously. If the child rolls a 1, you
+kill it via the reaper. Otherwise the child keeps rolling on its own.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 This is the first cycle (${_msg} is "init").
 
 @@roller
-You are the roller child. Each cycle you roll a number and report it.
+You are the roller child. You autonomously roll random numbers in a
+tight loop (grind mode — you cycle continuously without waiting for
+messages between cycles).
 
-1. Send 'shuf -i 1-10 -n 1' to 'bash'.
-2. Receive the bash result into ${result}.
-3. Send "rolled:${result}" to ${_parent}.
-4. Send "Child: I rolled ${result}" to 'human'.
-Return frames: [].
+EVERY cycle, do ALL of these steps in order:
+1. If ${roll} is in your bindings: send "rolled:${roll}" to ${_parent}
+   and send "Child: I rolled ${roll}" to 'human'.
+2. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+3. Issue receive("roll") to block until bash responds.
+4. Return frames: ["@0"].
+
+On the first cycle ${roll} is not yet bound, so skip step 1.
+On every subsequent cycle ${roll} holds the previous bash result.
 @@end
 
 @@check-roll
 A message arrived as ${_msg} from ${_msg_source}.
 
-- If ${_msg} starts with "rolled:": extract the number. Send
-  "Parent: child rolled ${_msg}" to 'human'.
-  If the number after "rolled:" is exactly "1" (trimmed), send ${child}
-  to 'reaper' to kill the child. Return frames: ["@wait-for-death"].
-  Otherwise return frames: ["@check-roll"] to wait for the next roll.
+If ${_msg} starts with "rolled:":
+  Send "Parent: child ${_msg}" to 'human'.
+  Extract the number after "rolled:" and trim whitespace.
+  If the number is "1":
+    Send ${child} to 'reaper' to kill the child.
+    Return frames: ["@wait-for-death"].
+  Otherwise:
+    Return frames: ["@check-roll"].
 
-- If ${_msg} starts with "child_died:": the child was killed.
-  Go to @report.
+If ${_msg} starts with "child_died:":
+  Send "Parent: child died! ${_msg}" to 'human'.
+  Terminate with empty frames [].
 
-Otherwise return frames: ["@check-roll"].
+Otherwise: return frames: ["@check-roll"].
 Do NOT issue a receive op.
 @@end
 
 @@wait-for-death
 The reaper was asked to kill the child. A message arrived as ${_msg}.
-- If ${_msg} starts with "child_died:": go to @report.
-- Otherwise: return frames: ["@wait-for-death"].
-Do NOT issue a receive op.
-@@end
-
-@@report
-The child rolled a 1 and was killed. Send "Parent: unlucky! Child rolled
-a 1 and was reaped. Death notice: ${_msg}" to 'human'. Terminate with
-empty frames [].
+If ${_msg} starts with "child_died:":
+  Send "Parent: child was reaped! ${_msg}" to 'human'.
+  Terminate with empty frames [].
+Otherwise: return frames: ["@wait-for-death"].
 Do NOT issue a receive op.
 @@end
 
 Step 1:
 1. Send "Parent: spawning roller child..." to 'human'.
-2. Spawn a child with frames: ["@roller"], dest "child", "grind": true, "idle": true.
-3. Return frames: ["@check-roll"]
+2. Spawn a child with frames: ["@roller"], dest "child", "grind": true.
+3. Return frames: ["@check-roll"].

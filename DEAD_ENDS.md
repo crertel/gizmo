@@ -358,3 +358,36 @@ producing garbled output like `echo-bot> echo-bot: you said: hello`.
 Combine output and prompt into a single send to `human_input`, separated by a
 newline. Since `human_input` is one GenServer, it processes sequentially: print
 the combined text, then block on `IO.gets`. Output ordering is guaranteed.
+
+## Same-Cycle Receive + Interpolation in Grind Mode
+
+**Discovered:** Stage 13 (test frame 08_lucky_number.txt)
+
+A grind-mode child that sent to `bash`, issued `receive("result")`, and then
+used `${result}` in subsequent ops in the *same* cycle — expecting the receive
+to bind `result` before the sends ran.
+
+### Why it didn't work
+
+Interpolation runs *before* ops execute. All `${name}` references in the cycle's
+ops and frames are resolved against bindings from *before* any ops run. The
+`receive` op updates bindings during execution, but the sends were already
+interpolated with the pre-execution bindings. So `${result}` was either
+unresolved (literal `${result}`) or stale.
+
+Combined with idle mode, this produced a second failure mode: idle restore
+resets bindings to `init_bindings` (only `_self`, `_parent`). In grind mode
+(non-first cycle), `maybe_wait_for_message` doesn't re-bind `_msg`. So
+`${_msg}` was also unresolved on post-idle cycles, producing literal `${_msg}`
+in output.
+
+### What replaced it
+
+The **two-cycle roll** pattern. Cycle N does `send(bash)` + `receive("roll")`
+and returns `@0`. Cycle N+1 has `${roll}` in bindings from the previous
+receive, so `${roll}` in ops is interpolated correctly. The child reports the
+previous result and starts the next receive in the same cycle, creating a
+continuous grind loop without idle.
+
+See PROMPTING.md "Grind child with receive (two-cycle roll)" for the full
+pattern.

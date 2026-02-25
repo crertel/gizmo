@@ -187,12 +187,13 @@ Agent lifecycle management via a well-known `reaper` service. Agents can
 force-kill children lower in the supervision hierarchy by sending their
 mailbox ID to the reaper.
 
-- [ ] Store parent mailbox ID in Mailbox Registry value (currently `nil`)
-- [ ] `Gizmo.Services.Reaper` — well-known service that accepts kill requests
-- [ ] Ancestor check: walk parent chain from target to verify caller is ancestor
-- [ ] Kill via `Process.exit(pid, :shutdown)` — triggers existing child death monitor
-- [ ] Parent receives `child_died:` notification as usual (no special case)
-- [ ] Tests: parent kills child, grandparent kills grandchild, sibling rejected
+- [x] Store parent mailbox ID in Mailbox Registry value (`Gizmo.Mailbox.register/2`)
+- [x] `Gizmo.Services.Reaper` — well-known service that accepts kill requests
+- [x] Ancestor check: walk parent chain from target to verify caller is ancestor
+- [x] Kill via `Process.exit(pid, :shutdown)` — triggers existing child death monitor
+- [x] Parent receives `child_died:` notification as usual (no special case)
+- [x] Tests: parent kills child, sibling rejected (smoke tests in `--test`)
+- [x] Test frame: `test/08_lucky_number.txt` — grind child rolls dice, parent reaps on 1
 
 ## Deferred / Future
 
