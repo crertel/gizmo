@@ -85,8 +85,10 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)} #{@dim}────────────────────────────────#{@reset}"
   end
 
-  def timing_line(id, llm_ms, cycle_ms) do
-    "#{agent_tag(id)}   #{@dim}⏱#{@reset} llm=#{llm_ms}ms cycle=#{cycle_ms}ms"
+  def timing_line(id, llm_ms, cycle_ms, run_start) do
+    t_ms = System.monotonic_time(:millisecond) - run_start
+    t_s = Float.round(t_ms / 1000, 1)
+    "#{agent_tag(id)}   #{@dim}⏱#{@reset} llm=#{llm_ms}ms cycle=#{cycle_ms}ms #{@dim}t=#{t_s}s#{@reset}"
   end
 
   def full_prompt(id, system_prompt, user_content) do
@@ -1161,6 +1163,7 @@ defmodule Gizmo.Agent.Wrapper do
     grind = Keyword.get(opts, :grind, false)
     log_timings = Keyword.get(opts, :log_timings, false)
     log_full_prompts = Keyword.get(opts, :log_full_prompts, false)
+    run_start = Keyword.get(opts, :run_start, System.monotonic_time(:millisecond))
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
     Gizmo.Mailbox.register(mailbox_id, parent)
@@ -1184,6 +1187,7 @@ defmodule Gizmo.Agent.Wrapper do
       grind: grind,
       log_timings: log_timings,
       log_full_prompts: log_full_prompts,
+      run_start: run_start,
       msgs_queue: msgs_queue,
       boot_frames: frames
     }
@@ -1610,7 +1614,7 @@ defmodule Gizmo.Agent do
         cycle_ms = System.monotonic_time(:millisecond) - cycle_start
         if state.log_timings do
           Logger.flush()
-          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms))
+          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start))
         end
 
         eval_loop_inner(new_stack, state, %{loop | retries: 0, cycles: cycles + 1, persisted_sections: sections, bindings: new_bindings, binding_notes: new_binding_notes, trap: new_trap})
@@ -1620,7 +1624,7 @@ defmodule Gizmo.Agent do
         cycle_ms = System.monotonic_time(:millisecond) - cycle_start
         if state.log_timings do
           Logger.flush()
-          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms))
+          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start))
         end
 
         Logger.error(Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
@@ -1667,7 +1671,8 @@ defmodule Gizmo.Agent do
       quit_on_exhaust: child_quit_on_exhaust,
       grind: child_grind,
       log_timings: state.log_timings,
-      log_full_prompts: state.log_full_prompts
+      log_full_prompts: state.log_full_prompts,
+      run_start: state.run_start
     )
 
     # Monitor child: on abnormal exit, notify parent mailbox
@@ -1778,7 +1783,7 @@ defmodule Gizmo.CLI do
       --grind             Hot-loop eval (no inter-cycle message wait)
       --watchdog N        Send periodic watchdog:tick messages every N ms
       --boot <file>       Separate boot frame file (used for idle recovery)
-      --log-timings       Show LLM and cycle timing per eval cycle
+      --log-timings       Show LLM call, cycle, and wall-clock timing per eval cycle
       --log-full-prompts  Show full system prompt and user message each cycle
 
     Positional arguments:
@@ -3445,7 +3450,7 @@ defmodule Gizmo.CLI do
 
     Logger.warning("Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}...")
 
-    run_opts = []
+    run_opts = [run_start: System.monotonic_time(:millisecond)]
     run_opts = if thinking do
       chat_fn = fn system, messages, chat_opts ->
         Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))

@@ -682,7 +682,7 @@ To cancel all your timers:
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
 | `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
-| `--log-timings` | Show LLM and cycle timing per eval cycle |
+| `--log-timings` | Show LLM call, cycle, and wall-clock timing per eval cycle |
 | `--log-full-prompts` | Show full system prompt and user message each cycle |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
