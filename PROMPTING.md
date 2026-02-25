@@ -684,6 +684,8 @@ To cancel all your timers:
 | `--watchdog <ms>` | Periodic tick messages at given interval |
 | `--log-timings` | Show LLM call, cycle, and wall-clock timing per eval cycle |
 | `--log-full-prompts` | Show full system prompt and user message each cycle |
+| `--trace` | Emit NDJSON trace to stderr (silences logger) |
+| `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
 responding. This can help with complex multi-step tasks where the LLM needs
@@ -715,4 +717,144 @@ elixir gizmo.exs --boot sys.txt task.txt
 ```
 
 This lets you reuse a generic boot frame (with sections, idle behavior, etc.)
+
+### `--trace` and `--trace-file`
+
+Trace mode emits one JSON object per line (NDJSON) with full cycle data for
+every agent. This is the machine-readable alternative to `-v` / `--log-timings`
+and is intended for post-run analysis, visualization, and debugging.
+
+Either flag silences Logger output so only the JSON stream and stdout human
+messages appear. Both flags can be used together (trace goes to both stderr
+and file).
+
+```bash
+# Trace to stderr
+elixir gizmo.exs --trace task.txt
+
+# Trace to a file
+elixir gizmo.exs --trace-file trace.jsonl task.txt
+
+# Both (stderr + file)
+elixir gizmo.exs --trace --trace-file trace.jsonl task.txt
+```
+
+#### Piping trace to jq
+
+Since `--trace` writes to stderr, swap file descriptors to pipe into `jq`:
+
+```bash
+elixir gizmo.exs --trace task.txt 3>&1 1>&2 2>&3 | jq .
+```
+
+This sends trace (stderr) into the pipe and human output (stdout) to the
+terminal.
+
+To discard human output entirely:
+
+```bash
+elixir gizmo.exs --trace task.txt 2>&1 >/dev/null | jq .
+```
+
+With `--trace-file`, inspect after the run:
+
+```bash
+elixir gizmo.exs --trace-file trace.jsonl task.txt
+jq . trace.jsonl
+```
+
+Or stream live in another terminal:
+
+```bash
+tail -f trace.jsonl | jq .
+```
+
+#### Event types
+
+Three event types are emitted:
+
+**`agent_start`** — emitted when an agent registers its mailbox.
+
+```json
+{"event":"agent_start","agent":"agent_1","parent":null,"t_ms":42}
+```
+
+**`agent_stop`** — emitted when an agent is about to clean up.
+
+```json
+{"event":"agent_stop","agent":"agent_1","t_ms":15230}
+```
+
+**`cycle`** — emitted after each eval cycle completes. Contains the full
+system prompt, user message, interpolated ops, resulting frames, bindings,
+and notes. On LLM error, `ops`/`frames`/`bindings`/`notes` are null and
+`error` contains the stringified reason.
+
+```json
+{
+  "event": "cycle",
+  "agent": "agent_1",
+  "cycle": 1,
+  "llm_ms": 2435,
+  "cycle_ms": 2436,
+  "t_ms": 2436,
+  "system_prompt": "...",
+  "user_content": "Begin.\n\nCurrent bindings:\n...",
+  "ops": [{"op":"send","mailbox":"human","msg":"Hello!"}],
+  "frames": ["..."],
+  "bindings": {"_self":"agent_1","_msg":"init"},
+  "notes": {},
+  "error": null
+}
+```
+
+#### Useful jq recipes
+
+Compact one-line-per-event summary:
+
+```bash
+jq -r '
+  if .event == "cycle" then
+    "\(.agent) cycle=\(.cycle) llm=\(.llm_ms)ms ops=\(.ops | length) frames=\(.frames | length)"
+  elif .event == "agent_start" then
+    "\(.agent) START parent=\(.parent)"
+  elif .event == "agent_stop" then
+    "\(.agent) STOP t=\(.t_ms)ms"
+  else . | tostring
+  end
+' trace.jsonl
+```
+
+Full JSON but truncate prompts:
+
+```bash
+jq '
+  if .system_prompt then .system_prompt = (.system_prompt[:80] + "…") else . end |
+  if .user_content then .user_content = (.user_content[:80] + "…") else . end
+' trace.jsonl
+```
+
+Drop prompts entirely:
+
+```bash
+jq 'del(.system_prompt, .user_content)' trace.jsonl
+```
+
+Filter to a single agent in a multi-agent run:
+
+```bash
+jq 'select(.agent == "agent_1")' trace.jsonl
+```
+
+Show only error cycles:
+
+```bash
+jq 'select(.error != null)' trace.jsonl
+```
+
+Total LLM time across all cycles:
+
+```bash
+jq -s '[.[] | select(.event == "cycle") | .llm_ms] | add' trace.jsonl
+```
 across different task files.
