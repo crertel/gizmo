@@ -682,8 +682,9 @@ To cancel all your timers:
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
 | `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
-| `--log-timings` | Show LLM call, cycle, and wall-clock timing per eval cycle |
+| `--log-timings` | Show LLM call, cycle, wall-clock timing, and cache stats per eval cycle |
 | `--log-full-prompts` | Show full system prompt and user message each cycle |
+| `--runtime <file>` | Use custom runtime preamble instead of built-in |
 | `--trace` | Emit NDJSON trace to stderr (silences logger) |
 | `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
 
@@ -787,8 +788,8 @@ Three event types are emitted:
 
 **`cycle`** — emitted after each eval cycle completes. Contains the full
 system prompt, user message, interpolated ops, resulting frames, bindings,
-and notes. On LLM error, `ops`/`frames`/`bindings`/`notes` are null and
-`error` contains the stringified reason.
+notes, and token usage. On LLM error, `ops`/`frames`/`bindings`/`notes`/`usage`
+are null and `error` contains the stringified reason.
 
 ```json
 {
@@ -804,9 +805,15 @@ and notes. On LLM error, `ops`/`frames`/`bindings`/`notes` are null and
   "frames": ["..."],
   "bindings": {"_self":"agent_1","_msg":"init"},
   "notes": {},
+  "usage": {"input_tokens":1234,"output_tokens":567,"cache_creation_input_tokens":1234,"cache_read_input_tokens":0},
   "error": null
 }
 ```
+
+The `usage` field is populated for Anthropic API calls and `null` for OpenAI.
+`cache_creation_input_tokens` and `cache_read_input_tokens` reflect prompt
+caching behavior — on the first call you'll see creation tokens, and subsequent
+calls with the same prefix will show read tokens instead.
 
 #### Useful jq recipes
 
@@ -856,5 +863,16 @@ Total LLM time across all cycles:
 
 ```bash
 jq -s '[.[] | select(.event == "cycle") | .llm_ms] | add' trace.jsonl
+```
+
+Cache hit ratio across all cycles:
+
+```bash
+jq -s '
+  [.[] | select(.event == "cycle" and .usage != null) | .usage] |
+  { total_input: (map(.input_tokens) | add),
+    cache_read: (map(.cache_read_input_tokens) | add),
+    cache_create: (map(.cache_creation_input_tokens) | add) }
+' trace.jsonl
 ```
 across different task files.

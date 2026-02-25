@@ -96,11 +96,21 @@ defmodule Gizmo.Format do
     "#{agent_tag(id)} #{@dim}────────────────────────────────#{@reset}"
   end
 
-  def timing_line(id, llm_ms, cycle_ms, run_start) do
+  def timing_line(id, llm_ms, cycle_ms, run_start, usage \\ nil) do
     t_ms = System.monotonic_time(:millisecond) - run_start
     t_s = Float.round(t_ms / 1000, 1)
 
-    "#{agent_tag(id)}   #{@dim}⏱#{@reset} llm=#{llm_ms}ms cycle=#{cycle_ms}ms #{@dim}t=#{t_s}s#{@reset}"
+    base =
+      "#{agent_tag(id)}   #{@dim}⏱#{@reset} llm=#{llm_ms}ms cycle=#{cycle_ms}ms #{@dim}t=#{t_s}s#{@reset}"
+
+    case usage do
+      %{cache_read_input_tokens: read, cache_creation_input_tokens: create}
+      when is_integer(read) or is_integer(create) ->
+        base <> " #{@dim}cache:#{@reset} read=#{read || 0} create=#{create || 0}"
+
+      _ ->
+        base
+    end
   end
 
   def full_prompt(id, system_prompt, user_content) do
@@ -165,7 +175,9 @@ defmodule Gizmo.LLM do
 
   @type eval_response :: %{ops: [op()], frames: [String.t()], notes: map()}
 
-  @callback chat(system :: String.t(), messages :: list(), opts :: keyword()) ::
+  @type system_prompt :: String.t() | [{String.t(), :cached | :uncached}]
+
+  @callback chat(system :: system_prompt(), messages :: list(), opts :: keyword()) ::
               {:ok, eval_response()} | {:error, term()}
 
   @eval_tool %{
@@ -346,7 +358,7 @@ defmodule Gizmo.LLM do
   Takes an eval_response, bindings map, and optional sections map.
   Notes are passed through unchanged.
   """
-  def interpolate_response(%{ops: ops, frames: frames, notes: notes}, bindings, sections \\ %{}) do
+  def interpolate_response(%{ops: ops, frames: frames, notes: notes} = response, bindings, sections \\ %{}) do
     interpolated_frames =
       Enum.map(frames, &Gizmo.Interpolation.resolve(&1, bindings, sections))
 
@@ -368,7 +380,8 @@ defmodule Gizmo.LLM do
           other
       end)
 
-    %{ops: interpolated_ops, frames: interpolated_frames, notes: notes}
+    usage = Map.get(response, :usage)
+    %{ops: interpolated_ops, frames: interpolated_frames, notes: notes, usage: usage}
   end
 end
 
@@ -430,7 +443,7 @@ defmodule Gizmo.LLM.Anthropic do
     body = %{
       model: model,
       max_tokens: max_tokens,
-      system: system,
+      system: format_system(system),
       messages: messages,
       tools: [Gizmo.LLM.eval_tool()],
       tool_choice: if(thinking, do: %{type: "any"}, else: %{type: "tool", name: "eval_response"})
@@ -465,14 +478,55 @@ defmodule Gizmo.LLM.Anthropic do
     end)
   end
 
+  defp format_system(system) when is_binary(system), do: system
+
+  defp format_system(parts) when is_list(parts) do
+    parts
+    |> Enum.reject(fn {text, _} -> text == "" end)
+    |> Enum.map(fn
+      {text, :cached} -> %{type: "text", text: text, cache_control: %{type: "ephemeral"}}
+      {text, :uncached} -> %{type: "text", text: text}
+    end)
+  end
+
+  defp extract_eval_response(%{"content" => content, "usage" => usage}) do
+    case Enum.find(content, &(&1["type"] == "tool_use" && &1["name"] == "eval_response")) do
+      %{"input" => input} ->
+        case Gizmo.LLM.normalize_eval(input) do
+          {:ok, response} -> {:ok, Map.put(response, :usage, normalize_usage(usage))}
+          error -> error
+        end
+
+      nil ->
+        {:error, :no_eval_response}
+    end
+  end
+
   defp extract_eval_response(%{"content" => content}) do
     case Enum.find(content, &(&1["type"] == "tool_use" && &1["name"] == "eval_response")) do
-      %{"input" => input} -> Gizmo.LLM.normalize_eval(input)
-      nil -> {:error, :no_eval_response}
+      %{"input" => input} ->
+        case Gizmo.LLM.normalize_eval(input) do
+          {:ok, response} -> {:ok, Map.put(response, :usage, nil)}
+          error -> error
+        end
+
+      nil ->
+        {:error, :no_eval_response}
     end
   end
 
   defp extract_eval_response(_), do: {:error, :unexpected_response_shape}
+
+  defp normalize_usage(usage) when is_map(usage) do
+    %{
+      input_tokens: usage["input_tokens"],
+      output_tokens: usage["output_tokens"],
+      cache_creation_input_tokens: usage["cache_creation_input_tokens"],
+      cache_read_input_tokens: usage["cache_read_input_tokens"]
+    }
+  end
+
+  defp normalize_usage(_), do: nil
 end
 
 # -----------------------------------------------------------------------------
@@ -493,7 +547,8 @@ defmodule Gizmo.LLM.OpenAI do
 
     eval_schema = Gizmo.LLM.eval_tool().input_schema
 
-    all_messages = [%{role: "system", content: system} | messages]
+    system_text = flatten_system(system)
+    all_messages = [%{role: "system", content: system_text} | messages]
 
     body = %{
       model: model,
@@ -527,6 +582,12 @@ defmodule Gizmo.LLM.OpenAI do
     end)
   end
 
+  defp flatten_system(system) when is_binary(system), do: system
+
+  defp flatten_system(parts) when is_list(parts) do
+    Enum.map_join(parts, "\n\n---\n\n", fn {text, _} -> text end)
+  end
+
   defp extract_eval_response(%{"choices" => [%{"message" => message} | _]}) do
     content = message["content"]
 
@@ -537,7 +598,14 @@ defmodule Gizmo.LLM.OpenAI do
         true -> nil
       end
 
-    if parsed, do: Gizmo.LLM.normalize_eval(parsed), else: {:error, :unexpected_response_shape}
+    case parsed do
+      nil -> {:error, :unexpected_response_shape}
+      _ ->
+        case Gizmo.LLM.normalize_eval(parsed) do
+          {:ok, response} -> {:ok, Map.put(response, :usage, nil)}
+          error -> error
+        end
+    end
   end
 
   defp extract_eval_response(_), do: {:error, :unexpected_response_shape}
@@ -1223,6 +1291,7 @@ defmodule Gizmo.Agent.Wrapper do
     log_full_prompts = Keyword.get(opts, :log_full_prompts, false)
     run_start = Keyword.get(opts, :run_start, System.monotonic_time(:millisecond))
     trace_outputs = Keyword.get(opts, :trace_outputs, nil)
+    runtime_preamble = Keyword.get(opts, :runtime_preamble, Gizmo.Agent.runtime_prompt())
 
     mailbox_id = Gizmo.Mailbox.generate_id("agent")
     Gizmo.Mailbox.register(mailbox_id, parent)
@@ -1249,7 +1318,8 @@ defmodule Gizmo.Agent.Wrapper do
       run_start: run_start,
       msgs_queue: msgs_queue,
       boot_frames: frames,
-      trace_outputs: trace_outputs
+      trace_outputs: trace_outputs,
+      runtime_preamble: runtime_preamble
     }
 
     Gizmo.Trace.emit(trace_outputs, %{
@@ -1693,7 +1763,20 @@ defmodule Gizmo.Agent do
     {bindings, binding_notes, context_stack} =
       maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
 
-    system_prompt = runtime_prompt() <> "\n\n---\n\n" <> Enum.join(context_stack, "\n\n---\n\n")
+    # Build structured system prompt for caching
+    boot_text = Enum.join(state.boot_frames, "\n\n---\n\n")
+    frames_text = Enum.join(context_stack, "\n\n---\n\n")
+
+    system_parts =
+      if context_stack == state.boot_frames do
+        [{state.runtime_preamble, :cached}, {frames_text, :cached}]
+      else
+        [{state.runtime_preamble, :cached}, {boot_text, :cached}, {frames_text, :uncached}]
+      end
+
+    # Flat string for logging and trace
+    system_prompt = Enum.map_join(system_parts, "\n\n---\n\n", fn {text, _} -> text end)
+
     # Merge: current frame sections override persisted, but old ones survive
     current_sections = Gizmo.Interpolation.extract_sections(context_stack)
     sections = Map.merge(persisted_sections, current_sections)
@@ -1730,7 +1813,7 @@ defmodule Gizmo.Agent do
     cycle_start = System.monotonic_time(:millisecond)
     llm_start = System.monotonic_time(:millisecond)
 
-    case state.chat_fn.(system_prompt, [%{role: "user", content: user_content}], []) do
+    case state.chat_fn.(system_parts, [%{role: "user", content: user_content}], []) do
       {:ok, response} ->
         llm_ms = System.monotonic_time(:millisecond) - llm_start
 
@@ -1768,7 +1851,11 @@ defmodule Gizmo.Agent do
 
         if state.log_timings do
           Logger.flush()
-          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start))
+
+          IO.puts(
+            :stderr,
+            Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start, interpolated.usage)
+          )
         end
 
         Gizmo.Trace.emit(state.trace_outputs, %{
@@ -1784,6 +1871,7 @@ defmodule Gizmo.Agent do
           frames: interpolated.frames,
           bindings: new_bindings,
           notes: interpolated.notes,
+          usage: interpolated.usage,
           error: nil
         })
 
@@ -1819,6 +1907,7 @@ defmodule Gizmo.Agent do
           frames: nil,
           bindings: nil,
           notes: nil,
+          usage: nil,
           error: inspect(reason)
         })
 
@@ -1890,7 +1979,8 @@ defmodule Gizmo.Agent do
         log_timings: state.log_timings,
         log_full_prompts: state.log_full_prompts,
         run_start: state.run_start,
-        trace_outputs: state.trace_outputs
+        trace_outputs: state.trace_outputs,
+        runtime_preamble: state.runtime_preamble
       )
 
     # Monitor child: on abnormal exit, notify parent mailbox
@@ -1952,7 +2042,8 @@ defmodule Gizmo.CLI do
           log_timings: :boolean,
           log_full_prompts: :boolean,
           trace: :boolean,
-          trace_file: :string
+          trace_file: :string,
+          runtime: :string
         ],
         aliases: [v: :verbose]
       )
@@ -2013,6 +2104,7 @@ defmodule Gizmo.CLI do
       --boot <file>       Separate boot frame file (used for idle recovery)
       --log-timings       Show LLM call, cycle, and wall-clock timing per eval cycle
       --log-full-prompts  Show full system prompt and user message each cycle
+      --runtime <file>     Use custom runtime preamble instead of built-in
       --trace             Emit NDJSON trace to stderr (silences logger)
       --trace-file <file> Emit NDJSON trace to file (silences logger)
 
@@ -2063,6 +2155,13 @@ defmodule Gizmo.CLI do
     The Gizmo runtime reference (syscalls, interpolation, mailboxes) is
     appended automatically below your frame — you don't need to include it.
     """
+  end
+
+  # Flatten system_parts (list of {text, tag} tuples) to a plain string for test assertions
+  defp flatten_system_for_test(system) when is_binary(system), do: system
+
+  defp flatten_system_for_test(parts) when is_list(parts) do
+    Enum.map_join(parts, "\n\n---\n\n", fn {text, _} -> text end)
   end
 
   def run_tests do
@@ -2959,14 +3058,16 @@ defmodule Gizmo.CLI do
     {:ok, spawn_result_agent} = spawn_captured_result
 
     combined_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
+
       cond do
         # Child: system contains "child frame" — send result to parent and terminate
-        String.contains?(system, "child frame") ->
+        String.contains?(sys, "child frame") ->
           {:ok, %{ops: [{:send, "${_parent}", "result from child"}], frames: [], notes: %{}}}
 
         # Parent cycle 1+: system contains "parent waiting" — capture and exit
-        String.contains?(system, "parent waiting") ->
-          Agent.update(spawn_result_agent, fn _ -> system end)
+        String.contains?(sys, "parent waiting") ->
+          Agent.update(spawn_result_agent, fn _ -> sys end)
           {:ok, %{ops: [], frames: [], notes: %{}}}
 
         # Parent cycle 0: spawn a child, then receive
@@ -3014,11 +3115,12 @@ defmodule Gizmo.CLI do
     concat_cycle = :counters.new(1, [:atomics])
 
     concat_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
       c = :counters.get(concat_cycle, 1)
       :counters.add(concat_cycle, 1, 1)
 
       if c == 0 do
-        Agent.update(concat_agent, fn _ -> system end)
+        Agent.update(concat_agent, fn _ -> sys end)
         {:ok, %{ops: [], frames: [], notes: %{}}}
       else
         {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -3219,6 +3321,7 @@ defmodule Gizmo.CLI do
     child_death_cycle = :counters.new(1, [:atomics])
 
     child_death_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
       c = :counters.get(child_death_cycle, 1)
       :counters.add(child_death_cycle, 1, 1)
 
@@ -3233,7 +3336,7 @@ defmodule Gizmo.CLI do
            }}
 
         # Child: always raises
-        String.contains?(system, "crash frame") ->
+        String.contains?(sys, "crash frame") ->
           raise "deliberate child crash"
 
         # Parent cycle 1: got death notification in ${death_msg}, exit cleanly
@@ -3901,8 +4004,9 @@ defmodule Gizmo.CLI do
     reaper_parent_cycle = :counters.new(1, [:atomics])
 
     reaper_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
       # Child: just idle (message-driven, will sleep waiting for messages)
-      if String.contains?(system, "reaper child frame") do
+      if String.contains?(sys, "reaper child frame") do
         {:ok, %{ops: [], frames: ["reaper child frame"], notes: %{}}}
       else
         c = :counters.get(reaper_parent_cycle, 1)
@@ -4042,7 +4146,9 @@ defmodule Gizmo.CLI do
     spawn_opts_child_cycle = :counters.new(1, [:atomics])
 
     spawn_opts_chat_fn = fn system, _messages, _opts ->
-      if String.contains?(system, "msg-child") do
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "msg-child") do
         child_c = :counters.get(spawn_opts_child_cycle, 1)
         :counters.add(spawn_opts_child_cycle, 1, 1)
 
@@ -4112,7 +4218,9 @@ defmodule Gizmo.CLI do
     spawn_opts_cycle2 = :counters.new(1, [:atomics])
 
     spawn_opts_chat_fn2 = fn system, _messages, _opts ->
-      if String.contains?(system, "grind-child") do
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "grind-child") do
         # Child: grind mode, sends result and exits immediately
         {:ok, %{ops: [{:send, spawn_opts_test_mb2, "grind child done"}], frames: [], notes: %{}}}
       else
@@ -4346,6 +4454,21 @@ defmodule Gizmo.CLI do
 
     run_opts =
       if trace_outputs, do: Keyword.put(run_opts, :trace_outputs, trace_outputs), else: run_opts
+
+    run_opts =
+      if opts[:runtime] do
+        runtime_preamble =
+          case File.read(opts[:runtime]) do
+            {:ok, content} -> content
+            {:error, reason} ->
+              IO.puts(:stderr, "Error reading #{opts[:runtime]}: #{:file.format_error(reason)}")
+              System.halt(1)
+          end
+
+        Keyword.put(run_opts, :runtime_preamble, runtime_preamble)
+      else
+        run_opts
+      end
 
     # Signal traps for clean abort
     {:ok, _} =
