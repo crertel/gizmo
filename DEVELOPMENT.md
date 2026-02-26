@@ -121,7 +121,11 @@ Multi-process support.
 - [x] `_self` and `_parent` runtime bindings for agent identity
 - [x] Termination: `send` to `${_parent}` + `frames: []` (no special op)
 - [x] Process.monitor for unexpected child death → notify parent
+- [x] `disown` option: detach child from parent (no `_parent` binding, no death monitor)
+- [x] Cross-lineage messaging: independent agents discover each other via blackboard
 - [x] Test: parent spawns child, child sends result, parent receives (smoke test)
+- [x] Test: disown spawn, cross-lineage messaging (smoke tests)
+- [x] Test frame: `test/10_marketplace.txt` — disowned peers trade via blackboard
 - Note: `fork`/`join` ops removed — see DEAD_ENDS.md
 
 ## Stage 9: Supervision and Error Recovery

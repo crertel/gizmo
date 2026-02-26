@@ -391,3 +391,109 @@ continuous grind loop without idle.
 
 See PROMPTING.md "Grind child with receive (two-cycle roll)" for the full
 pattern.
+
+## Section-Based State Machines in Spawned Children
+
+**Discovered:** Stage 8 (test frame 10_marketplace.txt)
+
+The first marketplace test frame defined child agent phases as separate
+`@@sections` in the parent's boot frame: `@@bank`, `@@bank-wait`,
+`@@bank-handle`, etc. The parent spawned with `frames: ["@bank"]`, which
+resolved to the bank section content. The child then returned
+`frames: ["@bank-wait"]` to transition phases.
+
+### Why it didn't work
+
+- **Children don't inherit parent sections.** When a parent spawns with
+  `frames: ["@bank"]`, the runtime interpolates `@bank` and passes the
+  *resolved plain text* to the child. The child's boot frame is just a
+  string — it has no `@@bank-wait` or `@@bank-handle` section definitions.
+  Those definitions exist only in the parent's persisted sections.
+- **Unresolved references become literal text.** When the child returned
+  `frames: ["@bank-wait"]`, the runtime tried to resolve `@bank-wait`
+  against the child's sections (empty). The frame stayed as the literal
+  string `"@bank-wait"`. The LLM's system prompt on the next cycle was
+  just the runtime preamble + the child's boot text + `"@bank-wait"`.
+- **LLM had no instructions.** Seeing `"@bank-wait"` as its current
+  frame, the LLM had no context for what to do. It returned
+  `frames: ["@bank-wait"]` again without issuing any ops, creating an
+  infinite spin loop in grind mode.
+- **Sections can't be nested.** Even if you tried to include all section
+  definitions inside the child's spawn frame (e.g., `@@bank` containing
+  `@@bank-wait...@@end`), the non-greedy section regex matches the
+  *first* `@@end`, truncating nested content.
+
+### What replaced it
+
+The **binding-conditional single-frame** pattern. Each child's entire
+multi-phase program lives in a single section. The child uses `@0` to
+loop and checks which bindings are present to determine its current phase.
+Bindings accumulate across grind-mode cycles, so the agent progresses
+through phases by acquiring new bindings (via `receive`) each cycle.
+
+See PROMPTING.md "Disowned peers with blackboard discovery" for the full
+pattern.
+
+## Boot Frame Re-Execution on Non-First Cycles
+
+**Discovered:** Stage 8 (test frame 10_marketplace.txt)
+
+The first marketplace test frame had "Step 1: spawn bank and store" as
+plain text at the bottom of the boot frame. On cycle 1, the coordinator
+correctly executed step 1 (spawned children, transitioned to the polling
+frame). On cycle 2, the coordinator spawned two more children.
+
+### Why it didn't work
+
+- **Boot frame is always in the system prompt.** On non-first cycles, the
+  system prompt is `[runtime preamble, boot_text, current_frame_text]`
+  (line 2101 of gizmo.exs). The raw boot frame — including all `@@section`
+  definitions and any plain text — is visible to the LLM every cycle.
+- **Plain-text instructions look like current directives.** The LLM on
+  cycle 2 saw both "Step 1: spawn bank and store" (from boot frame) and
+  the polling frame (from current frame). Despite the polling frame saying
+  to check the blackboard, the LLM also followed the spawn instructions
+  from the boot frame, producing duplicate agents.
+- **Sections are definitions, plain text is imperative.** `@@step1...@@end`
+  in the boot frame reads as a definition the LLM can reference. Bare
+  "Step 1: spawn..." reads as an instruction to execute *now*.
+
+### What replaced it
+
+Two complementary fixes:
+
+1. **Put first-cycle instructions inside a `@@section`.** Instead of bare
+   text at the bottom, wrap step-1 instructions in `@@step1...@@end` and
+   reference them with `@step1`. Section definitions in the boot frame are
+   visible but read as reference material, not imperative instructions.
+2. **Strong anti-re-execution language in continuation frames.** The
+   `@wait-result` frame explicitly says "You already spawned the bank and
+   store. Do NOT spawn any agents. Do NOT issue any ops." This overrides
+   any spawn-related text the LLM sees in the boot frame.
+
+## Checking `${_msg}` in Grind-Mode Children
+
+**Discovered:** Stage 8 (test frame 10_marketplace.txt)
+
+The bank agent ran in grind mode and used `${_msg}` to detect incoming
+balance requests in its `@bank-wait` phase: "If ${_msg} starts with
+balance_request:, extract the sender and respond."
+
+### Why it didn't work
+
+- **`_msg` is NOT re-bound in grind mode after the first cycle.** This is
+  an existing invariant (see "Same-Cycle Receive + Interpolation in Grind
+  Mode" above), but it has a non-obvious consequence for grind children
+  waiting for external messages: `${_msg}` stays as `"init"` forever.
+- **The bank spun without ever seeing the request.** The store sent
+  `"balance_request:agent_5"` to the bank's mailbox, but the bank was in
+  grind mode and never called `receive`. The message sat in the mailbox
+  while the bank checked `${_msg}` (always `"init"`) in a tight loop.
+
+### What replaced it
+
+Grind-mode agents that need to receive external messages must use explicit
+`receive("dest")` ops. The bank-wait phase issues `receive("req")` which
+blocks until a message arrives, then the bank-handle phase checks `${req}`
+(not `${_msg}`). This is the two-cycle roll pattern applied to message
+reception rather than service calls.

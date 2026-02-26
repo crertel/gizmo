@@ -344,6 +344,73 @@ results back. The parent sleeps until the child's message arrives as
 crashes instead of completing normally — the watcher sends a death
 notification that the trap intercepts.
 
+> **Important limitation:** The child receives the *resolved* section
+> content as plain text — it does NOT inherit the parent's other section
+> definitions. If the child returns `["@some-section"]` that was defined
+> in the parent's boot frame, it won't resolve. For children that need
+> multi-phase state machines, use the **binding-conditional single-frame**
+> pattern below instead of section transitions.
+
+### Disowned peers with blackboard discovery
+
+Use `"disown": true` on `spawn` to create a fully independent peer agent:
+no `${_parent}` binding, no death monitor. Disowned agents must discover
+each other through shared services like the blackboard.
+
+Since children can't inherit parent sections (see above), use the
+**binding-conditional single-frame** pattern: put the child's entire
+multi-phase program in one section, use `@0` to loop, and check binding
+presence to determine the current phase.
+
+```
+You are a coordinator. Spawn two disowned peers that discover each other.
+Messages arrive between cycles as ${_msg}.
+
+@@bank-program
+You are the bank. You run in grind mode. Use receive ops to block.
+Return frames: ["@0"] to loop.
+
+Check your bindings to determine what to do:
+
+If ${req} is in your bindings:
+  If ${req} starts with "balance_request:":
+    Extract reply address. Send "balance:42" to it.
+    Terminate with empty frames [].
+  Otherwise: Issue receive("req"). Return frames: ["@0"].
+
+If ${ack} is in your bindings but ${req} is NOT:
+  Issue receive("req").
+  Return frames: ["@0"].
+
+Otherwise (first cycle):
+  Send "write bank_mb ${_self}" to 'blackboard'.
+  Issue receive("ack").
+  Return frames: ["@0"].
+@@end
+
+@@wait-result
+You are the coordinator. Do NOT spawn any agents.
+A message arrived as ${_msg}.
+If ${_msg} starts with "balance:":
+  Send "Result: ${_msg}" to 'human'. Terminate with [].
+Otherwise: Return frames: ["@wait-result"]. No ops.
+@@end
+
+1. Spawn with frames: ["@bank-program"], dest "bank_id",
+   "grind": true, "disown": true.
+2. Return frames: ["@wait-result"].
+```
+
+The pattern works because:
+- **Bindings persist** across grind-mode cycles (as long as frames don't
+  drain to `[]`), so the agent accumulates bindings as it progresses.
+- **`@0` is self-referencing** — it injects the current frame's full text,
+  so the same conditional logic runs every cycle.
+- **Binding checks are ordered** most-advanced-phase first, so the agent
+  falls through to the correct phase based on what bindings exist.
+- **The child's entire program is self-contained** in one section — no
+  cross-section references needed.
+
 ### Grind child with receive (two-cycle roll)
 
 For a child that needs to call a service (like `bash`) and use the result
@@ -586,7 +653,44 @@ On the next cycle, `${roll}` is in the bindings and available for
 interpolation. See the "Grind child with receive" pattern for a
 complete example.
 
-### 8. Issuing too many ops in one cycle
+### 8. Child agents returning parent section references
+
+**Wrong:**
+```
+@@worker
+Do step 1, then return frames: ["@step2"]
+@@end
+
+@@step2
+Do step 2...
+@@end
+
+Spawn with frames: ["@worker"]
+```
+
+The child receives the resolved `@worker` text as plain text. It does NOT
+have `@@step2` — that section is defined in the parent's boot frame. When
+the child returns `["@step2"]`, it stays as the literal string `"@step2"`
+and the LLM gets no useful instructions.
+
+**Right:** Put the child's entire multi-phase logic in a single section
+using binding-conditional checks and `@0` to loop (see the "Disowned peers"
+pattern above). Or keep the child simple enough to finish in one or two
+cycles without needing section transitions.
+
+### 9. Boot frame instructions re-executing on every cycle
+
+The boot frame text (with `@@sections` visible) is included in the system
+prompt on **every cycle**, not just the first. If you put "Step 1: spawn a
+child" as plain text at the bottom of the boot frame, the LLM sees those
+spawn instructions on cycle 2, 3, etc. and may re-execute them.
+
+**Fix:** Either put first-cycle-only instructions inside a `@@section` (so
+they appear as a definition, not a direct instruction), or make the current
+frame's instructions clearly override with "Do NOT spawn" / "Do NOT re-run
+step 1" language.
+
+### 10. Issuing too many ops in one cycle
 
 Each cycle should do one logical step. Don't pre-issue ops for future steps.
 For example, don't send to `bash` and then immediately try to forward the

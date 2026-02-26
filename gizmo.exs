@@ -249,6 +249,11 @@ defmodule Gizmo.LLM do
                 type: "boolean",
                 description:
                   "Child restores boot frame on empty frames (for spawn). Default: inherit parent."
+              },
+              disown: %{
+                type: "boolean",
+                description:
+                  "Detach child from parent (no _parent binding, no death monitor). Default: false."
               }
             }
           }
@@ -343,7 +348,8 @@ defmodule Gizmo.LLM do
     opts = %{}
 
     with {:ok, opts} <- validate_spawn_bool(op, "grind", :grind, opts),
-         {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts) do
+         {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
+         {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts) do
       {:ok, opts}
     end
   end
@@ -1716,12 +1722,14 @@ defmodule Gizmo.Agent do
       do NOT need receive — messages arrive automatically as ${_msg} between
       cycles. Use receive only in grind mode or when you need to explicitly
       block mid-cycle.
-    - spawn(frames, dest, [grind], [idle]): Create a child process with the given
-      frames as its context stack. The child's mailbox ID is stored in the binding
-      named by `dest`. The child receives ${_parent} bound to your mailbox ID.
-      Optional: set "grind": true/false to override the child's loop mode
-      (default: inherit parent). Set "idle": true/false to control whether the
-      child restores its boot frame on empty frames (default: inherit parent).
+    - spawn(frames, dest, [grind], [idle], [disown]): Create a child process with
+      the given frames as its context stack. The child's mailbox ID is stored in
+      the binding named by `dest`. The child receives ${_parent} bound to your
+      mailbox ID. Optional: set "grind": true/false to override the child's loop
+      mode (default: inherit parent). Set "idle": true/false to control whether
+      the child restores its boot frame on empty frames (default: inherit parent).
+      Set "disown": true to detach the child — it won't have ${_parent} and
+      the parent won't receive child_died notifications for it.
     - trap(pattern, frames): Register an interrupt handler. When a message
       matching the regex `pattern` arrives between cycles, the handler frames
       are prepended to your context stack. The message is bound to
@@ -2287,9 +2295,12 @@ defmodule Gizmo.Agent do
         do: !spawn_opts.idle,
         else: state.quit_on_exhaust
 
+    disown = Map.get(spawn_opts, :disown, false)
+    parent_arg = if disown, do: nil, else: state.mailbox_id
+
     {:ok, child_mb, child_pid} =
       Gizmo.Agent.start(child_frames,
-        parent: state.mailbox_id,
+        parent: parent_arg,
         chat_fn: state.chat_fn,
         receive_timeout: state.receive_timeout,
         max_cycles: state.max_cycles,
@@ -2302,25 +2313,27 @@ defmodule Gizmo.Agent do
         runtime_preamble: state.runtime_preamble
       )
 
-    # Monitor child: on abnormal exit, notify parent mailbox
-    parent_mb = state.mailbox_id
+    # Monitor child: on abnormal exit, notify parent mailbox (skip for disowned children)
+    unless disown do
+      parent_mb = state.mailbox_id
 
-    Kernel.spawn(fn ->
-      ref = Process.monitor(child_pid)
+      Kernel.spawn(fn ->
+        ref = Process.monitor(child_pid)
 
-      receive do
-        {:DOWN, ^ref, :process, ^child_pid, :normal} ->
-          :ok
+        receive do
+          {:DOWN, ^ref, :process, ^child_pid, :normal} ->
+            :ok
 
-        {:DOWN, ^ref, :process, ^child_pid, reason} ->
-          Logger.warning("[watcher] child #{child_mb} died: #{inspect(reason)}")
+          {:DOWN, ^ref, :process, ^child_pid, reason} ->
+            Logger.warning("[watcher] child #{child_mb} died: #{inspect(reason)}")
 
-          Gizmo.Mailbox.route(
-            parent_mb,
-            {child_mb, "child_died:#{child_mb} reason=#{inspect(reason)}"}
-          )
-      end
-    end)
+            Gizmo.Mailbox.route(
+              parent_mb,
+              {child_mb, "child_died:#{child_mb} reason=#{inspect(reason)}"}
+            )
+        end
+      end)
+    end
 
     {:cont, frames, Map.put(bindings, dest, child_mb), trap}
   end
@@ -2768,6 +2781,37 @@ defmodule Gizmo.CLI do
         assert_error_op(
           "spawn grind non-bool",
           Gizmo.LLM.normalize_eval(bad_spawn_grind),
+          :invalid_op,
+          "spawn"
+        )
+
+    # spawn with disown option
+    spawn_disown = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "disown" => true}],
+      "frames" => []
+    }
+
+    {:ok, spawn_disown_result} = Gizmo.LLM.normalize_eval(spawn_disown)
+
+    failures =
+      failures ++
+        assert_eq(
+          "spawn with disown: true",
+          hd(spawn_disown_result.ops),
+          {:spawn, ["f"], "c", %{disown: true}}
+        )
+
+    # spawn with non-bool disown → error
+    bad_spawn_disown = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "disown" => "yes"}],
+      "frames" => []
+    }
+
+    failures =
+      failures ++
+        assert_error_op(
+          "spawn disown non-bool",
+          Gizmo.LLM.normalize_eval(bad_spawn_disown),
           :invalid_op,
           "spawn"
         )
@@ -4595,6 +4639,218 @@ defmodule Gizmo.CLI do
         assert_eq("spawn opts: msg-driven parent, grind child", so_result2, "grind child done")
 
     Gizmo.Mailbox.unregister(spawn_opts_test_mb2)
+
+    # Test 3: Disown — child has no _parent binding, parent gets no death notification
+    disown_test_mb = Gizmo.Mailbox.generate_id("disown_test")
+    Gizmo.Mailbox.register(disown_test_mb)
+    disown_parent_cycle = :counters.new(1, [:atomics])
+    disown_child_cycle = :counters.new(1, [:atomics])
+
+    disown_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "disown-child") do
+        child_c = :counters.get(disown_child_cycle, 1)
+        :counters.add(disown_child_cycle, 1, 1)
+
+        case child_c do
+          0 ->
+            # Child cycle 0 (init): report whether _parent is in bindings
+            # If disowned, _parent won't exist. Send "_parent" binding presence to test.
+            {:ok,
+             %{
+               ops: [{:send, disown_test_mb, "has_parent=${_parent}"}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      else
+        c = :counters.get(disown_parent_cycle, 1)
+        :counters.add(disown_parent_cycle, 1, 1)
+
+        case c do
+          0 ->
+            # Parent cycle 0: spawn disowned child, then exit
+            {:ok,
+             %{
+               ops: [{:spawn, ["disown-child"], "kid", %{disown: true, grind: true}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _disown_mb, disown_pid} =
+      Gizmo.Agent.start(["parent: spawn disown child"],
+        chat_fn: disown_chat_fn,
+        receive_timeout: 5_000,
+        grind: true
+      )
+
+    disown_ref = Process.monitor(disown_pid)
+
+    disown_result =
+      receive do
+        {:mailbox_msg, ^disown_test_mb, {_from, msg}} -> msg
+      after
+        10_000 -> :no_message
+      end
+
+    receive do
+      {:DOWN, ^disown_ref, :process, ^disown_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    # With disown, ${_parent} won't be interpolated — it stays as literal "${_parent}"
+    failures =
+      failures ++
+        assert_eq(
+          "spawn opts: disown child has no _parent",
+          disown_result,
+          "has_parent=${_parent}"
+        )
+
+    # Verify parent did NOT receive child_died (wait briefly, check no message)
+    disown_death_msg =
+      receive do
+        {:mailbox_msg, ^disown_test_mb, {_from, msg}} -> msg
+      after
+        200 -> :none
+      end
+
+    failures =
+      failures ++
+        assert_eq("spawn opts: disown no death notification", disown_death_msg, :none)
+
+    Gizmo.Mailbox.unregister(disown_test_mb)
+
+    IO.puts("")
+
+    # 13b. Cross-lineage messaging via blackboard
+    IO.puts("--- Cross-Lineage Messaging ---")
+
+    # Two independently started agents discover each other via the blackboard
+    # and exchange a message. No shared parent.
+    xline_test_mb = Gizmo.Mailbox.generate_id("xline_test")
+    Gizmo.Mailbox.register(xline_test_mb)
+
+    xline_server_cycle = :counters.new(1, [:atomics])
+    xline_client_cycle = :counters.new(1, [:atomics])
+
+    xline_server_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(xline_server_cycle, 1)
+      :counters.add(xline_server_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # Cycle 0 (init): register in blackboard
+          {:ok,
+           %{
+             ops: [{:send, "blackboard", "write server_mb ${_self}"}],
+             frames: ["server: registered"],
+             notes: %{}
+           }}
+
+        1 ->
+          # Cycle 1: blackboard ack, idle waiting for client message
+          {:ok, %{ops: [], frames: ["server: waiting"], notes: %{}}}
+
+        2 ->
+          # Cycle 2: got message from client, forward to test and exit
+          {:ok,
+           %{
+             ops: [{:send, xline_test_mb, "${_msg}"}],
+             frames: [],
+             notes: %{}
+           }}
+
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    xline_client_chat_fn = fn _system, _messages, _opts ->
+      c = :counters.get(xline_client_cycle, 1)
+      :counters.add(xline_client_cycle, 1, 1)
+
+      case c do
+        0 ->
+          # Cycle 0 (init): look up server from blackboard
+          {:ok,
+           %{
+             ops: [{:send, "blackboard", "read server_mb"}],
+             frames: ["client: lookup"],
+             notes: %{}
+           }}
+
+        1 ->
+          # Cycle 1: got server mailbox ID, send message to server
+          {:ok,
+           %{
+             ops: [{:send, "${_msg}", "hello from client"}],
+             frames: [],
+             notes: %{}
+           }}
+
+        _ ->
+          {:ok, %{ops: [], frames: [], notes: %{}}}
+      end
+    end
+
+    # Start server first
+    {:ok, _server_mb, server_pid} =
+      Gizmo.Agent.start(["server: start"],
+        chat_fn: xline_server_chat_fn,
+        receive_timeout: 5_000
+      )
+
+    server_ref = Process.monitor(server_pid)
+
+    # Wait for server to register in blackboard
+    Process.sleep(100)
+
+    # Start client
+    {:ok, _client_mb, client_pid} =
+      Gizmo.Agent.start(["client: start"],
+        chat_fn: xline_client_chat_fn,
+        receive_timeout: 5_000
+      )
+
+    client_ref = Process.monitor(client_pid)
+
+    xline_result =
+      receive do
+        {:mailbox_msg, ^xline_test_mb, {_from, msg}} -> msg
+      after
+        10_000 -> :no_message
+      end
+
+    # Wait for both to exit
+    receive do
+      {:DOWN, ^server_ref, :process, ^server_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    receive do
+      {:DOWN, ^client_ref, :process, ^client_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures =
+      failures ++
+        assert_eq("cross-lineage: client→server→test", xline_result, "hello from client")
+
+    Gizmo.Mailbox.unregister(xline_test_mb)
 
     IO.puts("")
 

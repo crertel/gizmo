@@ -53,7 +53,7 @@ new messages — useful for long-running daemon-style agents.
 |---------|-----------|----------|
 | `send`  | `send(mailbox_id, msg)` | Async fire-and-forget message to any mailbox. Non-blocking. |
 | `receive` | `receive(dest)` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
-| `spawn` | `spawn([frames...], dest)` | Create child process with given frames. Child mailbox ID stored in binding `dest`. |
+| `spawn` | `spawn([frames...], dest)` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Options: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor). |
 | `trap` | `trap(pattern, [frames...])` | Register interrupt handler. Regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
 
 All message content is interpolated (`${name}` from bindings) at operation
@@ -132,7 +132,7 @@ Each op is an object with an `"op"` field and op-specific parameters:
 |----|--------|---------|
 | `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
 | `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
-| `spawn` | `frames`, `dest` | `{"op": "spawn", "frames": ["child task"], "dest": "child"}` |
+| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
 | `trap` | `pattern`, `frames` | `{"op": "trap", "pattern": "^alert:", "frames": ["handle ${_interrupt}"]}` |
 | `trap` (clear) | `pattern`, `frames=[]` | `{"op": "trap", "pattern": ".*", "frames": []}` |
 
@@ -156,11 +156,13 @@ The runtime provides every agent with identity bindings:
 
 - `${_self}` — this agent's own mailbox ID. Always available.
 - `${_parent}` — the spawning agent's mailbox ID. Only available for
-  child agents created via `spawn`. Root agents do not have `_parent`.
+  child agents created via `spawn` without `disown: true`. Root agents
+  and disowned children do not have `_parent`.
 
 These bindings persist across cycles (preserved on idle reset) and enable
 symmetric communication: the parent has `${child_dest}` from `spawn`, the
-child has `${_parent}` from the runtime.
+child has `${_parent}` from the runtime. Disowned children must discover
+peers through the blackboard or other shared services.
 
 ## Error Handling
 
