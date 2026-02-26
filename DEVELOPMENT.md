@@ -73,7 +73,7 @@ Implement the service processes that back the well-known mailboxes.
 - [x] GenServer that receives command strings
 - [x] Execute via `System.cmd("sh", ["-c", cmd])`
 - [x] Send stdout/stderr back to caller's mailbox
-- [ ] Timeout handling for long-running commands
+- [x] Timeout handling for long-running commands
 
 ### 5e: Human Adapter
 - [x] Two GenServers: `Human` (output) and `HumanInput` (input)

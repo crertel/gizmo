@@ -615,13 +615,41 @@ on the next cycle.
 
 ### bash
 
-Send a shell command string. The output (stdout with stderr merged) arrives
-as `${_msg}` on the next cycle. On failure, the message is
-`"error: exit code N: ..."`.
+Shell command execution with configurable timeout.
+
+**Raw command** (backward compatible) — send a plain command string:
 
 ```json
 {"op": "send", "mailbox": "bash", "msg": "uname -a"}
 ```
+
+Output arrives as `${_msg}` on the next cycle. On failure: `"error: exit code N: ..."`.
+
+**Structured run** — first line is metadata, rest is the command:
+
+```json
+{"op": "send", "mailbox": "bash", "msg": "run,5000,kill\nfind / -name '*.log'"}
+```
+
+Format: `run,<timeout_ms>,<mode>[,<note>]\n<command>`
+
+- **mode** `kill`: on timeout the command is terminated and you receive
+  `"error: timeout after Nms"`.
+- **mode** `notify`: on timeout the command keeps running and you receive
+  `"bash:timeout:<handle>"` (or `"bash:timeout:<handle>:<note>"` if a note
+  was provided). You can then control the job:
+
+| Message | Effect |
+|---------|--------|
+| `kill,<handle>` | Terminate the job. You receive `"error: killed"`. |
+| `wait,<handle>` | Reset the timer (same duration). |
+| `wait,<handle>,<timeout_ms>` | Reset the timer with a new duration. |
+
+The final result of a notify-mode job still arrives in the standard format
+(stdout or error string) when the command eventually completes.
+
+**Default timeout** is set by the runtime (`--bash-timeout`, typically 60 s).
+Raw commands use the default timeout in kill mode. Use `0` for no timeout.
 
 ### blackboard
 

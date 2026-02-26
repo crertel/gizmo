@@ -897,35 +897,253 @@ end
 defmodule Gizmo.Services.Bash do
   use GenServer
 
-  def start_link(mailbox_id \\ "bash") do
-    GenServer.start_link(__MODULE__, mailbox_id)
+  def start_link({mailbox_id, default_timeout}) do
+    GenServer.start_link(__MODULE__, {mailbox_id, default_timeout})
+  end
+
+  def start_link(mailbox_id) when is_binary(mailbox_id) do
+    start_link({mailbox_id, 60_000})
   end
 
   @impl true
-  def init(mailbox_id) do
+  def init({mailbox_id, default_timeout}) do
     Gizmo.Mailbox.register(mailbox_id)
-    {:ok, %{mailbox_id: mailbox_id}}
+
+    {:ok,
+     %{
+       mailbox_id: mailbox_id,
+       default_timeout: default_timeout,
+       handle_counter: 0,
+       jobs: %{},
+       port_to_handle: %{}
+     }}
   end
 
+  # --- Mailbox message (agent → bash) ---
+
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, command}}, state) do
-    bash_mb = state.mailbox_id
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, message}}, state) do
+    case parse_message(message) do
+      {:run, timeout_ms, mode, note, command} ->
+        {:noreply, start_job(state, reply_to, command, timeout_ms, mode, note)}
 
-    Task.start(fn ->
-      try do
-        {stdout, exit_code} = System.cmd("sh", ["-c", command], stderr_to_stdout: true)
+      {:kill, handle} ->
+        {:noreply, kill_job(state, reply_to, handle)}
 
-        if exit_code == 0 do
-          Gizmo.Mailbox.route(reply_to, {bash_mb, stdout})
+      {:wait, handle, new_timeout} ->
+        {:noreply, wait_job(state, reply_to, handle, new_timeout)}
+
+      {:raw, command} ->
+        {:noreply, start_job(state, reply_to, command, state.default_timeout, :kill, nil)}
+    end
+  end
+
+  # --- Port data accumulation ---
+
+  def handle_info({port, {:data, data}}, state) when is_port(port) do
+    case Map.get(state.port_to_handle, port) do
+      nil ->
+        {:noreply, state}
+
+      handle ->
+        job = state.jobs[handle]
+        {:noreply, put_in(state.jobs[handle], %{job | output: [job.output | [data]]})}
+    end
+  end
+
+  # --- Port exit (command finished) ---
+
+  def handle_info({port, {:exit_status, status}}, state) when is_port(port) do
+    case Map.get(state.port_to_handle, port) do
+      nil ->
+        {:noreply, state}
+
+      handle ->
+        job = state.jobs[handle]
+        output = IO.iodata_to_binary(job.output)
+
+        if status == 0 do
+          Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, output})
         else
-          Gizmo.Mailbox.route(reply_to, {bash_mb, "error: exit code #{exit_code}: #{stdout}"})
+          Gizmo.Mailbox.route(
+            job.reply_to,
+            {state.mailbox_id, "error: exit code #{status}: #{output}"}
+          )
         end
-      rescue
-        e -> Gizmo.Mailbox.route(reply_to, {bash_mb, "error: #{Exception.message(e)}"})
-      end
-    end)
 
-    {:noreply, state}
+        {:noreply, cleanup_job(state, handle)}
+    end
+  end
+
+  # --- Timeout fired ---
+
+  def handle_info({:job_timeout, handle}, state) do
+    case Map.get(state.jobs, handle) do
+      nil ->
+        {:noreply, state}
+
+      %{mode: :kill} = job ->
+        kill_port(job.port)
+
+        Gizmo.Mailbox.route(
+          job.reply_to,
+          {state.mailbox_id, "error: timeout after #{job.timeout_ms}ms"}
+        )
+
+        {:noreply, cleanup_job(state, handle)}
+
+      %{mode: :notify} = job ->
+        notification =
+          case job.note do
+            nil -> "bash:timeout:#{handle}"
+            note -> "bash:timeout:#{handle}:#{note}"
+          end
+
+        Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, notification})
+        {:noreply, put_in(state.jobs[handle], %{job | status: :notified, timer_ref: nil})}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # --- Message parsing ---
+
+  defp parse_message(message) do
+    case String.split(message, "\n", parts: 2) do
+      [first_line, command] ->
+        case String.split(first_line, ",", parts: 4) do
+          ["run", timeout_str, mode_str] ->
+            {:run, String.to_integer(timeout_str), parse_mode(mode_str), nil, command}
+
+          ["run", timeout_str, mode_str, note] ->
+            {:run, String.to_integer(timeout_str), parse_mode(mode_str), note, command}
+
+          _ ->
+            {:raw, message}
+        end
+
+      [single_line] ->
+        case String.split(single_line, ",", parts: 3) do
+          ["kill", handle] -> {:kill, handle}
+          ["wait", handle] -> {:wait, handle, nil}
+          ["wait", handle, timeout_str] -> {:wait, handle, String.to_integer(timeout_str)}
+          _ -> {:raw, message}
+        end
+    end
+  end
+
+  defp parse_mode("kill"), do: :kill
+  defp parse_mode("notify"), do: :notify
+  defp parse_mode(_), do: :kill
+
+  # --- Job management ---
+
+  defp start_job(state, reply_to, command, timeout_ms, mode, note) do
+    counter = state.handle_counter + 1
+    handle = "bash_#{counter}"
+
+    port =
+      Port.open(
+        {:spawn_executable, "/bin/sh"},
+        [:binary, :exit_status, :stderr_to_stdout, args: ["-c", command]]
+      )
+
+    timer_ref =
+      if timeout_ms > 0 do
+        Process.send_after(self(), {:job_timeout, handle}, timeout_ms)
+      else
+        nil
+      end
+
+    job = %{
+      port: port,
+      reply_to: reply_to,
+      timer_ref: timer_ref,
+      timeout_ms: timeout_ms,
+      mode: mode,
+      note: note,
+      output: [],
+      status: :running
+    }
+
+    %{
+      state
+      | handle_counter: counter,
+        jobs: Map.put(state.jobs, handle, job),
+        port_to_handle: Map.put(state.port_to_handle, port, handle)
+    }
+  end
+
+  defp kill_job(state, reply_to, handle) do
+    case Map.get(state.jobs, handle) do
+      nil ->
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unknown handle #{handle}"})
+        state
+
+      job ->
+        kill_port(job.port)
+        Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, "error: killed"})
+        cleanup_job(state, handle)
+    end
+  end
+
+  defp wait_job(state, reply_to, handle, new_timeout_ms) do
+    case Map.get(state.jobs, handle) do
+      nil ->
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unknown handle #{handle}"})
+        state
+
+      %{status: :notified} = job ->
+        timeout = new_timeout_ms || job.timeout_ms
+        if job.timer_ref, do: Process.cancel_timer(job.timer_ref)
+
+        timer_ref =
+          if timeout > 0 do
+            Process.send_after(self(), {:job_timeout, handle}, timeout)
+          else
+            nil
+          end
+
+        put_in(state.jobs[handle], %{job | status: :running, timer_ref: timer_ref, timeout_ms: timeout})
+
+      _job ->
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: job #{handle} is still running"})
+        state
+    end
+  end
+
+  defp kill_port(port) do
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        nil -> nil
+      end
+
+    try do
+      Port.close(port)
+    catch
+      _, _ -> :ok
+    end
+
+    if os_pid do
+      :os.cmd(~c"kill -9 #{os_pid} 2>/dev/null")
+    end
+  end
+
+  defp cleanup_job(state, handle) do
+    case Map.get(state.jobs, handle) do
+      nil ->
+        state
+
+      job ->
+        if job.timer_ref, do: Process.cancel_timer(job.timer_ref)
+
+        %{
+          state
+          | jobs: Map.delete(state.jobs, handle),
+            port_to_handle: Map.delete(state.port_to_handle, job.port)
+        }
+    end
   end
 end
 
@@ -1358,11 +1576,13 @@ end
 # -----------------------------------------------------------------------------
 
 defmodule Gizmo.Supervision do
-  def start_link do
+  def start_link(opts \\ []) do
+    bash_timeout = Keyword.get(opts, :bash_timeout, 60_000)
+
     children = [
       %{id: Gizmo.Mailbox.Registry, start: {Gizmo.Mailbox, :start, []}, type: :supervisor},
       {Gizmo.Services.Blackboard, "blackboard"},
-      {Gizmo.Services.Bash, "bash"},
+      {Gizmo.Services.Bash, {"bash", bash_timeout}},
       {Gizmo.Services.Human, "human"},
       {Gizmo.Services.HumanInput, "human_input"},
       {Gizmo.Services.Exception, "exception"},
@@ -1478,9 +1698,31 @@ defmodule Gizmo.Agent do
       Fire-and-forget — no response comes back.
     - human_input: Send a prompt string here. The user's typed input arrives
       as ${_msg} on your next cycle.
-    - bash: Shell command execution. Send a command string. The output arrives
-      as ${_msg} on your next cycle. Return a continuation frame so you
-      remember what to do with the result.
+    - bash: Shell command execution with timeout. Send a raw command string for
+      simple use, or a structured message for timeout control.
+
+      Raw command (backward compatible):
+        send "uname -a" → output arrives as ${_msg} next cycle.
+
+      Structured run (first line = metadata, rest = command):
+        send "run,<timeout_ms>,<mode>\n<command>"
+        send "run,<timeout_ms>,<mode>,<note>\n<command>"
+      Mode is "kill" (terminate on timeout) or "notify" (send notification,
+      keep running). Note is an optional tag for your reference.
+
+      Timeout behavior:
+        - Default timeout is set by the runtime (typically 60s, 0 = none).
+        - kill mode: on timeout you receive "error: timeout after Nms".
+        - notify mode: on timeout you receive "bash:timeout:<handle>" (or
+          "bash:timeout:<handle>:<note>" if you set a note). The command
+          keeps running. You can then:
+            send "wait,<handle>"           — reset timer, same duration
+            send "wait,<handle>,<timeout>" — reset timer, new duration
+            send "kill,<handle>"           — terminate the job
+          The final result still arrives normally when the command completes.
+
+      Normal completion: stdout as ${_msg} (exit 0) or
+        "error: exit code N: <output>" (non-zero exit).
     - blackboard: Key-value store. Send {read, key} or {write, key, value}.
       The result arrives as ${_msg} on your next cycle. Read returns the
       value, write returns "ok".
@@ -2043,7 +2285,8 @@ defmodule Gizmo.CLI do
           log_full_prompts: :boolean,
           trace: :boolean,
           trace_file: :string,
-          runtime: :string
+          runtime: :string,
+          bash_timeout: :integer
         ],
         aliases: [v: :verbose]
       )
@@ -2107,6 +2350,7 @@ defmodule Gizmo.CLI do
       --runtime <file>     Use custom runtime preamble instead of built-in
       --trace             Emit NDJSON trace to stderr (silences logger)
       --trace-file <file> Emit NDJSON trace to file (silences logger)
+      --bash-timeout N    Default bash command timeout in ms (default: 60000, 0 = none)
 
     Positional arguments:
       Without --boot: first file is the boot frame, rest are stacked on top.
@@ -4273,8 +4517,200 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
-    # 14. LLM test (only if API key is set)
-    # (renumbered from 12 to make room for reaper and spawn opts tests)
+    # 14. Bash job tests (timeout, kill, wait, notes)
+    IO.puts("--- Bash Jobs ---")
+
+    # Test 1: Raw command backward compat (Port-based)
+    bj_recv1 = Gizmo.Mailbox.generate_id("bj_recv1")
+    Gizmo.Mailbox.register(bj_recv1)
+    bj_bash1 = Gizmo.Mailbox.generate_id("bj_bash1")
+    {:ok, bj_pid1} = Gizmo.Services.Bash.start_link(bj_bash1)
+    Gizmo.Mailbox.route(bj_bash1, {bj_recv1, "echo hello"})
+
+    bj_result1 =
+      receive do
+        {:mailbox_msg, ^bj_recv1, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++ assert_eq("bash jobs: raw command", String.trim(bj_result1), "hello")
+
+    Gizmo.Mailbox.unregister(bj_recv1)
+    GenServer.stop(bj_pid1)
+
+    # Test 2: Kill-mode timeout
+    bj_recv2 = Gizmo.Mailbox.generate_id("bj_recv2")
+    Gizmo.Mailbox.register(bj_recv2)
+    bj_bash2 = Gizmo.Mailbox.generate_id("bj_bash2")
+    {:ok, bj_pid2} = Gizmo.Services.Bash.start_link({bj_bash2, 200})
+    Gizmo.Mailbox.route(bj_bash2, {bj_recv2, "sleep 30"})
+
+    bj_result2 =
+      receive do
+        {:mailbox_msg, ^bj_recv2, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++
+        assert_eq("bash jobs: kill-mode timeout", bj_result2, "error: timeout after 200ms")
+
+    Gizmo.Mailbox.unregister(bj_recv2)
+    GenServer.stop(bj_pid2)
+
+    # Test 3: Structured run with kill-mode timeout override
+    bj_recv3 = Gizmo.Mailbox.generate_id("bj_recv3")
+    Gizmo.Mailbox.register(bj_recv3)
+    bj_bash3 = Gizmo.Mailbox.generate_id("bj_bash3")
+    {:ok, bj_pid3} = Gizmo.Services.Bash.start_link({bj_bash3, 0})
+    Gizmo.Mailbox.route(bj_bash3, {bj_recv3, "run,200,kill\nsleep 30"})
+
+    bj_result3 =
+      receive do
+        {:mailbox_msg, ^bj_recv3, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++
+        assert_eq(
+          "bash jobs: structured kill timeout",
+          bj_result3,
+          "error: timeout after 200ms"
+        )
+
+    Gizmo.Mailbox.unregister(bj_recv3)
+    GenServer.stop(bj_pid3)
+
+    # Test 4: Notify-mode timeout + kill
+    bj_recv4 = Gizmo.Mailbox.generate_id("bj_recv4")
+    Gizmo.Mailbox.register(bj_recv4)
+    bj_bash4 = Gizmo.Mailbox.generate_id("bj_bash4")
+    {:ok, bj_pid4} = Gizmo.Services.Bash.start_link({bj_bash4, 0})
+    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, "run,200,notify\nsleep 30"})
+
+    # Should get timeout notification
+    bj_result4a =
+      receive do
+        {:mailbox_msg, ^bj_recv4, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++
+        assert_eq(
+          "bash jobs: notify timeout notification",
+          String.starts_with?(to_string(bj_result4a), "bash:timeout:bash_"),
+          true
+        )
+
+    # Extract handle from notification
+    "bash:timeout:" <> handle4 = bj_result4a
+
+    # Kill the job
+    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, "kill,#{handle4}"})
+
+    bj_result4b =
+      receive do
+        {:mailbox_msg, ^bj_recv4, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++ assert_eq("bash jobs: notify then kill", bj_result4b, "error: killed")
+
+    Gizmo.Mailbox.unregister(bj_recv4)
+    GenServer.stop(bj_pid4)
+
+    # Test 5: Notify-mode timeout + wait (command completes)
+    bj_recv5 = Gizmo.Mailbox.generate_id("bj_recv5")
+    Gizmo.Mailbox.register(bj_recv5)
+    bj_bash5 = Gizmo.Mailbox.generate_id("bj_bash5")
+    {:ok, bj_pid5} = Gizmo.Services.Bash.start_link({bj_bash5, 0})
+    # Command takes ~1s, notify timeout at 200ms, then extend with 5s wait
+    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, "run,200,notify\necho waited && sleep 1 && echo done"})
+
+    # Get timeout notification
+    bj_result5a =
+      receive do
+        {:mailbox_msg, ^bj_recv5, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    "bash:timeout:" <> handle5 = bj_result5a
+
+    # Extend wait
+    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, "wait,#{handle5},5000"})
+
+    # Wait for final result
+    bj_result5b =
+      receive do
+        {:mailbox_msg, ^bj_recv5, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    failures =
+      failures ++
+        assert_eq(
+          "bash jobs: notify then wait completes",
+          String.trim(bj_result5b),
+          "waited\ndone"
+        )
+
+    Gizmo.Mailbox.unregister(bj_recv5)
+    GenServer.stop(bj_pid5)
+
+    # Test 6: Note threading in notify mode
+    bj_recv6 = Gizmo.Mailbox.generate_id("bj_recv6")
+    Gizmo.Mailbox.register(bj_recv6)
+    bj_bash6 = Gizmo.Mailbox.generate_id("bj_bash6")
+    {:ok, bj_pid6} = Gizmo.Services.Bash.start_link({bj_bash6, 0})
+    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, "run,200,notify,compiling\nsleep 30"})
+
+    bj_result6 =
+      receive do
+        {:mailbox_msg, ^bj_recv6, {_, msg}} -> msg
+      after
+        5_000 -> :timeout
+      end
+
+    # Extract handle — notification is "bash:timeout:<handle>:<note>"
+    # The handle is between the second and third colons
+    failures =
+      failures ++
+        assert_eq(
+          "bash jobs: note in timeout notification",
+          String.ends_with?(bj_result6, ":compiling"),
+          true
+        )
+
+    # Also verify the handle is present
+    parts6 = String.split(bj_result6, ":")
+    handle6 = Enum.at(parts6, 2)
+
+    # Kill to clean up
+    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, "kill,#{handle6}"})
+
+    receive do
+      {:mailbox_msg, ^bj_recv6, _} -> :ok
+    after
+      2_000 -> :ok
+    end
+
+    Gizmo.Mailbox.unregister(bj_recv6)
+    GenServer.stop(bj_pid6)
+
+    IO.puts("")
+
+    # 15. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
     if System.get_env("ANTHROPIC_API_KEY") do
@@ -4483,7 +4919,8 @@ defmodule Gizmo.CLI do
         System.halt(0)
       end)
 
-    {:ok, _} = Gizmo.Supervision.start_link()
+    sup_opts = if opts[:bash_timeout], do: [bash_timeout: opts[:bash_timeout]], else: []
+    {:ok, _} = Gizmo.Supervision.start_link(sup_opts)
     {:ok, agent_mb, agent_pid} = Gizmo.Agent.start(frames, run_opts)
 
     if watchdog_ms do
