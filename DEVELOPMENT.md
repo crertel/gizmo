@@ -79,7 +79,7 @@ Implement the service processes that back the well-known mailboxes.
 - [x] Two GenServers: `Human` (output) and `HumanInput` (input)
 - [x] Receive message from agent → print to terminal
 - [x] Read user input → send to agent's mailbox
-- [ ] Later: swap IO for Phoenix channel without changing the agent
+- [ ] ~Swap IO for Phoenix channel~ — deferred, see Deferred / Future
 
 ## Stage 6: Agent Process (The Core)
 
@@ -151,7 +151,7 @@ and signal handling.
 
 ## Stage 11: Polish and Hardening
 
-- [ ] Logging: structured logs for eval cycles, message routing, errors
+- [x] Logging: structured logs for eval cycles, message routing, errors (`--trace-service`, `--trace-messages`)
 - [x] ~Telemetry~ — removed, see DEAD_ENDS.md
 - [x] ~Boot frame templating~ — removed, see DEAD_ENDS.md
 - [x] ~Config: cycle limits, stack exhaustion~ — done in Stage 10
@@ -200,6 +200,7 @@ mailbox ID to the reaper.
 These are explicitly out of scope for the initial build but noted for later:
 
 - ~Selective receive~ — partially addressed by trap (Stage 12)
+- Phoenix channel / LiveView human adapter
 - Context summarization service
 - Persistence (durable stacks/mailboxes across restarts)
 - Nested boot frames / sandboxing

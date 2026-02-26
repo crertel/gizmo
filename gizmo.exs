@@ -150,6 +150,25 @@ defmodule Gizmo.Trace do
 
     :ok
   end
+
+  @doc "Store global trace config so services/mailbox can emit without agent state."
+  def setup(outputs, opts \\ []) do
+    :persistent_term.put({__MODULE__, :outputs}, outputs)
+    :persistent_term.put({__MODULE__, :service}, opts[:service] || false)
+    :persistent_term.put({__MODULE__, :messages}, opts[:messages] || false)
+  end
+
+  def emit_service(event) do
+    if :persistent_term.get({__MODULE__, :service}, false) do
+      emit(:persistent_term.get({__MODULE__, :outputs}, nil), event)
+    end
+  end
+
+  def emit_messages(event) do
+    if :persistent_term.get({__MODULE__, :messages}, false) do
+      emit(:persistent_term.get({__MODULE__, :outputs}, nil), event)
+    end
+  end
 end
 
 # -----------------------------------------------------------------------------
@@ -734,10 +753,31 @@ defmodule Gizmo.Mailbox do
   def route(mailbox_id, message) do
     case lookup(mailbox_id) do
       {:ok, pid} ->
+        {from, content} =
+          case message do
+            {sender, body} when is_binary(sender) -> {sender, body}
+            _ -> {nil, message}
+          end
+
+        content_str = if is_binary(content), do: content, else: inspect(content)
+
+        Gizmo.Trace.emit_messages(%{
+          event: "msg:route",
+          from: from,
+          to: mailbox_id,
+          content_bytes: byte_size(content_str),
+          content_preview: String.slice(content_str, 0, 200)
+        })
+
         send(pid, {:mailbox_msg, mailbox_id, message})
         :ok
 
       {:error, _} = err ->
+        Gizmo.Trace.emit_messages(%{
+          event: "msg:route_failed",
+          to: mailbox_id
+        })
+
         err
     end
   end
@@ -827,6 +867,8 @@ defmodule Gizmo.Services.Blackboard do
 
   @impl true
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:read, key}}}, %{store: store} = state) do
+    found = Map.has_key?(store, key)
+    Gizmo.Trace.emit_service(%{event: "blackboard:read", key: key, found: found})
     value = Map.get(store, key, "")
     Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
     {:noreply, state}
@@ -836,6 +878,8 @@ defmodule Gizmo.Services.Blackboard do
         {:mailbox_msg, _mailbox_id, {reply_to, {:write, key, value}}},
         %{store: store} = state
       ) do
+    value_str = if is_binary(value), do: value, else: inspect(value)
+    Gizmo.Trace.emit_service(%{event: "blackboard:write", key: key, value_bytes: byte_size(value_str)})
     Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
     {:noreply, %{state | store: Map.put(store, key, value)}}
   end
@@ -843,11 +887,14 @@ defmodule Gizmo.Services.Blackboard do
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, msg}}, state) when is_binary(msg) do
     case parse_command(msg) do
       {:read, key} ->
+        found = Map.has_key?(state.store, key)
+        Gizmo.Trace.emit_service(%{event: "blackboard:read", key: key, found: found})
         value = Map.get(state.store, key, "")
         Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
         {:noreply, state}
 
       {:write, key, value} ->
+        Gizmo.Trace.emit_service(%{event: "blackboard:write", key: key, value_bytes: byte_size(value)})
         Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
         {:noreply, %{state | store: Map.put(state.store, key, value)}}
 
@@ -962,6 +1009,13 @@ defmodule Gizmo.Services.Bash do
         job = state.jobs[handle]
         output = IO.iodata_to_binary(job.output)
 
+        Gizmo.Trace.emit_service(%{
+          event: "bash:done",
+          handle: handle,
+          exit_code: status,
+          output_bytes: byte_size(output)
+        })
+
         if status == 0 do
           Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, output})
         else
@@ -983,6 +1037,7 @@ defmodule Gizmo.Services.Bash do
         {:noreply, state}
 
       %{mode: :kill} = job ->
+        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "kill"})
         kill_port(job.port)
 
         Gizmo.Mailbox.route(
@@ -993,6 +1048,8 @@ defmodule Gizmo.Services.Bash do
         {:noreply, cleanup_job(state, handle)}
 
       %{mode: :notify} = job ->
+        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "notify"})
+
         notification =
           case job.note do
             nil -> "bash:timeout:#{handle}"
@@ -1042,6 +1099,15 @@ defmodule Gizmo.Services.Bash do
     counter = state.handle_counter + 1
     handle = "bash_#{counter}"
 
+    Gizmo.Trace.emit_service(%{
+      event: "bash:run",
+      handle: handle,
+      command: String.slice(command, 0, 200),
+      timeout_ms: timeout_ms,
+      mode: Atom.to_string(mode),
+      note: note
+    })
+
     port =
       Port.open(
         {:spawn_executable, "/bin/sh"},
@@ -1081,6 +1147,7 @@ defmodule Gizmo.Services.Bash do
         state
 
       job ->
+        Gizmo.Trace.emit_service(%{event: "bash:kill", handle: handle})
         kill_port(job.port)
         Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, "error: killed"})
         cleanup_job(state, handle)
@@ -1095,6 +1162,7 @@ defmodule Gizmo.Services.Bash do
 
       %{status: :notified} = job ->
         timeout = new_timeout_ms || job.timeout_ms
+        Gizmo.Trace.emit_service(%{event: "bash:wait", handle: handle, timeout_ms: timeout})
         if job.timer_ref, do: Process.cancel_timer(job.timer_ref)
 
         timer_ref =
@@ -1262,13 +1330,17 @@ defmodule Gizmo.Services.Reaper do
   def handle_info({:mailbox_msg, _mailbox_id, {caller_mb, target_mb}}, state) do
     case Gizmo.Mailbox.lookup_with_parent(target_mb) do
       {:ok, target_pid, _parent} ->
-        if ancestor?(caller_mb, target_mb) do
+        allowed = ancestor?(caller_mb, target_mb)
+        Gizmo.Trace.emit_service(%{event: "reaper:kill", caller: caller_mb, target: target_mb, allowed: allowed})
+
+        if allowed do
           Process.exit(target_pid, :shutdown)
         else
           Logger.error("[reaper] denied: #{caller_mb} is not an ancestor of #{target_mb}")
         end
 
       {:error, _} ->
+        Gizmo.Trace.emit_service(%{event: "reaper:kill", caller: caller_mb, target: target_mb, allowed: false})
         Logger.error("[reaper] target not found: #{target_mb}")
     end
 
@@ -1334,6 +1406,7 @@ defmodule Gizmo.Services.Watchdog do
     state =
       case parse_command(cmd) do
         {:every, ms} ->
+          Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "every", interval_ms: ms})
           {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
           add_timer(state, sender_mb, %{
@@ -1344,6 +1417,7 @@ defmodule Gizmo.Services.Watchdog do
           })
 
         {:after, ms} ->
+          Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "after", interval_ms: ms})
           {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
           add_timer(state, sender_mb, %{
@@ -1354,6 +1428,7 @@ defmodule Gizmo.Services.Watchdog do
           })
 
         :cancel ->
+          Gizmo.Trace.emit_service(%{event: "watchdog:cancel", agent: sender_mb})
           cancel_all_timers(state, sender_mb)
 
         :list ->
@@ -1380,6 +1455,7 @@ defmodule Gizmo.Services.Watchdog do
             {:noreply, state}
 
           %{type: :every, interval: ms} ->
+            Gizmo.Trace.emit_service(%{event: "watchdog:tick", agent: agent_mb})
             Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
             {new_id, new_cancel_ref} = schedule_fire(agent_mb, ms)
 
@@ -1392,6 +1468,7 @@ defmodule Gizmo.Services.Watchdog do
             {:noreply, put_in(state, [:agents, agent_mb, :timers], timers)}
 
           %{type: :after} ->
+            Gizmo.Trace.emit_service(%{event: "watchdog:tick", agent: agent_mb})
             Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
             timers = Enum.reject(agent_entry.timers, &(&1.id == timer_id))
             {:noreply, put_in(state, [:agents, agent_mb, :timers], timers)}
@@ -2285,6 +2362,8 @@ defmodule Gizmo.CLI do
           log_full_prompts: :boolean,
           trace: :boolean,
           trace_file: :string,
+          trace_service: :boolean,
+          trace_messages: :boolean,
           runtime: :string,
           bash_timeout: :integer
         ],
@@ -2350,6 +2429,8 @@ defmodule Gizmo.CLI do
       --runtime <file>     Use custom runtime preamble instead of built-in
       --trace             Emit NDJSON trace to stderr (silences logger)
       --trace-file <file> Emit NDJSON trace to file (silences logger)
+      --trace-service     Include service events in trace (bash, blackboard, watchdog, reaper)
+      --trace-messages    Include message routing events in trace
       --bash-timeout N    Default bash command timeout in ms (default: 60000, 0 = none)
 
     Positional arguments:
@@ -4710,6 +4791,127 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
+    # 15b. Trace: service events
+    IO.puts("--- Trace: Service Events ---")
+
+    {:ok, trace_svc_io} = StringIO.open("")
+    Gizmo.Trace.setup([trace_svc_io], service: true, messages: false)
+
+    trace_bash_recv = Gizmo.Mailbox.generate_id("trace_bash_recv")
+    Gizmo.Mailbox.register(trace_bash_recv)
+    {:ok, trace_bash_pid} = Gizmo.Services.Bash.start_link({"trace_bash", 5_000})
+
+    Gizmo.Mailbox.route("trace_bash", {trace_bash_recv, "echo trace_test"})
+    receive do
+      {:mailbox_msg, ^trace_bash_recv, {"trace_bash", _output}} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    Process.sleep(50)
+    {_in, trace_svc_out} = StringIO.contents(trace_svc_io)
+    trace_svc_lines = trace_svc_out |> String.split("\n", trim: true)
+    trace_svc_events = Enum.map(trace_svc_lines, fn line -> :json.decode(line) end)
+    trace_svc_event_names = Enum.map(trace_svc_events, fn e -> Map.get(e, "event") end)
+
+    failures = failures ++ assert_eq(
+      "service trace has bash:run",
+      "bash:run" in trace_svc_event_names,
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "service trace has bash:done",
+      "bash:done" in trace_svc_event_names,
+      true
+    )
+
+    # Verify bash:done has output_bytes and exit_code fields
+    bash_done = Enum.find(trace_svc_events, fn e -> Map.get(e, "event") == "bash:done" end)
+
+    failures = failures ++ assert_eq(
+      "bash:done has exit_code 0",
+      Map.get(bash_done, "exit_code"),
+      0
+    )
+
+    failures = failures ++ assert_eq(
+      "bash:done has output_bytes",
+      is_integer(Map.get(bash_done, "output_bytes")),
+      true
+    )
+
+    Gizmo.Mailbox.unregister(trace_bash_recv)
+    GenServer.stop(trace_bash_pid)
+    StringIO.close(trace_svc_io)
+
+    # Reset persistent_term trace config
+    :persistent_term.put({Gizmo.Trace, :service}, false)
+    :persistent_term.put({Gizmo.Trace, :messages}, false)
+
+    IO.puts("")
+
+    # 15c. Trace: message events
+    IO.puts("--- Trace: Message Events ---")
+
+    {:ok, trace_msg_io} = StringIO.open("")
+    Gizmo.Trace.setup([trace_msg_io], service: false, messages: true)
+
+    trace_msg_recv = Gizmo.Mailbox.generate_id("trace_msg_recv")
+    Gizmo.Mailbox.register(trace_msg_recv)
+
+    Gizmo.Mailbox.route(trace_msg_recv, {"test_sender", "hello trace"})
+    receive do
+      {:mailbox_msg, ^trace_msg_recv, {"test_sender", "hello trace"}} -> :ok
+    after
+      1_000 -> :timeout
+    end
+
+    # Also test route_failed
+    Gizmo.Mailbox.route("nonexistent_mb_xyz", {"test_sender", "should fail"})
+
+    Process.sleep(50)
+    {_in, trace_msg_out} = StringIO.contents(trace_msg_io)
+    trace_msg_lines = trace_msg_out |> String.split("\n", trim: true)
+    trace_msg_events = Enum.map(trace_msg_lines, fn line -> :json.decode(line) end)
+    trace_msg_event_names = Enum.map(trace_msg_events, fn e -> Map.get(e, "event") end)
+
+    failures = failures ++ assert_eq(
+      "message trace has msg:route",
+      "msg:route" in trace_msg_event_names,
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "message trace has msg:route_failed",
+      "msg:route_failed" in trace_msg_event_names,
+      true
+    )
+
+    # Verify msg:route has expected fields
+    msg_route = Enum.find(trace_msg_events, fn e -> Map.get(e, "event") == "msg:route" end)
+
+    failures = failures ++ assert_eq(
+      "msg:route has from field",
+      Map.get(msg_route, "from"),
+      "test_sender"
+    )
+
+    failures = failures ++ assert_eq(
+      "msg:route has content_preview",
+      Map.get(msg_route, "content_preview"),
+      "hello trace"
+    )
+
+    Gizmo.Mailbox.unregister(trace_msg_recv)
+    StringIO.close(trace_msg_io)
+
+    # Reset persistent_term trace config
+    :persistent_term.put({Gizmo.Trace, :service}, false)
+    :persistent_term.put({Gizmo.Trace, :messages}, false)
+
+    IO.puts("")
+
     # 15. LLM test (only if API key is set)
     IO.puts("--- LLM (Anthropic) ---")
 
@@ -4826,6 +5028,14 @@ defmodule Gizmo.CLI do
       end
 
     trace_outputs = if trace_outputs == [], do: nil, else: trace_outputs
+
+    # Store global trace config for services and mailbox routing
+    if trace_outputs do
+      Gizmo.Trace.setup(trace_outputs,
+        service: opts[:trace_service] || false,
+        messages: opts[:trace_messages] || false
+      )
+    end
 
     # Silence Logger when tracing
     if trace_outputs, do: Logger.configure(level: :none)
