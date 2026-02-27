@@ -53,7 +53,7 @@ new messages — useful for long-running daemon-style agents.
 |---------|-----------|----------|
 | `send`  | `send(mailbox_id, msg)` | Async fire-and-forget message to any mailbox. Non-blocking. |
 | `receive` | `receive(dest)` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
-| `spawn` | `spawn([frames...], dest)` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Options: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor). |
+| `spawn` | `spawn([frames...], dest)` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Options: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated). |
 | `trap` | `trap(pattern, [frames...])` | Register interrupt handler. Regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
 
 All message content is interpolated (`${name}` from bindings) at operation
@@ -132,7 +132,7 @@ Each op is an object with an `"op"` field and op-specific parameters:
 |----|--------|---------|
 | `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
 | `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
-| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
+| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`], [`name`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
 | `trap` | `pattern`, `frames` | `{"op": "trap", "pattern": "^alert:", "frames": ["handle ${_interrupt}"]}` |
 | `trap` (clear) | `pattern`, `frames=[]` | `{"op": "trap", "pattern": ".*", "frames": []}` |
 
@@ -244,13 +244,30 @@ Multiple files can be loaded as frames:
 - `gizmo task.txt` — frames=[task], boot_frame=task (backward compatible)
 - `gizmo a.txt b.txt` — frames=[a, b], boot_frame=a
 - `gizmo --boot sys.txt task.txt` — frames=[sys, task], boot_frame=sys
+- `gizmo --each a.txt b.txt` — one independent agent per file
+- `gizmo --each --boot sys.txt a.txt b.txt` — each agent gets [sys, file]
 
 With `--boot`, the boot frame is separate from task frames. Without it, the
 first positional file serves as both. This lets you reuse a generic boot
 frame (with sections, idle behavior, etc.) across different task files.
 
+With `--each`, each positional file becomes an independent agent instead of
+being stacked into one. Combined with `--boot`, each agent gets the boot
+frame as its first frame and the positional file as its second.
+
 Different boot frames = different "OS distributions." Same kernel, different
 preloaded services and instructions.
+
+### Agent naming
+
+By default, agents get auto-generated mailbox IDs like `agent_1`, `agent_2`.
+The `--name <id>` CLI flag sets a custom mailbox ID for the root agent. In
+spawn ops, `"name": "worker"` gives the child a custom ID. Names must be
+unique — registration fails (crashing the spawning agent) if the name is
+already taken.
+
+Named agents are easier to address in boot frames, debug in logs, and
+filter in traces.
 
 ## Message-Driven Eval Loop
 

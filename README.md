@@ -90,6 +90,8 @@ elixir gizmo.exs my_task.txt
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
 | `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
+| `--name <id>` | Custom mailbox ID for the root agent |
+| `--each` | Spawn one agent per positional file (instead of stacking) |
 | `--runtime <file>` | Use a custom runtime preamble instead of the built-in one |
 | `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
 | `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
@@ -98,7 +100,8 @@ elixir gizmo.exs my_task.txt
 
 Without `--boot`, the first positional file is the boot frame and any additional
 files are stacked on top. With `--boot`, the boot file is used for idle recovery
-and all positional files are task frames.
+and all positional files are task frames. With `--each`, each positional file
+becomes a separate independent agent.
 
 ### Signal handling
 
@@ -116,6 +119,15 @@ elixir gizmo.exs -v test/05_loop.txt
 
 # Multi-file stack with separate boot frame
 elixir gizmo.exs --boot sys.txt task.txt
+
+# Named root agent
+elixir gizmo.exs --name mybot task.txt
+
+# One agent per file
+elixir gizmo.exs --each a.txt b.txt
+
+# Each agent gets sys.txt as boot frame
+elixir gizmo.exs --each --boot sys.txt a.txt b.txt
 
 # Limit eval cycles
 elixir gizmo.exs --max-cycles 10 task.txt
@@ -137,6 +149,8 @@ test/              # Example boot frames
   08_lucky_number.txt # Grind child + reaper (dice game)
   09_lucky_number_idle.txt # Idle child + trap (dice game variant)
   10_marketplace.txt # Disowned peers + blackboard discovery (marketplace)
+  11a_named_spawn.txt # Named child spawn (custom mailbox ID)
+  11b_each_hello.txt  # Per-file agent for --each mode
 ARCHITECTURE.md    # Runtime design and process model
 DEVELOPMENT.md     # Development stages and roadmap
 PROMPTING.md       # Guide for writing boot frames

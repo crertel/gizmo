@@ -357,6 +357,11 @@ Use `"disown": true` on `spawn` to create a fully independent peer agent:
 no `${_parent}` binding, no death monitor. Disowned agents must discover
 each other through shared services like the blackboard.
 
+You can also give agents custom mailbox IDs with `"name": "worker"` on
+`spawn`. This makes the child addressable by a known name instead of an
+auto-generated `agent_N`. The name must be unique — spawn fails if the
+name is already registered.
+
 Since children can't inherit parent sections (see above), use the
 **binding-conditional single-frame** pattern: put the child's entire
 multi-phase program in one section, use `@0` to loop, and check binding
@@ -397,7 +402,7 @@ Otherwise: Return frames: ["@wait-result"]. No ops.
 @@end
 
 1. Spawn with frames: ["@bank-program"], dest "bank_id",
-   "grind": true, "disown": true.
+   "grind": true, "disown": true, "name": "bank".
 2. Return frames: ["@wait-result"].
 ```
 
@@ -817,6 +822,8 @@ To cancel all your timers:
 | `--log-timings` | Show LLM call, cycle, wall-clock timing, and cache stats per eval cycle |
 | `--log-full-prompts` | Show full system prompt and user message each cycle |
 | `--runtime <file>` | Use custom runtime preamble instead of built-in |
+| `--name <id>` | Custom mailbox ID for the root agent |
+| `--each` | Spawn one agent per positional file (instead of stacking) |
 | `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
 | `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
 | `--trace` | Emit NDJSON trace to stderr (silences logger) |
@@ -852,6 +859,35 @@ elixir gizmo.exs --boot sys.txt task.txt
 ```
 
 This lets you reuse a generic boot frame (with sections, idle behavior, etc.)
+
+### `--name <id>`
+
+Give the root agent a human-readable mailbox ID instead of auto-generated
+`agent_1`. Useful for tracing, debugging, and addressing the agent by name
+in boot frames.
+
+```bash
+elixir gizmo.exs --name mybot task.txt
+```
+
+In spawn ops, use `"name": "worker"` for the same effect on child agents.
+
+### `--each`
+
+Spawn one independent agent per positional file, instead of stacking all
+files into a single agent's context stack. Each agent runs independently
+with its own mailbox, bindings, and lifecycle.
+
+```bash
+# Two independent agents, one per file
+elixir gizmo.exs --each a.txt b.txt
+
+# Each agent gets sys.txt as boot frame
+elixir gizmo.exs --each --boot sys.txt a.txt b.txt
+```
+
+`--each` cannot be combined with `--name` (ambiguous — which agent gets
+the name?). The runtime waits for all agents to exit before shutting down.
 
 ### `--trace` and `--trace-file`
 

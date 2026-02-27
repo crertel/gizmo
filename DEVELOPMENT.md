@@ -199,6 +199,23 @@ mailbox ID to the reaper.
 - [x] Tests: parent kills child, sibling rejected (smoke tests in `--test`)
 - [x] Test frame: `test/08_lucky_number.txt` — grind child rolls dice, parent reaps on 1
 
+## Stage 14: Agent Naming and Multi-Agent CLI
+
+Human-readable agent IDs and per-file agent spawning from the command line.
+
+- [x] `name` option on `spawn` op: custom mailbox ID for child agents
+- [x] `validate_spawn_string/4` helper for string spawn options
+- [x] Registration failure crashes the agent (name collision = hard crash)
+- [x] `--name <id>` CLI flag for root agent naming
+- [x] `--each` CLI flag: spawn one agent per positional file
+- [x] `--each` + `--boot`: each agent gets boot frame + its positional file
+- [x] `--each` + `--name` mutual exclusion check
+- [x] `setup_runtime/1` helper factored from `run/2` (shared by `run` and `run_each`)
+- [x] `wait_all/1` for monitoring multiple agent exits
+- [x] Runtime prompt updated with `name` option in spawn docs
+- [x] Tests: parse name string/error, named spawn behavior, name collision crash
+- [x] Test frames: `test/11a_named_spawn.txt`, `test/11b_each_hello.txt`
+
 ## Deferred / Future
 
 These are explicitly out of scope for the initial build but noted for later:

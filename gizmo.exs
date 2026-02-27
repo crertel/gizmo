@@ -254,6 +254,11 @@ defmodule Gizmo.LLM do
                 type: "boolean",
                 description:
                   "Detach child from parent (no _parent binding, no death monitor). Default: false."
+              },
+              name: %{
+                type: "string",
+                description:
+                  "Custom mailbox ID for the child (for spawn). Must be unique. Default: auto-generated."
               }
             }
           }
@@ -349,7 +354,8 @@ defmodule Gizmo.LLM do
 
     with {:ok, opts} <- validate_spawn_bool(op, "grind", :grind, opts),
          {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
-         {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts) do
+         {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts),
+         {:ok, opts} <- validate_spawn_string(op, "name", :name, opts) do
       {:ok, opts}
     end
   end
@@ -359,6 +365,14 @@ defmodule Gizmo.LLM do
       nil -> {:ok, opts}
       v when is_boolean(v) -> {:ok, Map.put(opts, atom_key, v)}
       _ -> {:error, {:invalid_op, "spawn", "#{json_key} must be a boolean"}}
+    end
+  end
+
+  defp validate_spawn_string(op, json_key, atom_key, opts) do
+    case op[json_key] do
+      nil -> {:ok, opts}
+      v when is_binary(v) -> {:ok, Map.put(opts, atom_key, v)}
+      _ -> {:error, {:invalid_op, "spawn", "#{json_key} must be a string"}}
     end
   end
 
@@ -1594,8 +1608,8 @@ defmodule Gizmo.Agent.Wrapper do
     trace_outputs = Keyword.get(opts, :trace_outputs, nil)
     runtime_preamble = Keyword.get(opts, :runtime_preamble, Gizmo.Agent.runtime_prompt())
 
-    mailbox_id = Gizmo.Mailbox.generate_id("agent")
-    Gizmo.Mailbox.register(mailbox_id, parent)
+    mailbox_id = Keyword.get(opts, :name) || Gizmo.Mailbox.generate_id("agent")
+    :ok = Gizmo.Mailbox.register(mailbox_id, parent)
     Logger.metadata(agent_id: mailbox_id)
 
     msgs_queue_mb = Gizmo.Mailbox.generate_id("msgs")
@@ -1723,14 +1737,17 @@ defmodule Gizmo.Agent do
       do NOT need receive — messages arrive automatically as ${_msg} between
       cycles. Use receive only in grind mode or when you need to explicitly
       block mid-cycle.
-    - spawn(frames, dest, [grind], [idle], [disown]): Create a child process with
-      the given frames as its context stack. The child's mailbox ID is stored in
-      the binding named by `dest`. The child receives ${_parent} bound to your
-      mailbox ID. Optional: set "grind": true/false to override the child's loop
-      mode (default: inherit parent). Set "idle": true/false to control whether
-      the child restores its boot frame on empty frames (default: inherit parent).
-      Set "disown": true to detach the child — it won't have ${_parent} and
-      the parent won't receive child_died notifications for it.
+    - spawn(frames, dest, [grind], [idle], [disown], [name]): Create a child
+      process with the given frames as its context stack. The child's mailbox ID
+      is stored in the binding named by `dest`. The child receives ${_parent}
+      bound to your mailbox ID. Optional: set "grind": true/false to override
+      the child's loop mode (default: inherit parent). Set "idle": true/false to
+      control whether the child restores its boot frame on empty frames (default:
+      inherit parent). Set "disown": true to detach the child — it won't have
+      ${_parent} and the parent won't receive child_died notifications for it.
+      Set "name": "worker" to give the child a custom mailbox ID instead of an
+      auto-generated one. The name must be unique — spawn fails if the name is
+      already registered.
     - trap(pattern, frames): Register an interrupt handler. When a message
       matching the regex `pattern` arrives between cycles, the handler frames
       are prepended to your context stack. The message is bound to
@@ -2349,21 +2366,25 @@ defmodule Gizmo.Agent do
 
     disown = Map.get(spawn_opts, :disown, false)
     parent_arg = if disown, do: nil, else: state.mailbox_id
+    child_name = Map.get(spawn_opts, :name, nil)
 
-    {:ok, child_mb, child_pid} =
-      Gizmo.Agent.start(child_frames,
-        parent: parent_arg,
-        chat_fn: state.chat_fn,
-        receive_timeout: state.receive_timeout,
-        max_cycles: state.max_cycles,
-        quit_on_exhaust: child_quit_on_exhaust,
-        grind: child_grind,
-        log_timings: state.log_timings,
-        log_full_prompts: state.log_full_prompts,
-        run_start: state.run_start,
-        trace_outputs: state.trace_outputs,
-        runtime_preamble: state.runtime_preamble
-      )
+    child_opts = [
+      parent: parent_arg,
+      chat_fn: state.chat_fn,
+      receive_timeout: state.receive_timeout,
+      max_cycles: state.max_cycles,
+      quit_on_exhaust: child_quit_on_exhaust,
+      grind: child_grind,
+      log_timings: state.log_timings,
+      log_full_prompts: state.log_full_prompts,
+      run_start: state.run_start,
+      trace_outputs: state.trace_outputs,
+      runtime_preamble: state.runtime_preamble
+    ]
+
+    child_opts = if child_name, do: Keyword.put(child_opts, :name, child_name), else: child_opts
+
+    {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames, child_opts)
 
     # Monitor child: on abnormal exit, notify parent mailbox (skip for disowned children)
     unless disown do
@@ -2432,7 +2453,9 @@ defmodule Gizmo.CLI do
           runtime: :string,
           bash_timeout: :integer,
           dump_runtime: :string,
-          dry_run: :boolean
+          dry_run: :boolean,
+          name: :string,
+          each: :boolean
         ],
         aliases: [v: :verbose]
       )
@@ -2450,6 +2473,13 @@ defmodule Gizmo.CLI do
 
       opts[:dry_run] && args != [] ->
         dry_run(args, opts)
+
+      opts[:each] && opts[:name] ->
+        IO.puts(:stderr, "Error: --each and --name cannot be combined.")
+        System.halt(1)
+
+      opts[:each] && args != [] ->
+        run_each(args, opts)
 
       args != [] ->
         run(args, opts)
@@ -2502,6 +2532,8 @@ defmodule Gizmo.CLI do
       --runtime <file>     Use custom runtime preamble instead of built-in
       --dump-runtime <f>  Write the built-in runtime preamble to <f>
       --dry-run           Print the full initial prompt to stdout and exit
+      --name <id>         Custom mailbox ID for the root agent
+      --each              Spawn one agent per positional file (instead of stacking)
       --trace             Emit NDJSON trace to stderr (silences logger)
       --trace-file <file> Emit NDJSON trace to file (silences logger)
       --trace-service     Include service events in trace (bash, blackboard, watchdog, reaper)
@@ -2511,6 +2543,7 @@ defmodule Gizmo.CLI do
     Positional arguments:
       Without --boot: first file is the boot frame, rest are stacked on top.
       With --boot:    --boot file is the boot frame, positional files are task frames.
+      With --each:    each positional file becomes a separate agent.
 
     Signal handling:
       Ctrl+\\  (SIGQUIT) or kill <pid> (SIGTERM) cleanly stops the runtime.
@@ -2522,6 +2555,9 @@ defmodule Gizmo.CLI do
       elixir gizmo.exs --boot sys.txt task.txt            # separate boot frame
       elixir gizmo.exs --idle --boot sys.txt task.txt      # idle on empty frames (restore boot)
       elixir gizmo.exs --max-cycles 5 task.txt            # limit to 5 eval cycles
+      elixir gizmo.exs --name mybot task.txt              # named root agent
+      elixir gizmo.exs --each a.txt b.txt                 # one agent per file
+      elixir gizmo.exs --each --boot sys.txt a.txt b.txt  # each agent gets sys.txt as boot
       elixir gizmo.exs --test                             # smoke tests
       elixir gizmo.exs --init boot.txt                    # create a starter boot frame
       elixir gizmo.exs --dump-runtime runtime.txt         # export runtime preamble for editing
@@ -2932,6 +2968,37 @@ defmodule Gizmo.CLI do
         assert_error_op(
           "spawn disown non-bool",
           Gizmo.LLM.normalize_eval(bad_spawn_disown),
+          :invalid_op,
+          "spawn"
+        )
+
+    # spawn with name option
+    spawn_name = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "name" => "worker"}],
+      "frames" => []
+    }
+
+    {:ok, spawn_name_result} = Gizmo.LLM.normalize_eval(spawn_name)
+
+    failures =
+      failures ++
+        assert_eq(
+          "spawn with name: \"worker\"",
+          hd(spawn_name_result.ops),
+          {:spawn, ["f"], "c", %{name: "worker"}}
+        )
+
+    # spawn with non-string name → error
+    bad_spawn_name = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "name" => 123}],
+      "frames" => []
+    }
+
+    failures =
+      failures ++
+        assert_error_op(
+          "spawn name non-string",
+          Gizmo.LLM.normalize_eval(bad_spawn_name),
           :invalid_op,
           "spawn"
         )
@@ -4852,6 +4919,137 @@ defmodule Gizmo.CLI do
 
     Gizmo.Mailbox.unregister(disown_test_mb)
 
+    # Test 4: Named spawn — child gets custom mailbox ID
+    name_test_mb = Gizmo.Mailbox.generate_id("name_test")
+    Gizmo.Mailbox.register(name_test_mb)
+    name_parent_cycle = :counters.new(1, [:atomics])
+
+    name_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "named-child") do
+        # Child: report own _self to test mailbox
+        {:ok,
+         %{
+           ops: [{:send, name_test_mb, "self=${_self}"}],
+           frames: [],
+           notes: %{}
+         }}
+      else
+        c = :counters.get(name_parent_cycle, 1)
+        :counters.add(name_parent_cycle, 1, 1)
+
+        case c do
+          0 ->
+            {:ok,
+             %{
+               ops: [{:spawn, ["named-child"], "kid", %{name: "my_worker", grind: true}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _name_mb, name_pid} =
+      Gizmo.Agent.start(["parent: spawn named child"],
+        chat_fn: name_chat_fn,
+        receive_timeout: 5_000,
+        grind: true
+      )
+
+    name_ref = Process.monitor(name_pid)
+
+    name_result =
+      receive do
+        {:mailbox_msg, ^name_test_mb, {_from, msg}} -> msg
+      after
+        10_000 -> :no_message
+      end
+
+    receive do
+      {:DOWN, ^name_ref, :process, ^name_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures =
+      failures ++
+        assert_eq("spawn opts: named child gets custom ID", name_result, "self=my_worker")
+
+    Gizmo.Mailbox.unregister(name_test_mb)
+
+    # Test 5: Name collision — second spawn with same name fails
+    collision_test_mb = Gizmo.Mailbox.generate_id("collision_test")
+    Gizmo.Mailbox.register(collision_test_mb)
+    collision_parent_cycle = :counters.new(1, [:atomics])
+
+    collision_chat_fn = fn system, _messages, _opts ->
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "collide-child") do
+        # Child: idle forever (stay alive to hold the name)
+        {:ok, %{ops: [], frames: ["collide-child"], notes: %{}}}
+      else
+        c = :counters.get(collision_parent_cycle, 1)
+        :counters.add(collision_parent_cycle, 1, 1)
+
+        case c do
+          0 ->
+            # Spawn first child with name "unique_name"
+            {:ok,
+             %{
+               ops: [{:spawn, ["collide-child"], "kid1", %{name: "unique_name", grind: true}}],
+               frames: ["parent: spawn second"],
+               notes: %{}
+             }}
+
+          1 ->
+            # Spawn second child with same name — should fail (crash)
+            {:ok,
+             %{
+               ops: [{:spawn, ["collide-child"], "kid2", %{name: "unique_name", grind: true}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _collision_mb, collision_pid} =
+      Gizmo.Agent.start(["parent: spawn collision test"],
+        chat_fn: collision_chat_fn,
+        receive_timeout: 5_000,
+        grind: true
+      )
+
+    collision_ref = Process.monitor(collision_pid)
+
+    # Parent should crash because the second spawn fails (name already registered)
+    collision_exit =
+      receive do
+        {:DOWN, ^collision_ref, :process, ^collision_pid, reason} -> reason
+      after
+        10_000 -> :timeout
+      end
+
+    # The parent should have died abnormally (match error from Agent.start)
+    failures =
+      failures ++
+        assert_eq(
+          "spawn opts: name collision crashes parent",
+          collision_exit != :normal && collision_exit != :timeout,
+          true
+        )
+
+    Gizmo.Mailbox.unregister(collision_test_mb)
+
     IO.puts("")
 
     # 13b. Cross-lineage messaging via blackboard
@@ -5381,11 +5579,19 @@ defmodule Gizmo.CLI do
     end
   end
 
-  def run(paths, opts) when is_list(paths) do
+  defp read_file!(path) do
+    case File.read(path) do
+      {:ok, content} -> content
+      {:error, reason} ->
+        IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
+        System.halt(1)
+    end
+  end
+
+  defp setup_runtime(opts) do
     configure_logger(opts[:verbose])
 
     thinking = opts[:thinking] || false
-    boot_path = opts[:boot]
     max_cycles = opts[:max_cycles]
     idle = opts[:idle] || false
     grind = opts[:grind] || false
@@ -5415,39 +5621,6 @@ defmodule Gizmo.CLI do
 
     # Silence Logger when tracing
     if trace_outputs, do: Logger.configure(level: :none)
-
-    # Read all positional arg files
-    task_frames =
-      Enum.map(paths, fn path ->
-        case File.read(path) do
-          {:ok, content} ->
-            content
-
-          {:error, reason} ->
-            IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
-            System.halt(1)
-        end
-      end)
-
-    # Determine boot frame and assemble frames list
-    {frames, boot_frame} =
-      if boot_path do
-        case File.read(boot_path) do
-          {:ok, boot_content} ->
-            {[boot_content | task_frames], boot_content}
-
-          {:error, reason} ->
-            IO.puts(:stderr, "Error reading #{boot_path}: #{:file.format_error(reason)}")
-            System.halt(1)
-        end
-      else
-        # First positional arg is the boot frame
-        {task_frames, List.first(task_frames)}
-      end
-
-    Logger.warning(
-      "Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}..."
-    )
 
     run_opts = [run_start: System.monotonic_time(:millisecond)]
 
@@ -5479,14 +5652,7 @@ defmodule Gizmo.CLI do
 
     run_opts =
       if opts[:runtime] do
-        runtime_preamble =
-          case File.read(opts[:runtime]) do
-            {:ok, content} -> content
-            {:error, reason} ->
-              IO.puts(:stderr, "Error reading #{opts[:runtime]}: #{:file.format_error(reason)}")
-              System.halt(1)
-          end
-
+        runtime_preamble = read_file!(opts[:runtime])
         Keyword.put(run_opts, :runtime_preamble, runtime_preamble)
       else
         run_opts
@@ -5507,6 +5673,34 @@ defmodule Gizmo.CLI do
 
     sup_opts = if opts[:bash_timeout], do: [bash_timeout: opts[:bash_timeout]], else: []
     {:ok, _} = Gizmo.Supervision.start_link(sup_opts)
+
+    %{run_opts: run_opts, watchdog_ms: watchdog_ms, trace_file: trace_file, boot_path: opts[:boot]}
+  end
+
+  def run(paths, opts) when is_list(paths) do
+    %{run_opts: run_opts, watchdog_ms: watchdog_ms, trace_file: trace_file, boot_path: boot_path} =
+      setup_runtime(opts)
+
+    run_opts =
+      if opts[:name], do: Keyword.put(run_opts, :name, opts[:name]), else: run_opts
+
+    # Read all positional arg files
+    task_frames = Enum.map(paths, &read_file!/1)
+
+    # Determine boot frame and assemble frames list
+    {frames, boot_frame} =
+      if boot_path do
+        boot_content = read_file!(boot_path)
+        {[boot_content | task_frames], boot_content}
+      else
+        # First positional arg is the boot frame
+        {task_frames, List.first(task_frames)}
+      end
+
+    Logger.warning(
+      "Loaded #{length(frames)} frame(s), boot frame: #{String.slice(boot_frame, 0, 60)}..."
+    )
+
     {:ok, agent_mb, agent_pid} = Gizmo.Agent.start(frames, run_opts)
 
     if watchdog_ms do
@@ -5521,6 +5715,41 @@ defmodule Gizmo.CLI do
 
     if trace_file, do: File.close(trace_file)
     Logger.flush()
+  end
+
+  def run_each(paths, opts) when is_list(paths) do
+    %{run_opts: run_opts, watchdog_ms: watchdog_ms, trace_file: trace_file, boot_path: boot_path} =
+      setup_runtime(opts)
+
+    boot_content = if boot_path, do: read_file!(boot_path), else: nil
+
+    agents =
+      Enum.map(paths, fn path ->
+        content = read_file!(path)
+        frames = if boot_content, do: [boot_content, content], else: [content]
+        {:ok, mb, pid} = Gizmo.Agent.start(frames, run_opts)
+
+        if watchdog_ms do
+          Gizmo.Mailbox.route("watchdog", {mb, "every #{watchdog_ms}"})
+        end
+
+        {mb, pid}
+      end)
+
+    refs = Enum.map(agents, fn {_mb, pid} -> {Process.monitor(pid), pid} end)
+    wait_all(refs)
+
+    if trace_file, do: File.close(trace_file)
+    Logger.flush()
+  end
+
+  defp wait_all([]), do: :ok
+
+  defp wait_all(refs) do
+    receive do
+      {:DOWN, ref, :process, pid, _reason} ->
+        wait_all(Enum.reject(refs, fn {r, p} -> r == ref and p == pid end))
+    end
   end
 end
 
