@@ -49,12 +49,12 @@ new messages — useful for long-running daemon-style agents.
 
 ## Ops
 
-| Op | Signature | Behavior |
+| Op | JSON format | Behavior |
 |---------|-----------|----------|
-| `send`  | `send(mailbox_id, msg)` | Async fire-and-forget message to any mailbox. Non-blocking. |
-| `receive` | `receive(dest)` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
-| `spawn` | `spawn([frames...], dest)` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Options: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated). |
-| `trap` | `trap(pattern, [frames...])` | Register interrupt handler. Regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
+| `send`  | `{"op": "send", "mailbox": "...", "msg": "..."}` | Async fire-and-forget message to any mailbox. Non-blocking. |
+| `receive` | `{"op": "receive", "dest": "..."}` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
+| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Optional fields: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated). |
+| `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register interrupt handler. PCRE regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
 
 All message content is interpolated (`${name}` from bindings) at operation
 time.
@@ -76,7 +76,7 @@ Per-agent state (not well-known, created per agent instance):
 
 | Component | Scope | Purpose |
 |-----------|-------|---------|
-| **bindings** | in-process | Named bindings map. Values from `receive(dest)`, `spawn(dest)`, and runtime (`_self`, `_parent`). Threaded through eval loop. |
+| **bindings** | in-process | Named bindings map. Values from `receive` (`dest`), `spawn` (`dest`), and runtime (`_self`, `_parent`). Threaded through eval loop. |
 | **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. |
 
 ## Eval Loop Detail
@@ -143,7 +143,7 @@ parsing ambiguity and the need for a text parser.
 ## Interpolation
 
 - `${name}` — named binding resolved from bindings map (populated by
-  `receive(dest)`, `spawn(dest)`, and runtime bindings `_self`/`_parent`)
+  `receive` (`dest`), `spawn` (`dest`), and runtime bindings `_self`/`_parent`)
 - `@N` — inject frame N (0-indexed) from the current context stack
 - `@name` — inject contents of a named section (`@@section-name` ... `@@end`)
 - `$$` — literal `$`; `@@` — literal `@`
@@ -287,18 +287,22 @@ calls on idle spinning.
 
 A single-slot interrupt handler registered via the `trap` op:
 
-```
-trap("^alert:", ["Handle alert: ${_interrupt}"])
+```json
+{"op": "trap", "pattern": "^alert:", "frames": ["Handle alert: ${_interrupt}"]}
 ```
 
-When a message matching the regex pattern arrives between cycles:
+When a message matching the PCRE regex pattern arrives between cycles:
 1. Handler frames are prepended to the context stack.
 2. `${_interrupt}` and `${_interrupt_source}` are bound.
 3. `${_msg}` and `${_msg_source}` are also bound as usual.
 
 The trap persists across cycles — it fires again on the next matching
 message. Only one trap can be active; a new `trap` replaces the old one.
-`trap(pattern, [])` with empty frames clears it.
+Pass empty frames to clear it:
+
+```json
+{"op": "trap", "pattern": ".*", "frames": []}
+```
 
 This enables spawn simplification: a parent spawns a child, continues
 sleeping, and naturally wakes when the child's message arrives. No
