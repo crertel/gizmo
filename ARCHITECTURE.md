@@ -66,7 +66,7 @@ by `Gizmo.Supervision`. They are not syscalls.
 
 | Service | Mailbox | Purpose |
 |---------|---------|---------|
-| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `{read, key}` / `{write, key, value}`. |
+| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `"read <key>"` / `"write <key> <value>"`. |
 | **bash** | `"bash"` | Shell command execution. Send command string, get output back. |
 | **human** | `"human"` | Terminal output. Send text to display to the user. |
 | **human_input** | `"human_input"` | Terminal input. Send a prompt string, receive the user's typed response. |

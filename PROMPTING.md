@@ -760,8 +760,8 @@ Raw commands use the default timeout in kill mode. Use `0` for no timeout.
 Key-value store. Send commands as strings. The result arrives as `${_msg}`
 on the next cycle.
 
-- **Write:** `{write, key, value}` or `write key value` — returns `"ok"`
-- **Read:** `{read, key}` or `read key` — returns the value (or empty
+- **Write:** `"write <key> <value>"` — returns `"ok"`
+- **Read:** `"read <key>"` — returns the value (or empty
   string if key doesn't exist)
 
 Both comma-separated and space-separated formats are accepted. Braces are

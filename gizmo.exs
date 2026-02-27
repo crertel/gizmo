@@ -1808,9 +1808,9 @@ defmodule Gizmo.Agent do
 
       Normal completion: stdout as ${_msg} (exit 0) or
         "error: exit code N: <output>" (non-zero exit).
-    - blackboard: Key-value store. Send {read, key} or {write, key, value}.
+    - blackboard: Key-value store. Send "read <key>" or "write <key> <value>".
       The result arrives as ${_msg} on your next cycle. Read returns the
-      value, write returns "ok".
+      value (or "" if missing), write returns "ok".
     - exception: Error notification sink. The runtime sends error tuples here
       when an agent exceeds retry or cycle limits. You do not normally send
       to this mailbox yourself.
@@ -1836,6 +1836,19 @@ defmodule Gizmo.Agent do
     To get periodic heartbeats, send "every N" to the "watchdog" mailbox
     (N in milliseconds). The watchdog delivers "watchdog:tick" from source
     "watchdog" on each interval. Send "cancel" to stop all your timers.
+
+    ## Grind mode
+
+    In grind mode (set via --grind flag or "grind": true in spawn), the
+    process loops continuously without waiting for messages between cycles.
+    ${_msg} and ${_msg_source} are NOT re-bound after the first cycle —
+    they stay as "init"/"runtime". Use explicit receive(dest) ops to block
+    for messages when needed. Bindings from receive and spawn persist
+    across cycles as long as the frame stack does not drain to [].
+
+    Grind mode is useful for worker agents that need to churn through
+    multi-step work using blocking receive ops rather than waiting for
+    messages to arrive between cycles.
 
     ## Trap (interrupt handler)
 
@@ -1893,6 +1906,33 @@ defmodule Gizmo.Agent do
 
     6. When terminating (frames: []), just send any final messages and
        return empty frames. Do NOT return continuation frames after [].
+
+    ## Examples
+
+    One-shot greeter (send to human, terminate):
+      {"ops": [{"op": "send", "mailbox": "human", "msg": "Hello!"}],
+       "frames": [], "notes": {}}
+
+    Bash call with continuation (message-driven):
+      Cycle 1 — send command, return frame describing what to do with output:
+      {"ops": [{"op": "send", "mailbox": "bash", "msg": "uname -a"}],
+       "frames": ["The bash output arrived as ${_msg}. Send it to 'human', then terminate."],
+       "notes": {}}
+      Cycle 2 — ${_msg} now contains the bash output:
+      {"ops": [{"op": "send", "mailbox": "human", "msg": "System: ${_msg}"}],
+       "frames": [], "notes": {}}
+
+    Named section workflow (advance to next step):
+      If your boot frame defines @@step2 ... @@end:
+      {"ops": [{"op": "send", "mailbox": "bash", "msg": "ls"}],
+       "frames": ["@step2"], "notes": {}}
+
+    Spawn child and receive result (grind mode):
+      {"ops": [
+         {"op": "spawn", "frames": ["Send 'done' to ${_parent}, then terminate."], "dest": "kid"},
+         {"op": "receive", "dest": "result"}
+       ],
+       "frames": ["@0"], "notes": {"result": "child's reply"}}
     """
   end
 
