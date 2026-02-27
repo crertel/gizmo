@@ -97,6 +97,14 @@ elixir gizmo.exs my_task.txt
 | `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
 | `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
 | `--list-models` | List available models from configured backend(s) |
+| `--test` | Run smoke tests, then exit |
+| `--log-timings` | Show LLM call, cycle, and wall-clock timing per eval cycle |
+| `--log-full-prompts` | Show full system prompt and user message each cycle |
+| `--trace` | Emit NDJSON trace to stderr (silences logger) |
+| `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
+| `--trace-service` | Include service events in trace (bash, blackboard, watchdog, reaper) |
+| `--trace-messages` | Include message routing events in trace |
+| `--bash-timeout N` | Default bash command timeout in ms (default: 60000, 0 = none) |
 
 ### Positional arguments
 
@@ -156,6 +164,8 @@ test/              # Example boot frames
 ARCHITECTURE.md    # Runtime design and process model
 DEVELOPMENT.md     # Development stages and roadmap
 PROMPTING.md       # Guide for writing boot frames
+FUTURE_WORK.md     # Ideas for future development
+DEAD_ENDS.md       # Approaches tried and abandoned
 ```
 
 ## Further reading

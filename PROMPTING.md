@@ -812,6 +812,7 @@ To cancel all your timers:
 | `-vv` | + ops per cycle (send, receive, spawn, trap) |
 | `-vvv` | + bindings, full frame content |
 | `--thinking` | Enable extended thinking (Anthropic only) |
+| `--model <id>` | LLM model to use (default: env var or `claude-sonnet-4-20250514`) |
 | `--test` | Run built-in smoke tests |
 | `--init <file>` | Generate a starter boot frame |
 | `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
@@ -829,6 +830,9 @@ To cancel all your timers:
 | `--list-models` | List available models from configured backend(s) |
 | `--trace` | Emit NDJSON trace to stderr (silences logger) |
 | `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
+| `--trace-service` | Include service events in trace (bash, blackboard, watchdog, reaper) |
+| `--trace-messages` | Include message routing events in trace |
+| `--bash-timeout N` | Default bash command timeout in ms (default: 60000, 0 = none) |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
 responding. This can help with complex multi-step tasks where the LLM needs

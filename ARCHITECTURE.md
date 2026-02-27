@@ -53,7 +53,7 @@ new messages — useful for long-running daemon-style agents.
 |---------|-----------|----------|
 | `send`  | `{"op": "send", "mailbox": "...", "msg": "..."}` | Async fire-and-forget message to any mailbox. Non-blocking. |
 | `receive` | `{"op": "receive", "dest": "..."}` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
-| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Optional fields: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated). |
+| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Optional fields: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated), `model` (override LLM model for child). |
 | `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register interrupt handler. PCRE regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
 
 All message content is interpolated (`${name}` from bindings) at operation
@@ -71,6 +71,8 @@ by `Gizmo.Supervision`. They are not syscalls.
 | **human** | `"human"` | Terminal output. Send text to display to the user. |
 | **human_input** | `"human_input"` | Terminal input. Send a prompt string, receive the user's typed response. |
 | **exception** | `"exception"` | Error notification sink. Receives agent retry/cycle exhaustion reports. |
+| **reaper** | `"reaper"` | Agent lifecycle. Send a mailbox ID to kill a descendant. |
+| **watchdog** | `"watchdog"` | Timer service. Periodic/one-shot tick messages. |
 
 Per-agent state (not well-known, created per agent instance):
 
@@ -132,7 +134,7 @@ Each op is an object with an `"op"` field and op-specific parameters:
 |----|--------|---------|
 | `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
 | `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
-| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`], [`name`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
+| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`], [`name`], [`model`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
 | `trap` | `pattern`, `frames` | `{"op": "trap", "pattern": "^alert:", "frames": ["handle ${_interrupt}"]}` |
 | `trap` (clear) | `pattern`, `frames=[]` | `{"op": "trap", "pattern": ".*", "frames": []}` |
 
@@ -188,6 +190,8 @@ Gizmo.Supervision (one_for_one)
 ├── Gizmo.Services.Human ("human")
 ├── Gizmo.Services.HumanInput ("human_input")
 ├── Gizmo.Services.Exception ("exception")
+├── Gizmo.Services.Reaper ("reaper")
+├── Gizmo.Services.Watchdog ("watchdog")
 └── Gizmo.AgentSupervisor (DynamicSupervisor)
     ├── Agent via Wrapper (:temporary)
     ├── Agent via Wrapper (:temporary)
@@ -325,5 +329,5 @@ Useful for agents that need periodic think-ticks without external stimulus.
 - **JSON:** Req handles JSON encoding/decoding; Erlang `:json` for edge cases
 - **Process model:** OTP process (`:proc_lib` via `Gizmo.Agent.Wrapper`) per agent, `DynamicSupervisor` for spawn
 - **Message routing:** Elixir Registry
-- **LLM backend:** Claude API via Req
+- **LLM backend:** Anthropic Claude and OpenAI-compatible APIs via Req
 - **Human interface:** Initially IO, later Phoenix LiveView
