@@ -1704,8 +1704,9 @@ defmodule Gizmo.Agent do
 
     - ops: a list of operations to execute, in order.
     - frames: replacement frames for your context stack. These define what you
-      will see as your system prompt on the NEXT eval cycle. An empty array []
-      means this process is finished and should be removed from the stack.
+      will see as your system prompt on the NEXT eval cycle. Multiple frames
+      are concatenated in order with --- separators. An empty array [] means
+      this process is finished (or in idle mode, resets to the boot frame).
     - notes: an object mapping binding names to short descriptions. Use this to
       annotate what each binding contains. Notes persist across cycles and are
       shown alongside binding values in the user message.
@@ -1849,6 +1850,17 @@ defmodule Gizmo.Agent do
     Grind mode is useful for worker agents that need to churn through
     multi-step work using blocking receive ops rather than waiting for
     messages to arrive between cycles.
+
+    ## Idle mode
+
+    By default, returning frames: [] terminates the process. In idle mode
+    (set via --idle flag or "idle": true in spawn), returning empty frames
+    instead restores the boot frame (your initial context stack) and the
+    process waits for a new message. Bindings are reset to just ${_self}
+    and ${_parent} — all other bindings from the previous run are cleared.
+
+    Idle mode is useful for long-running daemon-style agents that handle
+    repeated requests. Each request starts fresh from the boot frame.
 
     ## Trap (interrupt handler)
 
