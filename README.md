@@ -90,6 +90,9 @@ elixir gizmo.exs my_task.txt
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
 | `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
+| `--runtime <file>` | Use a custom runtime preamble instead of the built-in one |
+| `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
+| `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
 
 ### Positional arguments
 

@@ -817,6 +817,8 @@ To cancel all your timers:
 | `--log-timings` | Show LLM call, cycle, wall-clock timing, and cache stats per eval cycle |
 | `--log-full-prompts` | Show full system prompt and user message each cycle |
 | `--runtime <file>` | Use custom runtime preamble instead of built-in |
+| `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
+| `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
 | `--trace` | Emit NDJSON trace to stderr (silences logger) |
 | `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
 

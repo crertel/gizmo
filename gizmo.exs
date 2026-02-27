@@ -2378,7 +2378,9 @@ defmodule Gizmo.CLI do
           trace_service: :boolean,
           trace_messages: :boolean,
           runtime: :string,
-          bash_timeout: :integer
+          bash_timeout: :integer,
+          dump_runtime: :string,
+          dry_run: :boolean
         ],
         aliases: [v: :verbose]
       )
@@ -2390,6 +2392,12 @@ defmodule Gizmo.CLI do
 
       opts[:init] ->
         init_boot_frame(opts[:init])
+
+      opts[:dump_runtime] ->
+        dump_runtime(opts[:dump_runtime])
+
+      opts[:dry_run] && args != [] ->
+        dry_run(args, opts)
 
       args != [] ->
         run(args, opts)
@@ -2440,6 +2448,8 @@ defmodule Gizmo.CLI do
       --log-timings       Show LLM call, cycle, and wall-clock timing per eval cycle
       --log-full-prompts  Show full system prompt and user message each cycle
       --runtime <file>     Use custom runtime preamble instead of built-in
+      --dump-runtime <f>  Write the built-in runtime preamble to <f>
+      --dry-run           Print the full initial prompt to stdout and exit
       --trace             Emit NDJSON trace to stderr (silences logger)
       --trace-file <file> Emit NDJSON trace to file (silences logger)
       --trace-service     Include service events in trace (bash, blackboard, watchdog, reaper)
@@ -2462,6 +2472,8 @@ defmodule Gizmo.CLI do
       elixir gizmo.exs --max-cycles 5 task.txt            # limit to 5 eval cycles
       elixir gizmo.exs --test                             # smoke tests
       elixir gizmo.exs --init boot.txt                    # create a starter boot frame
+      elixir gizmo.exs --dump-runtime runtime.txt         # export runtime preamble for editing
+      elixir gizmo.exs --dry-run task.txt                  # preview the full initial prompt
     """)
   end
 
@@ -2478,6 +2490,62 @@ defmodule Gizmo.CLI do
     File.write!(path, boot_prompt())
     IO.puts("Wrote starter boot frame to #{path}")
     IO.puts("Edit the '## Your task' section, then run: elixir gizmo.exs #{path}")
+  end
+
+  defp dump_runtime(path) do
+    if File.exists?(path) do
+      IO.puts(
+        :stderr,
+        "Error: #{path} already exists. Remove it first or choose a different name."
+      )
+
+      System.halt(1)
+    end
+
+    File.write!(path, Gizmo.Agent.runtime_prompt())
+    IO.puts("Wrote built-in runtime preamble to #{path}")
+    IO.puts("Use it with: elixir gizmo.exs --runtime #{path} task.txt")
+  end
+
+  defp dry_run(paths, opts) do
+    boot_path = opts[:boot]
+
+    runtime_preamble =
+      if opts[:runtime] do
+        case File.read(opts[:runtime]) do
+          {:ok, content} -> content
+          {:error, reason} ->
+            IO.puts(:stderr, "Error reading #{opts[:runtime]}: #{:file.format_error(reason)}")
+            System.halt(1)
+        end
+      else
+        Gizmo.Agent.runtime_prompt()
+      end
+
+    task_frames =
+      Enum.map(paths, fn path ->
+        case File.read(path) do
+          {:ok, content} -> content
+          {:error, reason} ->
+            IO.puts(:stderr, "Error reading #{path}: #{:file.format_error(reason)}")
+            System.halt(1)
+        end
+      end)
+
+    frames =
+      if boot_path do
+        case File.read(boot_path) do
+          {:ok, boot_content} -> [boot_content | task_frames]
+          {:error, reason} ->
+            IO.puts(:stderr, "Error reading #{boot_path}: #{:file.format_error(reason)}")
+            System.halt(1)
+        end
+      else
+        task_frames
+      end
+
+    frames_text = Enum.join(frames, "\n\n---\n\n")
+    IO.puts(runtime_preamble <> "\n\n---\n\n" <> frames_text)
   end
 
   def boot_prompt do
