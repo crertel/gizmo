@@ -826,6 +826,7 @@ To cancel all your timers:
 | `--each` | Spawn one agent per positional file (instead of stacking) |
 | `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
 | `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
+| `--list-models` | List available models from configured backend(s) |
 | `--trace` | Emit NDJSON trace to stderr (silences logger) |
 | `--trace-file <file>` | Emit NDJSON trace to file (silences logger) |
 

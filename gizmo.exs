@@ -259,6 +259,11 @@ defmodule Gizmo.LLM do
                 type: "string",
                 description:
                   "Custom mailbox ID for the child (for spawn). Must be unique. Default: auto-generated."
+              },
+              model: %{
+                type: "string",
+                description:
+                  "LLM model for the child (for spawn). Default: inherit parent's model."
               }
             }
           }
@@ -355,7 +360,8 @@ defmodule Gizmo.LLM do
     with {:ok, opts} <- validate_spawn_bool(op, "grind", :grind, opts),
          {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
          {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts),
-         {:ok, opts} <- validate_spawn_string(op, "name", :name, opts) do
+         {:ok, opts} <- validate_spawn_string(op, "name", :name, opts),
+         {:ok, opts} <- validate_spawn_string(op, "model", :model, opts) do
       {:ok, opts}
     end
   end
@@ -1768,6 +1774,7 @@ defmodule Gizmo.Agent do
         "idle": true/false — child restores boot frame on empty (default: inherit).
         "disown": true — detach child (no ${_parent}, no death monitor).
         "name": "<id>" — custom mailbox ID (must be unique; spawn fails if taken).
+        "model": "<model_id>" — LLM model for the child (default: inherit parent's model).
 
     - trap: Register an interrupt handler. When a message matching the PCRE
       regex "pattern" arrives between cycles, the handler frames are prepended
@@ -2396,10 +2403,21 @@ defmodule Gizmo.Agent do
     disown = Map.get(spawn_opts, :disown, false)
     parent_arg = if disown, do: nil, else: state.mailbox_id
     child_name = Map.get(spawn_opts, :name, nil)
+    child_model = Map.get(spawn_opts, :model, nil)
+
+    child_chat_fn =
+      if child_model do
+        parent_fn = state.chat_fn
+        fn system, messages, chat_opts ->
+          parent_fn.(system, messages, Keyword.put(chat_opts, :model, child_model))
+        end
+      else
+        state.chat_fn
+      end
 
     child_opts = [
       parent: parent_arg,
-      chat_fn: state.chat_fn,
+      chat_fn: child_chat_fn,
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: child_quit_on_exhaust,
@@ -2484,7 +2502,9 @@ defmodule Gizmo.CLI do
           dump_runtime: :string,
           dry_run: :boolean,
           name: :string,
-          each: :boolean
+          model: :string,
+          each: :boolean,
+          list_models: :boolean
         ],
         aliases: [v: :verbose]
       )
@@ -2496,6 +2516,9 @@ defmodule Gizmo.CLI do
 
       opts[:init] ->
         init_boot_frame(opts[:init])
+
+      opts[:list_models] ->
+        list_models()
 
       opts[:dump_runtime] ->
         dump_runtime(opts[:dump_runtime])
@@ -2551,6 +2574,7 @@ defmodule Gizmo.CLI do
       -vv                 + ops per cycle (send, receive, spawn, trap)
       -vvv                + bindings, full frame content
       --thinking          Enable extended thinking (Anthropic only)
+      --model <id>        LLM model to use (default: env var or claude-sonnet-4-20250514)
       --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
       --idle              Idle (restore boot frame) when frames exhaust instead of terminating
       --grind             Hot-loop eval (no inter-cycle message wait)
@@ -2568,6 +2592,7 @@ defmodule Gizmo.CLI do
       --trace-service     Include service events in trace (bash, blackboard, watchdog, reaper)
       --trace-messages    Include message routing events in trace
       --bash-timeout N    Default bash command timeout in ms (default: 60000, 0 = none)
+      --list-models       List available models from configured backend(s)
 
     Positional arguments:
       Without --boot: first file is the boot frame, rest are stacked on top.
@@ -2622,6 +2647,72 @@ defmodule Gizmo.CLI do
     File.write!(path, Gizmo.Agent.runtime_prompt())
     IO.puts("Wrote built-in runtime preamble to #{path}")
     IO.puts("Use it with: elixir gizmo.exs --runtime #{path} task.txt")
+  end
+
+  defp non_empty_env(var) do
+    case System.get_env(var) do
+      nil -> nil
+      "" -> nil
+      val -> val
+    end
+  end
+
+  defp list_models do
+    anthropic_key = non_empty_env("ANTHROPIC_API_KEY")
+    openai_key = non_empty_env("OPENAI_API_KEY")
+
+    if is_nil(anthropic_key) and is_nil(openai_key) do
+      IO.puts(:stderr, "Error: neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set.")
+      System.halt(1)
+    end
+
+    both = not is_nil(anthropic_key) and not is_nil(openai_key)
+
+    if anthropic_key do
+      if both, do: IO.puts("# Anthropic")
+
+      case Req.get("https://api.anthropic.com/v1/models",
+             headers: [
+               {"x-api-key", anthropic_key},
+               {"anthropic-version", "2023-06-01"}
+             ],
+             receive_timeout: 30_000
+           ) do
+        {:ok, %Req.Response{status: 200, body: %{"data" => data}}} ->
+          data
+          |> Enum.map(& &1["id"])
+          |> Enum.sort()
+          |> Enum.each(&IO.puts/1)
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          IO.puts(:stderr, "Anthropic API error (#{status}): #{inspect(body)}")
+
+        {:error, reason} ->
+          IO.puts(:stderr, "Anthropic request failed: #{inspect(reason)}")
+      end
+    end
+
+    if openai_key do
+      if both, do: IO.puts("\n# OpenAI")
+      base_url = System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1"
+
+      case Req.get("#{base_url}/models",
+             headers: [{"authorization", "Bearer #{openai_key}"}],
+             receive_timeout: 30_000
+           ) do
+        {:ok, %Req.Response{status: 200, body: %{"data" => data}}} ->
+          data
+          |> Enum.map(& &1["id"])
+          |> Enum.sort()
+          |> Enum.each(&IO.puts/1)
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          IO.puts(:stderr, "OpenAI API error (#{status}): #{inspect(body)}")
+
+        {:error, reason} ->
+          IO.puts(:stderr, "OpenAI request failed: #{inspect(reason)}")
+      end
+    end
   end
 
   defp dry_run(paths, opts) do
@@ -3028,6 +3119,37 @@ defmodule Gizmo.CLI do
         assert_error_op(
           "spawn name non-string",
           Gizmo.LLM.normalize_eval(bad_spawn_name),
+          :invalid_op,
+          "spawn"
+        )
+
+    # spawn with model option
+    spawn_model = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "model" => "claude-haiku"}],
+      "frames" => []
+    }
+
+    {:ok, spawn_model_result} = Gizmo.LLM.normalize_eval(spawn_model)
+
+    failures =
+      failures ++
+        assert_eq(
+          "spawn with model: \"claude-haiku\"",
+          hd(spawn_model_result.ops),
+          {:spawn, ["f"], "c", %{model: "claude-haiku"}}
+        )
+
+    # spawn with non-string model → error
+    bad_spawn_model = %{
+      "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "model" => 123}],
+      "frames" => []
+    }
+
+    failures =
+      failures ++
+        assert_error_op(
+          "spawn model non-string",
+          Gizmo.LLM.normalize_eval(bad_spawn_model),
           :invalid_op,
           "spawn"
         )
@@ -5081,6 +5203,142 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
+    # Test 6: spawn with model — child's chat_fn receives model override
+    IO.puts("--- Spawn with Model Override ---")
+
+    model_test_mb = Gizmo.Mailbox.generate_id("model_test")
+    Gizmo.Mailbox.register(model_test_mb, self())
+
+    model_parent_cycle = :counters.new(1, [:atomics])
+
+    model_chat_fn = fn system, _messages, chat_opts ->
+      sys = flatten_system_for_test(system)
+
+      if String.contains?(sys, "model-child") do
+        model_val = Keyword.get(chat_opts, :model, "none")
+
+        {:ok,
+         %{
+           ops: [{:send, model_test_mb, "model=#{model_val}"}],
+           frames: [],
+           notes: %{}
+         }}
+      else
+        c = :counters.get(model_parent_cycle, 1)
+        :counters.add(model_parent_cycle, 1, 1)
+
+        case c do
+          0 ->
+            {:ok,
+             %{
+               ops: [{:spawn, ["model-child"], "kid", %{model: "test-model", grind: true}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _model_mb, model_pid} =
+      Gizmo.Agent.start(["parent: spawn child with model"],
+        chat_fn: model_chat_fn,
+        receive_timeout: 5_000,
+        grind: true
+      )
+
+    model_ref = Process.monitor(model_pid)
+
+    model_result =
+      receive do
+        {:mailbox_msg, ^model_test_mb, {_from, msg}} -> msg
+      after
+        10_000 -> :no_message
+      end
+
+    receive do
+      {:DOWN, ^model_ref, :process, ^model_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures =
+      failures ++
+        assert_eq("spawn opts: child receives model override", model_result, "model=test-model")
+
+    # Test 7: spawn without model — child inherits parent's chat_fn unchanged
+    model_inherit_test_mb = Gizmo.Mailbox.generate_id("model_inherit_test")
+    Gizmo.Mailbox.register(model_inherit_test_mb, self())
+
+    model_inherit_parent_cycle = :counters.new(1, [:atomics])
+
+    model_inherit_chat_fn = fn system, _messages, chat_opts ->
+      sys = flatten_system_for_test(system)
+      model_val = Keyword.get(chat_opts, :model, "none")
+
+      if String.contains?(sys, "inherit-child") do
+        {:ok,
+         %{
+           ops: [{:send, model_inherit_test_mb, "child_model=#{model_val}"}],
+           frames: [],
+           notes: %{}
+         }}
+      else
+        c = :counters.get(model_inherit_parent_cycle, 1)
+        :counters.add(model_inherit_parent_cycle, 1, 1)
+
+        case c do
+          0 ->
+            {:ok,
+             %{
+               ops: [{:spawn, ["inherit-child"], "kid", %{grind: true}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          _ ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
+      end
+    end
+
+    {:ok, _inherit_mb, inherit_pid} =
+      Gizmo.Agent.start(["parent: spawn child without model"],
+        chat_fn: model_inherit_chat_fn,
+        receive_timeout: 5_000,
+        grind: true
+      )
+
+    inherit_ref = Process.monitor(inherit_pid)
+
+    inherit_result =
+      receive do
+        {:mailbox_msg, ^model_inherit_test_mb, {_from, msg}} -> msg
+      after
+        10_000 -> :no_message
+      end
+
+    receive do
+      {:DOWN, ^inherit_ref, :process, ^inherit_pid, _} -> :ok
+    after
+      5_000 -> :timeout
+    end
+
+    failures =
+      failures ++
+        assert_eq(
+          "spawn opts: child without model inherits parent chat_fn",
+          inherit_result,
+          "child_model=none"
+        )
+
+    Gizmo.Mailbox.unregister(model_test_mb)
+    Gizmo.Mailbox.unregister(model_inherit_test_mb)
+
+    IO.puts("")
+
     # 13b. Cross-lineage messaging via blackboard
     IO.puts("--- Cross-Lineage Messaging ---")
 
@@ -5660,6 +5918,19 @@ defmodule Gizmo.CLI do
         end
 
         Keyword.put(run_opts, :chat_fn, chat_fn)
+      else
+        run_opts
+      end
+
+    model = opts[:model]
+
+    run_opts =
+      if model do
+        chat_fn = run_opts[:chat_fn] || (&Gizmo.LLM.Anthropic.chat/3)
+        wrapped = fn system, messages, chat_opts ->
+          chat_fn.(system, messages, Keyword.put(chat_opts, :model, model))
+        end
+        Keyword.put(run_opts, :chat_fn, wrapped)
       else
         run_opts
       end

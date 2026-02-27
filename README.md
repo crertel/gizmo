@@ -84,6 +84,7 @@ elixir gizmo.exs my_task.txt
 |------|-------------|
 | `-v` | Verbose mode — shows ops, frames, bindings each cycle |
 | `--thinking` | Enable extended thinking |
+| `--model <id>` | LLM model to use (default: env var or `claude-sonnet-4-20250514`) |
 | `--init <file>` | Generate a starter boot frame file |
 | `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
 | `--idle` | Idle (restore boot frame) when frames exhaust instead of terminating |
@@ -95,6 +96,7 @@ elixir gizmo.exs my_task.txt
 | `--runtime <file>` | Use a custom runtime preamble instead of the built-in one |
 | `--dump-runtime <file>` | Write the built-in runtime preamble to a file for editing |
 | `--dry-run` | Print the full initial prompt (runtime + frames) to stdout and exit |
+| `--list-models` | List available models from configured backend(s) |
 
 ### Positional arguments
 
