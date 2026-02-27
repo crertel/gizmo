@@ -68,3 +68,25 @@ Open questions: redaction vs rejection (replace with `[REDACTED]` vs fail the
 op), pattern source (inline in pledge vs vault references), interaction with
 `spawn` frames (are patterns checked in child frame content at spawn time?),
 and performance cost of regex scanning every outbound message.
+
+## OpenAI-Compatible Backend Hardening
+
+The OpenAI client (`Gizmo.LLM.OpenAI`) works but needs hardening for local
+models (LM Studio, ollama, etc.):
+
+- **`additionalProperties: false`** on the eval schema at both the top-level
+  object and op items object. Required by OpenAI's strict JSON schema mode and
+  enables grammar-based constraining in local servers.
+- **Backend auto-selection.** `setup_runtime` and `init_agent` should select
+  the OpenAI backend when `ANTHROPIC_API_KEY` is absent, instead of always
+  defaulting to Anthropic.
+- **Rename spawn `model` field to `eval_model`.** The field name `model` is
+  too easily confused with `msg` by small local models — both are short string
+  fields on the same flat union schema. `eval_model` is unambiguous.
+
+Tested with phi-4-reasoning-plus (14B), devstral-small (14B), and
+ministral-3-14b-reasoning. All consistently garbled send ops (using `model`,
+`dest`, or `frames` instead of `msg`). The schema fixes help with constraining
+but can't overcome models that don't understand "which fields go with which op
+type" in a flat union. Likely need 30B+ with strong instruction tuning for
+reliable structured output.
