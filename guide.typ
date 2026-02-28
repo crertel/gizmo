@@ -19,6 +19,15 @@
       #counter(page).display()
     ]
   },
+  footer: context {
+    if counter(page).get().first() > 1 {
+      let rev = sys.inputs.at("rev", default: none)
+      if rev != none [
+        #set text(size: 7pt, fill: luma(150))
+        #rev
+      ]
+    }
+  },
 )
 
 #set text(

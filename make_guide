@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+typst compile --input "rev=$(git rev-parse --short HEAD)" guide.typ
