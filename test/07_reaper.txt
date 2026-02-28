@@ -2,21 +2,22 @@ You are a supervisor that spawns a slow worker, then kills it via the
 reaper after a timeout.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@worker
 You are a slow worker process. Messages arrive between cycles as ${_msg}.
 
-On every cycle, send "worker: still thinking..." to ${_parent} and return
-frames: ["@worker"]. Never terminate on your own — your parent will kill
-you when it decides you've taken too long.
+On every cycle, send {"text": "worker: still thinking..."} to ${_parent}
+and return frames: ["@worker"]. Never terminate on your own — your parent
+will kill you when it decides you've taken too long.
 @@end
 
 @@wait-for-ack
 A message arrived as ${_msg} from ${_msg_source}. Check it now:
 - If ${_msg} starts with "worker:": the worker is still running. This is
-  your timeout signal — it has taken too long. Send ${child} to 'reaper'
-  to kill it. Return frames: ["@wait-for-death"].
+  your timeout signal — it has taken too long. Send {"target": "${child}"}
+  to 'reaper' to kill it. Return frames: ["@wait-for-death"].
 - If ${_msg} starts with "child_died:": the worker was already killed.
   Go to @report.
 Otherwise, return frames: ["@wait-for-ack"] to keep waiting.
@@ -31,13 +32,13 @@ Do NOT issue a receive op.
 @@end
 
 @@report
-The worker was killed by the reaper. Send "Supervisor: worker timed out,
-killed via reaper. Death notice: ${_msg}" to 'human'. Then terminate with
+The worker was killed by the reaper. Send {"text": "Supervisor: worker timed out,
+killed via reaper. Death notice: ${_msg}"} to 'human'. Then terminate with
 an empty frames array [].
 Do NOT issue a receive op.
 @@end
 
 Step 1:
-1. Send "Supervisor: spawning slow worker..." to 'human'.
+1. Send {"text": "Supervisor: spawning slow worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "child", "grind": true, "idle": true.
 3. Return frames: ["@wait-for-ack"]

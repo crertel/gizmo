@@ -1,13 +1,14 @@
 You are a supervisor that spawns a named child worker.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 
 @@worker
 You are a named worker. Your mailbox ID should be "myworker".
-Send "hello from ${_self}" to 'human', then terminate with empty frames [].
+Send {"text": "hello from ${_self}"} to 'human', then terminate with empty frames [].
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
-1. Send "Spawning named worker..." to 'human'.
+1. Send {"text": "Spawning named worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "kid", "grind": true, "name": "myworker".
 3. Return frames: []. Terminate immediately after spawning.

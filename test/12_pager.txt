@@ -3,64 +3,74 @@ user for a file path, open it via the pager, then let them browse it
 interactively.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@got-path
 The user's input arrived as ${_msg}. It is a file path.
-Send "open ${_msg}" to 'pager'. Return frames: ["@opened"].
+Send {"action": "open", "path": "${_msg}"} to 'pager'. Return frames: ["@opened"].
 Do NOT issue a receive op.
 @@end
 
 @@opened
 The pager replied as ${_msg} from ${_msg_source}.
 If ${_msg} starts with "error:":
-  Send "Could not open file: ${_msg}" to 'human'.
+  Send {"text": "Could not open file: ${_msg}"} to 'human'.
   Terminate with empty frames [].
 If ${_msg} starts with "opened:":
   Extract the session ID (the part between "opened:" and the next ":").
-  Store it: issue send("human", "Opened session ${_msg}").
-  Now ask the pager session for the first page: send "next" to the session ID.
-  Return frames: ["@browse"].
-Otherwise: Send "Unexpected response: ${_msg}" to 'human'.
+  Send {"text": "Opened session ${_msg}"} to 'human'.
+  Now ask the pager session for the first page: send {"action": "next"}
+  to the session ID.
+  Return frames: ["Pager session: <SESSION_ID>.\n@browse"]
+  (Replace <SESSION_ID> with the actual session ID you extracted.)
+Otherwise: Send {"text": "Unexpected response: ${_msg}"} to 'human'.
   Terminate with empty frames [].
 Do NOT issue a receive op.
 @@end
 
 @@browse
 A message arrived as ${_msg} from ${_msg_source}.
+Your pager session ID is on the first line of this frame (e.g. "Pager session: pager_0.").
+Use that session ID for all pager commands.
 
 If ${_msg_source} is "human_input":
   The user typed a command. Parse it:
   If ${_msg} is "q" or "quit":
-    Send "close" to the pager session ID you have been using.
+    Send {"action": "close"} to the pager session ID.
     Return frames: ["@closing"].
-  Otherwise:
-    Forward ${_msg} as-is to the pager session ID (it handles
-    "next", "prev", "search <pattern>", "goto <N>").
-    Return frames: ["@browse"].
+  If ${_msg} is "next":
+    Send {"action": "next"} to the pager session ID.
+  If ${_msg} is "prev":
+    Send {"action": "prev"} to the pager session ID.
+  If ${_msg} starts with "goto ":
+    Extract the number N. Send {"action": "goto", "line": N} to the pager session ID.
+  If ${_msg} starts with "search ":
+    Extract the pattern. Send {"action": "search", "pattern": "<pattern>"} to the pager session ID.
+  Return frames: ["@0"].
   Do NOT issue a receive op.
 
 If ${_msg_source} is your pager session ID:
   The pager sent page content. Display it:
-  Send "${_msg}" to 'human'.
-  Then prompt for the next command: send "Command (next/prev/goto N/search PATTERN/q):"
+  Send {"text": "${_msg}"} to 'human'.
+  Then prompt for the next command: send {"prompt": "Command (next/prev/goto N/search PATTERN/q):"}
   to 'human_input'.
-  Return frames: ["@browse"].
+  Return frames: ["@0"].
   Do NOT issue a receive op.
 
-Otherwise: Return frames: ["@browse"].
+Otherwise: Return frames: ["@0"].
 Do NOT issue a receive op.
 @@end
 
 @@closing
 A message arrived as ${_msg}.
 If ${_msg} is "closed":
-  Send "Session closed. Goodbye!" to 'human'.
+  Send {"text": "Session closed. Goodbye!"} to 'human'.
   Terminate with empty frames [].
 Otherwise: Return frames: ["@closing"].
 Do NOT issue a receive op.
 @@end
 
 Step 1:
-1. Send "Enter file path to read:" to 'human_input'.
+1. Send {"prompt": "Enter file path to read:"} to 'human_input'.
 2. Return frames: ["@got-path"].

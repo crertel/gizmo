@@ -74,23 +74,26 @@ including `${name}`, `@0`, section markers, etc.
 The bindings map holds values from the runtime and ops. The most important
 bindings are set automatically by the message-driven model:
 
-- `${_msg}` — the message that woke this cycle
+- `${_msg}` — the text summary of the message that woke this cycle
+- `${_payload}` — the full JSON encoding of the message that woke this cycle
 - `${_msg_source}` — the sender's mailbox ID
 - `${_self}` — this agent's mailbox ID
 - `${_parent}` — the parent agent's mailbox ID (spawned children only)
 
-The `spawn` op also creates bindings via its `dest` field.
+The `spawn` op creates bindings via its `dest` field. The `receive` op
+creates two bindings: `${dest}` (text summary) and `${dest_payload}`
+(full JSON), mirroring `_msg` / `_payload`.
 
 ```
-# Agent sent "uname -a" to bash last cycle. Bash response woke this cycle.
+# Agent sent {"command": "uname -a"} to bash last cycle. Bash response woke this cycle.
 # Bindings show: ${_msg} = Linux hostname 6.18... , ${_msg_source} = bash
 # The LLM returns:
-  ops:    [send("human", "System info: ${_msg}")]
+  ops:    [send("human", {"text": "System info: ${_msg}"})]
   frames: []
   notes:  {}
 
 # After interpolation:
-  ops:    [send("human", "System info: Linux hostname 6.18...")]
+  ops:    [send("human", {"text": "System info: Linux hostname 6.18..."})]
 ```
 
 Unresolved binding refs are left as-is. If there's no binding named "foo",
@@ -136,10 +139,10 @@ Like `@N`, the injected text is quoted verbatim.
 #   @@end
 
 # LLM returns:
-  ops: [send("human", "@greeting")]
+  ops: [send("human", {"text": "@greeting"})]
 
 # After interpolation:
-  ops: [send("human", "Hello, welcome to the system!")]
+  ops: [send("human", {"text": "Hello, welcome to the system!"})]
 ```
 
 Section names must match `[a-zA-Z0-9_-]+`. If no section with that name
@@ -216,7 +219,7 @@ The LLM returns:
 
 ```json
 {
-  "ops": [{"op": "send", "mailbox": "human", "msg": "Hello!"}],
+  "ops": [{"op": "send", "mailbox": "human", "msg": {"text": "Hello!"}}],
   "frames": [],
   "notes": {}
 }
@@ -275,7 +278,7 @@ You are an interactive echo-bot. This is the first cycle (setup).
 Messages arrive between cycles as ${_msg}. Do NOT issue receive ops.
 
 @@quit
-The user typed "quit". Send "echo-bot: goodbye!" to 'human'.
+The user typed "quit". Send {"text": "echo-bot: goodbye!"} to 'human'.
 Return frames: [] to terminate.
 @@end
 
@@ -283,13 +286,13 @@ Return frames: [] to terminate.
 The user's most recent input arrived as ${_msg}. Decide what to do:
 
 - If ${_msg} is "quit": return frames ["@quit"] with no ops.
-- Otherwise: send "echo-bot: you said: ${_msg}" to 'human', then
-  send "echo-bot> " to 'human_input'. Return frames: ["@loop"].
+- Otherwise: send {"prompt": "echo-bot: you said: ${_msg}\necho-bot> "}
+  to 'human_input'. Return frames: ["@loop"].
 @@end
 
 First-time setup:
 1. Send a greeting to 'human'.
-2. Send the prompt "echo-bot> " to 'human_input'.
+2. Send {"prompt": "echo-bot> "} to 'human_input'.
 3. Return frames: ["@loop"] to enter the loop.
 
 After this first cycle, the @loop section takes over for all subsequent
@@ -378,8 +381,10 @@ Return frames: ["@0"] to loop.
 Check your bindings to determine what to do:
 
 If ${req} is in your bindings:
-  If ${req} starts with "balance_request:":
-    Extract reply address. Send "balance:42" to it.
+  ${req} is the text summary. ${req_payload} is the full JSON.
+  If ${req} contains "balance_request":
+    Parse ${req_payload} to extract the "reply_to" field.
+    Send {"text": "balance:42"} to that reply address.
     Terminate with empty frames [].
   Otherwise: Issue receive("req"). Return frames: ["@0"].
 
@@ -388,7 +393,7 @@ If ${ack} is in your bindings but ${req} is NOT:
   Return frames: ["@0"].
 
 Otherwise (first cycle):
-  Send "write bank_mb ${_self}" to 'blackboard'.
+  Send {"action": "write", "key": "bank_mb", "value": "${_self}"} to 'blackboard'.
   Issue receive("ack").
   Return frames: ["@0"].
 @@end
@@ -397,7 +402,7 @@ Otherwise (first cycle):
 You are the coordinator. Do NOT spawn any agents.
 A message arrived as ${_msg}.
 If ${_msg} starts with "balance:":
-  Send "Result: ${_msg}" to 'human'. Terminate with [].
+  Send {"text": "Result: ${_msg}"} to 'human'. Terminate with [].
 Otherwise: Return frames: ["@wait-result"]. No ops.
 @@end
 
@@ -432,9 +437,9 @@ tight loop (grind mode — you cycle continuously without waiting for
 messages between cycles).
 
 EVERY cycle, do ALL of these steps in order:
-1. If ${roll} is in your bindings: send "rolled:${roll}" to ${_parent}
-   and send "Child: I rolled ${roll}" to 'human'.
-2. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+1. If ${roll} is in your bindings: send {"text": "rolled:${roll}"} to ${_parent}
+   and send {"text": "Child: I rolled ${roll}"} to 'human'.
+2. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
 3. Issue receive("roll") to block until bash responds.
 4. Return frames: ["@0"].
 
@@ -480,12 +485,12 @@ You are the roller child. You roll random numbers when asked.
 A message arrived as ${_msg} from ${_msg_source}.
 
 If ${_msg} is "init" or "roll":
-  1. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+  1. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
   2. Return frames: ["@0"] to wait for the bash result.
 
 Otherwise (${_msg} is a bash result — a number):
-  1. Send "rolled:${_msg}" to ${_parent}.
-  2. Send "Child: I rolled ${_msg}" to 'human'.
+  1. Send {"text": "rolled:${_msg}"} to ${_parent}.
+  2. Send {"text": "Child: I rolled ${_msg}"} to 'human'.
   3. Return frames: [] to go idle and wait for the next "roll" message.
 @@end
 ```
@@ -535,8 +540,8 @@ over the child's pacing and don't want to handle stale messages.
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "uname -a"},
-    {"op": "send", "mailbox": "human", "msg": "Result: ${_msg}"}
+    {"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}},
+    {"op": "send", "mailbox": "human", "msg": {"text": "Result: ${_msg}"}}
   ],
   "frames": [],
   "notes": {}
@@ -551,7 +556,7 @@ on the next cycle when the response has arrived:
 
 ```json
 {
-  "ops": [{"op": "send", "mailbox": "bash", "msg": "uname -a"}],
+  "ops": [{"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}}],
   "frames": ["The bash output arrived as ${_msg}. Send 'Result: ${_msg}' to human, then terminate."],
   "notes": {}
 }
@@ -593,7 +598,7 @@ standalone frame entries like `["@step2"]`, never embedded in longer text.
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "ls"},
+    {"op": "send", "mailbox": "bash", "msg": {"command": "ls"}},
     {"op": "receive", "dest": "output"}
   ],
   "frames": ["Use ${output} somehow"],
@@ -610,7 +615,7 @@ the next cycle automatically:
 
 ```json
 {
-  "ops": [{"op": "send", "mailbox": "bash", "msg": "ls"}],
+  "ops": [{"op": "send", "mailbox": "bash", "msg": {"command": "ls"}}],
   "frames": ["The bash output arrived as ${_msg}. Use it."],
   "notes": {}
 }
@@ -626,9 +631,9 @@ responses arrive as `${_msg}` between cycles.
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "shuf -i 1-6 -n 1"},
+    {"op": "send", "mailbox": "bash", "msg": {"command": "shuf -i 1-6 -n 1"}},
     {"op": "receive", "dest": "roll"},
-    {"op": "send", "mailbox": "human", "msg": "You rolled ${roll}"}
+    {"op": "send", "mailbox": "human", "msg": {"text": "You rolled ${roll}"}}
   ],
   "frames": ["Report ${roll} to parent."],
   "notes": {}
@@ -646,7 +651,7 @@ on cycle N+1:
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "shuf -i 1-6 -n 1"},
+    {"op": "send", "mailbox": "bash", "msg": {"command": "shuf -i 1-6 -n 1"}},
     {"op": "receive", "dest": "roll"}
   ],
   "frames": ["@0"],
@@ -707,101 +712,95 @@ cycle when `${_msg}` has the response.
 
 ### human
 
-Send a string to display it on the user's terminal.
+Send a JSON object with a `"text"` field to display it on the user's terminal.
 
 ```json
-{"op": "send", "mailbox": "human", "msg": "Hello, user!"}
+{"op": "send", "mailbox": "human", "msg": {"text": "Hello, user!"}}
 ```
 
 ### human_input
 
-Send a prompt string. The user's typed line (trimmed) arrives as `${_msg}`
-on the next cycle.
+Send a JSON object with a `"prompt"` field. The user's typed line (trimmed)
+arrives as `${_msg}` on the next cycle.
 
 ```json
-{"op": "send", "mailbox": "human_input", "msg": "Enter your name: "}
+{"op": "send", "mailbox": "human_input", "msg": {"prompt": "Enter your name: "}}
 ```
 
 ### bash
 
-Shell command execution with configurable timeout.
-
-**Raw command** (backward compatible) — send a plain command string:
+Shell command execution with configurable timeout. Send a JSON object with
+a `"command"` field:
 
 ```json
-{"op": "send", "mailbox": "bash", "msg": "uname -a"}
+{"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}}
 ```
 
 Output arrives as `${_msg}` on the next cycle. On failure: `"error: exit code N: ..."`.
 
-**Structured run** — first line is metadata, rest is the command:
+**With timeout and mode** — add optional `"timeout"`, `"mode"`, and `"note"` fields:
 
 ```json
-{"op": "send", "mailbox": "bash", "msg": "run,5000,kill\nfind / -name '*.log'"}
+{"op": "send", "mailbox": "bash", "msg": {"command": "find / -name '*.log'", "timeout": 5000, "mode": "kill"}}
 ```
 
-Format: `run,<timeout_ms>,<mode>[,<note>]\n<command>`
-
-- **mode** `kill`: on timeout the command is terminated and you receive
+- **mode** `"kill"` (default): on timeout the command is terminated and you receive
   `"error: timeout after Nms"`.
-- **mode** `notify`: on timeout the command keeps running and you receive
-  `"bash:timeout:<handle>"` (or `"bash:timeout:<handle>:<note>"` if a note
-  was provided). You can then control the job:
+- **mode** `"notify"`: on timeout the command keeps running and you receive a
+  timeout notification with a handle. You can then control the job:
 
-| Message | Effect |
-|---------|--------|
-| `kill,<handle>` | Terminate the job. You receive `"error: killed"`. |
-| `wait,<handle>` | Reset the timer (same duration). |
-| `wait,<handle>,<timeout_ms>` | Reset the timer with a new duration. |
+```json
+{"op": "send", "mailbox": "bash", "msg": {"action": "kill", "handle": "<handle>"}}
+{"op": "send", "mailbox": "bash", "msg": {"action": "wait", "handle": "<handle>"}}
+{"op": "send", "mailbox": "bash", "msg": {"action": "wait", "handle": "<handle>", "timeout": 10000}}
+```
 
 The final result of a notify-mode job still arrives in the standard format
 (stdout or error string) when the command eventually completes.
 
 **Default timeout** is set by the runtime (`--bash-timeout`, typically 60 s).
-Raw commands use the default timeout in kill mode. Use `0` for no timeout.
+Commands without a `"timeout"` field use the default timeout in kill mode.
+Use `0` for no timeout.
 
 ### blackboard
 
-Key-value store. Send commands as strings. The result arrives as `${_msg}`
-on the next cycle.
+Key-value store. Send JSON objects with an `"action"` field. The result
+arrives as `${_msg}` on the next cycle.
 
-- **Write:** `"write <key> <value>"` — returns `"ok"`
-- **Read:** `"read <key>"` — returns the value (or empty
+- **Write:** `{"action": "write", "key": "<key>", "value": "<value>"}` — returns `"ok"`
+- **Read:** `{"action": "read", "key": "<key>"}` — returns the value (or empty
   string if key doesn't exist)
-
-Both comma-separated and space-separated formats are accepted. Braces are
-optional.
 
 ### watchdog
 
-Timer service. Send string commands to the `"watchdog"` mailbox. Ticks
-arrive as `"watchdog:tick"` from source `"watchdog"`.
+Timer service. Send JSON objects to the `"watchdog"` mailbox. Ticks
+arrive as `"tick"` from source `"watchdog"`.
 
-| Command | Behavior |
+| Message | Behavior |
 |---|---|
-| `"every <ms>"` | Periodic ticks every `<ms>` milliseconds |
-| `"after <ms>"` | Single tick after `<ms>` milliseconds |
-| `"cancel"` | Cancel all timers for the sender |
-| `"list"` | List active timers (reply: `"every:5000, after:3000"` or `"none"`) |
+| `{"action": "every", "ms": N}` | Periodic ticks every N milliseconds |
+| `{"action": "after", "ms": N}` | Single tick after N milliseconds |
+| `{"action": "cancel"}` | Cancel all timers for the sender |
+| `{"action": "list"}` | List active timers (reply sent back) |
 
 All commands are fire-and-forget except `list`, which sends a reply.
 Multiple timers stack — an agent can have several `every` and `after`
 timers simultaneously.
 
 ```json
-{"op": "send", "mailbox": "watchdog", "msg": "every 5000"}
+{"op": "send", "mailbox": "watchdog", "msg": {"action": "every", "ms": 5000}}
 ```
 
 To use a one-shot delayed tick:
 
 ```json
-{"op": "send", "mailbox": "watchdog", "msg": "after 3000"}
+{"op": "send", "mailbox": "watchdog", "msg": {"action": "after", "ms": 3000}}
 ```
 
 To cancel all your timers:
 
 ```json
-{"op": "send", "mailbox": "watchdog", "msg": "cancel"}
+{"op": "send", "mailbox": "watchdog", "msg": {"action": "cancel"}}
 ```
 
 ## CLI flags
@@ -976,7 +975,7 @@ are null and `error` contains the stringified reason.
   "t_ms": 2436,
   "system_prompt": "...",
   "user_content": "Begin.\n\nCurrent bindings:\n...",
-  "ops": [{"op":"send","mailbox":"human","msg":"Hello!"}],
+  "ops": [{"op":"send","mailbox":"human","msg":{"text":"Hello!"}}],
   "frames": ["..."],
   "bindings": {"_self":"agent_1","_msg":"init"},
   "notes": {},

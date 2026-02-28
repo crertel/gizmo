@@ -51,8 +51,8 @@ new messages — useful for long-running daemon-style agents.
 
 | Op | JSON format | Behavior |
 |---------|-----------|----------|
-| `send`  | `{"op": "send", "mailbox": "...", "msg": "..."}` | Async fire-and-forget message to any mailbox. Non-blocking. |
-| `receive` | `{"op": "receive", "dest": "..."}` | Block until a message arrives. Result stored in binding `dest` and messages queue. |
+| `send`  | `{"op": "send", "mailbox": "...", "msg": {...}}` | Async fire-and-forget message to any mailbox. `msg` is always a JSON object. Non-blocking. |
+| `receive` | `{"op": "receive", "dest": "..."}` | Block until a message arrives. Text summary stored in `dest`, full JSON in `dest_payload`. |
 | `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Optional fields: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated), `model` (override LLM model for child). |
 | `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register interrupt handler. PCRE regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
 
@@ -66,19 +66,19 @@ by `Gizmo.Supervision`. They are not syscalls.
 
 | Service | Mailbox | Purpose |
 |---------|---------|---------|
-| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `"read <key>"` / `"write <key> <value>"`. |
-| **bash** | `"bash"` | Shell command execution. Send command string, get output back. |
-| **human** | `"human"` | Terminal output. Send text to display to the user. |
-| **human_input** | `"human_input"` | Terminal input. Send a prompt string, receive the user's typed response. |
+| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `{"action": "read", "key": "..."}` / `{"action": "write", "key": "...", "value": "..."}`. |
+| **bash** | `"bash"` | Shell command execution. `{"command": "..."}` with optional `"timeout"`, `"mode"`, `"note"`. |
+| **human** | `"human"` | Terminal output. `{"text": "..."}`. |
+| **human_input** | `"human_input"` | Terminal input. `{"prompt": "..."}`, responds with user's typed line. |
 | **exception** | `"exception"` | Error notification sink. Receives agent retry/cycle exhaustion reports. |
-| **reaper** | `"reaper"` | Agent lifecycle. Send a mailbox ID to kill a descendant. |
-| **watchdog** | `"watchdog"` | Timer service. Periodic/one-shot tick messages. |
+| **reaper** | `"reaper"` | Agent lifecycle. `{"target": "<mailbox_id>"}` to kill a descendant. |
+| **watchdog** | `"watchdog"` | Timer service. `{"action": "every/after/cancel/list", "ms": N}`. |
 
 Per-agent state (not well-known, created per agent instance):
 
 | Component | Scope | Purpose |
 |-----------|-------|---------|
-| **bindings** | in-process | Named bindings map. Values from `receive` (`dest`), `spawn` (`dest`), and runtime (`_self`, `_parent`). Threaded through eval loop. |
+| **bindings** | in-process | Named bindings map. Values from `receive` (`dest` + `dest_payload`), `spawn` (`dest`), and runtime (`_self`, `_parent`, `_msg`, `_payload`, `_msg_source`). Threaded through eval loop. |
 | **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. |
 
 ## Eval Loop Detail
@@ -117,8 +117,8 @@ The response contains three fields: `ops` (syscalls to execute), `frames`
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "human", "msg": "I'll check the files."},
-    {"op": "send", "mailbox": "bash", "msg": "ls -la"},
+    {"op": "send", "mailbox": "human", "msg": {"text": "I'll check the files."}},
+    {"op": "send", "mailbox": "bash", "msg": {"command": "ls -la"}},
     {"op": "receive", "dest": "listing"}
   ],
   "frames": [
@@ -132,7 +132,7 @@ Each op is an object with an `"op"` field and op-specific parameters:
 
 | Op | Fields | Example |
 |----|--------|---------|
-| `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": "ls"}` |
+| `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": {"command": "ls"}}` |
 | `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
 | `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`], [`name`], [`model`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
 | `trap` | `pattern`, `frames` | `{"op": "trap", "pattern": "^alert:", "frames": ["handle ${_interrupt}"]}` |
@@ -145,7 +145,8 @@ parsing ambiguity and the need for a text parser.
 ## Interpolation
 
 - `${name}` — named binding resolved from bindings map (populated by
-  `receive` (`dest`), `spawn` (`dest`), and runtime bindings `_self`/`_parent`)
+  `receive` (`dest` + `dest_payload`), `spawn` (`dest`), and runtime
+  bindings `_self`/`_parent`/`_msg`/`_payload`/`_msg_source`)
 - `@N` — inject frame N (0-indexed) from the current context stack
 - `@name` — inject contents of a named section (`@@section-name` ... `@@end`)
 - `$$` — literal `$`; `@@` — literal `@`
@@ -315,7 +316,7 @@ need to pair `spawn` + `receive` in the same op list.
 ## Watchdog Service
 
 `Gizmo.Services.Watchdog` is a per-agent GenServer that sends periodic
-`"watchdog:tick"` messages (from source `"watchdog"`) to a target mailbox.
+`"tick"` messages (from source `"watchdog"`) to a target mailbox.
 Started on demand via `--watchdog <ms>` or programmatically. Monitors the
 target agent and stops when it dies.
 

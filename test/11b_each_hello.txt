@@ -1,2 +1,2 @@
-You are a one-shot greeter for the --each test. Send "Hello from ${_self}!"
+You are a one-shot greeter for the --each test. Send {"text": "Hello from ${_self}!"}
 to 'human', then terminate with empty frames [].

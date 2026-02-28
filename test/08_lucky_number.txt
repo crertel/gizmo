@@ -3,6 +3,7 @@ that rolls random numbers autonomously. If the child rolls a 1, you
 kill it via the reaper. Otherwise the child keeps rolling on its own.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@roller
@@ -11,9 +12,9 @@ tight loop (grind mode — you cycle continuously without waiting for
 messages between cycles).
 
 EVERY cycle, do ALL of these steps in order:
-1. If ${roll} is in your bindings: send "rolled:${roll}" to ${_parent}
-   and send "Child: I rolled ${roll}" to 'human'.
-2. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+1. If ${roll} is in your bindings: send {"text": "rolled:${roll}"} to ${_parent}
+   and send {"text": "Child: I rolled ${roll}"} to 'human'.
+2. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
 3. Issue receive("roll") to block until bash responds.
 4. Return frames: ["@0"].
 
@@ -25,16 +26,16 @@ On every subsequent cycle ${roll} holds the previous bash result.
 A message arrived as ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "rolled:":
-  Send "Parent: child ${_msg}" to 'human'.
+  Send {"text": "Parent: child ${_msg}"} to 'human'.
   Extract the number after "rolled:" and trim whitespace.
   If the number is "1":
-    Send ${child} to 'reaper' to kill the child.
+    Send {"target": "${child}"} to 'reaper' to kill the child.
     Return frames: ["@wait-for-death"].
   Otherwise:
     Return frames: ["@check-roll"].
 
 If ${_msg} starts with "child_died:":
-  Send "Parent: child died! ${_msg}" to 'human'.
+  Send {"text": "Parent: child died! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 
 Otherwise: return frames: ["@check-roll"].
@@ -44,13 +45,13 @@ Do NOT issue a receive op.
 @@wait-for-death
 The reaper was asked to kill the child. A message arrived as ${_msg}.
 If ${_msg} starts with "child_died:":
-  Send "Parent: child was reaped! ${_msg}" to 'human'.
+  Send {"text": "Parent: child was reaped! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 Otherwise: return frames: ["@wait-for-death"].
 Do NOT issue a receive op.
 @@end
 
 Step 1:
-1. Send "Parent: spawning roller child..." to 'human'.
+1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller"], dest "child", "grind": true.
 3. Return frames: ["@check-roll"].

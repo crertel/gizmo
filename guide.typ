@@ -290,7 +290,7 @@ The runtime loads the boot frame, calls the LLM, and the LLM returns something l
 
 ```json
 {
-  "ops": [{"op": "send", "mailbox": "human", "msg": "Hello there!"}],
+  "ops": [{"op": "send", "mailbox": "human", "msg": {"text": "Hello there!"}}],
   "frames": [],
   "notes": {}
 }
@@ -386,8 +386,9 @@ The *runtime bindings* are always available:
 
 - `${_self}` --- this agent's mailbox ID. Always present.
 - `${_parent}` --- the spawning agent's mailbox ID. Only for non-root, non-disowned children.
-- `${_msg}` --- the message that woke this cycle (message-driven mode).
-- `${_msg_source}` --- the sender's mailbox ID.
+- `${_msg}` --- text summary of the wake message (`"text"` field if present, else the full JSON). `"init"` on cycle 0.
+- `${_msg_source}` --- the sender's mailbox ID. `"runtime"` on cycle 0.
+- `${_payload}` --- full JSON of the wake message. `"{}"` on cycle 0.
 
 == In-Depth on Interpolation
 
@@ -447,9 +448,9 @@ The key timing: interpolation of the entire LLM response (ops _and_ frames) happ
 ```json
 {
   "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "echo hello"},
+    {"op": "send", "mailbox": "bash", "msg": {"command": "echo hello"}},
     {"op": "receive", "dest": "result"},
-    {"op": "send", "mailbox": "human", "msg": "Got: ${result}"}
+    {"op": "send", "mailbox": "human", "msg": {"text": "Got: ${result}"}}
   ]
 }
 ```
@@ -467,12 +468,12 @@ Gizmo has exactly four opcodes. Every agent capability is built from these primi
 === `send` --- Fire-and-Forget Message Delivery
 
 ```json
-{"op": "send", "mailbox": "<target>", "msg": "<content>"}
+{"op": "send", "mailbox": "<target>", "msg": {"text": "<content>"}}
 ```
 
 Delivers `msg` to the mailbox identified by `mailbox`. Non-blocking---the sender does not wait for a response or acknowledgment. The message is routed through the Mailbox Registry; if the target mailbox doesn't exist, the message is silently dropped.
 
-The `msg` field is interpolated before delivery, so `${_self}` in the message becomes the sender's mailbox ID.
+The `msg` field must be a JSON object. It is interpolated (recursively, including nested values) before delivery, so `${_self}` in the message becomes the sender's mailbox ID.
 
 === `receive` --- Blocking Message Wait
 
@@ -480,7 +481,7 @@ The `msg` field is interpolated before delivery, so `${_self}` in the message be
 {"op": "receive", "dest": "<binding_name>"}
 ```
 
-Blocks the agent process until a message arrives in its mailbox. The message content is stored in the bindings map under the name `dest`. The message source is stored as `dest`\_source (e.g., `receive("roll")` also creates `roll_source`).
+Blocks the agent process until a message arrives in its mailbox. Two bindings are created: `${dest}` holds the text summary (the `"text"` field of the JSON message, or the full JSON if no `"text"` key), and `${dest_payload}` holds the full JSON encoding. This mirrors `_msg` / `_payload`.
 
 The binding is available for interpolation starting in the _next_ cycle (because interpolation runs before ops execute).
 
@@ -575,20 +576,17 @@ The well-known services are supervised GenServers with fixed mailbox names. They
 
 *Mailbox:* `"bash"`
 
-Send a command string; receive the output as `${_msg}` on the next cycle.
+Send a JSON object with a `"command"` field; receive the output as `${_msg}` on the next cycle.
 
-*Raw command* (simple):
 ```json
-{"op": "send", "mailbox": "bash", "msg": "uname -a"}
+{"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}}
 ```
 Output arrives as `${_msg}`. On failure: `"error: exit code N: ..."`.
 
-*Structured run* (with timeout control):
+*With timeout and mode* --- add optional `"timeout"`, `"mode"`, and `"note"` fields:
 ```json
-{"op": "send", "mailbox": "bash", "msg": "run,5000,kill\nfind / -name '*.log'"}
+{"op": "send", "mailbox": "bash", "msg": {"command": "find / -name '*.log'", "timeout": 5000, "mode": "kill"}}
 ```
-
-Format: `run,<timeout_ms>,<mode>[,<note>]\n<command>`
 
 #table(
   columns: (auto, 1fr),
@@ -598,41 +596,39 @@ Format: `run,<timeout_ms>,<mode>[,<note>]\n<command>`
   table.header(
     [*Mode*], [*Behavior on timeout*],
   ),
-  [`kill`], [Command terminated. Agent receives `"error: timeout after Nms"`.],
-  [`notify`], [Command keeps running. Agent receives `"bash:timeout:<handle>"`. Can then send `kill,<handle>` or `wait,<handle>` to control the job.],
+  [`"kill"`], [Command terminated. Agent receives `"error: timeout after Nms"`.],
+  [`"notify"`], [Command keeps running. Agent receives a timeout notification with a handle. Can then send `{"action": "kill", "handle": "<h>"}` or `{"action": "wait", "handle": "<h>"}` to control the job.],
 )
 
-Default timeout is set by `--bash-timeout` (default: 60000ms). Raw commands use the default timeout in kill mode.
+Default timeout is set by `--bash-timeout` (default: 60000ms). Commands without a `"timeout"` field use the default timeout in kill mode.
 
 === `blackboard` --- Key-Value Store
 
 *Mailbox:* `"blackboard"`
 
-Send string commands; result arrives as `${_msg}`:
+Send JSON objects with an `"action"` field; result arrives as `${_msg}`:
 
-- `"write <key> <value>"` --- returns `"ok"`.
-- `"read <key>"` --- returns the value (or empty string if key doesn't exist).
-
-Both comma-separated and space-separated formats are accepted. Braces are optional.
+- `{"action": "write", "key": "<key>", "value": "<value>"}` --- returns `"ok"`.
+- `{"action": "read", "key": "<key>"}` --- returns the value (or empty string if key doesn't exist).
 
 === `human` --- Terminal Output
 
 *Mailbox:* `"human"`
 
-Send a string to display it on the user's terminal. Fire-and-forget---no response.
+Send a JSON object with a `"text"` field to display it on the user's terminal. Fire-and-forget---no response.
 
 ```json
-{"op": "send", "mailbox": "human", "msg": "Hello, user!"}
+{"op": "send", "mailbox": "human", "msg": {"text": "Hello, user!"}}
 ```
 
 === `human_input` --- Terminal Input
 
 *Mailbox:* `"human_input"`
 
-Send a prompt string. The user's typed line (trimmed) arrives as `${_msg}` on the next cycle.
+Send a JSON object with a `"prompt"` field. The user's typed line (trimmed) arrives as `${_msg}` on the next cycle.
 
 ```json
-{"op": "send", "mailbox": "human_input", "msg": "Enter your name: "}
+{"op": "send", "mailbox": "human_input", "msg": {"prompt": "Enter your name: "}}
 ```
 
 #admonition(title: "Tip")[
@@ -649,10 +645,10 @@ Receives error reports from the runtime (agent retry exhaustion, cycle limit exc
 
 *Mailbox:* `"reaper"`
 
-Send a mailbox ID to kill a descendant agent. The reaper walks the parent chain from the target to verify the caller is an ancestor. Only ancestors can kill descendants---peer-to-peer kills are rejected.
+Send a JSON object with a `"target"` field containing the mailbox ID to kill. The reaper walks the parent chain from the target to verify the caller is an ancestor. Only ancestors can kill descendants---peer-to-peer kills are rejected.
 
 ```json
-{"op": "send", "mailbox": "reaper", "msg": "${child}"}
+{"op": "send", "mailbox": "reaper", "msg": {"target": "${child}"}}
 ```
 
 The killed agent's parent receives a `child_died:` notification through the normal death-monitoring mechanism.
@@ -661,7 +657,7 @@ The killed agent's parent receives a `child_died:` notification through the norm
 
 *Mailbox:* `"watchdog"`
 
-Send string commands. Ticks arrive as `"watchdog:tick"` from source `"watchdog"`.
+Send JSON objects with an `"action"` field. Ticks arrive as `"tick"` from source `"watchdog"`.
 
 #table(
   columns: (auto, 1fr),
@@ -669,12 +665,12 @@ Send string commands. Ticks arrive as `"watchdog:tick"` from source `"watchdog"`
   stroke: 0.5pt + luma(200),
   inset: 6pt,
   table.header(
-    [*Command*], [*Behavior*],
+    [*Message*], [*Behavior*],
   ),
-  [`"every <ms>"`], [Periodic ticks every `<ms>` milliseconds.],
-  [`"after <ms>"`], [Single tick after `<ms>` milliseconds.],
-  [`"cancel"`], [Cancel all timers for the sender.],
-  [`"list"`], [List active timers (reply sent back to sender).],
+  [`{"action": "every", "ms": N}`], [Periodic ticks every N milliseconds.],
+  [`{"action": "after", "ms": N}`], [Single tick after N milliseconds.],
+  [`{"action": "cancel"}`], [Cancel all timers for the sender.],
+  [`{"action": "list"}`], [List active timers (reply sent back to sender).],
 )
 
 Multiple timers stack. An agent can have several `every` and `after` timers simultaneously.
@@ -702,26 +698,27 @@ defmodule Gizmo.Services.Timer do
     {:ok, state}
   end
 
-  def handle_cast({:mailbox_msg, "start", source}, state) do
-    {:noreply, Map.put(state, source, System.monotonic_time(:millisecond))}
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "start"}}}, state) do
+    {:noreply, Map.put(state, sender_mb, System.monotonic_time(:millisecond))}
   end
 
-  def handle_cast({:mailbox_msg, "elapsed", source}, state) do
-    start = Map.get(state, source, System.monotonic_time(:millisecond))
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "elapsed"}}}, state) do
+    start = Map.get(state, sender_mb, System.monotonic_time(:millisecond))
     elapsed = System.monotonic_time(:millisecond) - start
-    Gizmo.Mailbox.route(source, {"#{elapsed}ms", "timer"})
+    Gizmo.Mailbox.route(sender_mb, {"timer",
+      %{"text" => "#{elapsed}ms", "elapsed_ms" => elapsed}})
     {:noreply, state}
   end
 end
 ```
 
-The protocol is simple: send `"start"` to begin, send `"elapsed"` to get the duration. The agent addresses it like any other mailbox.
+The protocol is simple: send `{"action": "start"}` to begin, send `{"action": "elapsed"}` to get the duration. The agent addresses it like any other mailbox.
 
 === Services as Stateful Peers: A Document Pager
 
 The timer example is simple, but it understates the power of the mailbox abstraction. Consider a more substantial service: a document pager that lets an agent read through a large file page by page, despite the agent's limited context window.
 
-The design uses two modules: a *factory* (singleton service) and a *session* (one process per open document). When an agent sends `"open /path"` to the `"pager"` mailbox, the factory spawns a new session process, registers it with a unique mailbox ID, and tells the agent the ID. The agent then talks directly to the session. This means an agent can have multiple documents open simultaneously---each is a separate process with its own mailbox.
+The design uses two modules: a *factory* (singleton service) and a *session* (one process per open document). When an agent sends `{"action": "open", "path": "/path"}` to the `"pager"` mailbox, the factory spawns a new session process, registers it with a unique mailbox ID, and tells the agent the ID. The agent then talks directly to the session. This means an agent can have multiple documents open simultaneously---each is a separate process with its own mailbox.
 
 ```elixir
 defmodule Gizmo.Services.Pager do
@@ -737,26 +734,22 @@ defmodule Gizmo.Services.Pager do
     {:ok, %{mailbox_id: mailbox_id, counter: 0}}
   end
 
-  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state)
-      when is_binary(cmd) do
-    case Regex.run(~r/^open\s+(.+)$/i, String.trim(cmd)) do
-      [_, path] ->
-        case File.read(String.trim(path)) do
-          {:ok, content} ->
-            id = "pager_#{state.counter}"
-            lines = String.split(content, "\n")
-            {:ok, _} = Gizmo.Services.PagerSession.start(id, lines, sender_mb)
-            Gizmo.Mailbox.route(sender_mb,
-              {state.mailbox_id, "opened:#{id}:#{length(lines)} lines"})
-            {:noreply, %{state | counter: state.counter + 1}}
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "open", "path" => path}}}, state) do
+    path = String.trim(path)
 
-          {:error, reason} ->
-            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:#{reason}"})
-            {:noreply, state}
-        end
+    case File.read(path) do
+      {:ok, content} ->
+        lines = String.split(content, "\n")
+        id = "pager_#{state.counter}"
+        {:ok, _} = Gizmo.Services.PagerSession.start(id, lines, sender_mb)
+        line_count = length(lines)
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "opened:#{id}:#{line_count} lines", "session" => id, "lines" => line_count}})
+        {:noreply, %{state | counter: state.counter + 1}}
 
-      nil ->
-        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:unknown command"})
+      {:error, reason} ->
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "error:#{reason}", "error" => to_string(reason)}})
         {:noreply, state}
     end
   end
@@ -784,63 +777,63 @@ defmodule Gizmo.Services.PagerSession do
             owner_mb: owner_mb, monitor_ref: monitor_ref}}
   end
 
-  def handle_info({:mailbox_msg, _id, {sender_mb, "next"}}, state) do
-    {page_text, new_cursor} = get_page(state)
-    header = "lines #{state.cursor + 1}-" <>
-      "#{min(state.cursor + state.page_size, state.total)} of #{state.total}\n"
-    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+  def handle_info({:mailbox_msg, _id, {sender_mb, %{"action" => "next"}}}, state) do
+    {page_text, new_cursor} = get_page(state.lines, state.cursor, state.page_size, state.total)
+    from = state.cursor + 1
+    to = min(state.cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
     {:noreply, %{state | cursor: new_cursor}}
   end
 
-  def handle_info({:mailbox_msg, _id, {sender_mb, "prev"}}, state) do
+  def handle_info({:mailbox_msg, _id, {sender_mb, %{"action" => "prev"}}}, state) do
     new_cursor = max(state.cursor - state.page_size, 0)
-    {page_text, _} = get_page(%{state | cursor: new_cursor})
-    header = "lines #{new_cursor + 1}-" <>
-      "#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
-    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+    {page_text, _} = get_page(state.lines, new_cursor, state.page_size, state.total)
+    from = new_cursor + 1
+    to = min(new_cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
     {:noreply, %{state | cursor: new_cursor}}
   end
 
-  def handle_info({:mailbox_msg, _id, {sender_mb, cmd}}, state)
-      when is_binary(cmd) do
-    case Regex.run(~r/^search\s+(.+)$/i, String.trim(cmd)) do
-      [_, pattern] -> handle_search(sender_mb, pattern, state)
-      nil -> handle_other(sender_mb, String.trim(cmd), state)
-    end
+  def handle_info({:mailbox_msg, _id, {sender_mb, %{"action" => "goto", "line" => line_num}}}, state) do
+    line_num = if is_binary(line_num), do: String.to_integer(line_num), else: line_num
+    new_cursor = min(max(line_num - 1, 0), state.total - 1)
+    {page_text, next_cursor} = get_page(state.lines, new_cursor, state.page_size, state.total)
+    from = new_cursor + 1
+    to = min(new_cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
+    {:noreply, %{state | cursor: next_cursor}}
   end
 
-  defp handle_search(sender_mb, pattern, state) do
+  def handle_info({:mailbox_msg, _id, {sender_mb, %{"action" => "search", "pattern" => pattern}}}, state) do
     matches = state.lines
       |> Enum.with_index()
       |> Enum.filter(fn {line, _} -> String.contains?(line, pattern) end)
+      |> Enum.map(fn {line, idx} -> {idx, line} end)
 
     case matches do
       [] ->
-        Gizmo.Mailbox.route(sender_mb,
-          {state.id, "no matches for: #{pattern}"})
+        Gizmo.Mailbox.route(sender_mb, {state.id,
+          %{"text" => "no matches for: #{pattern}", "matches" => 0}})
         {:noreply, state}
-      [{_, first_idx} | _] = hits ->
+      [{first_idx, _} | _] = hits ->
         summary = hits |> Enum.take(20)
-          |> Enum.map(fn {line, idx} -> "#{idx + 1}: #{line}" end)
+          |> Enum.map(fn {idx, line} -> "#{idx + 1}: #{line}" end)
           |> Enum.join("\n")
         header = "#{length(hits)} matches, showing at line #{first_idx + 1}\n"
-        Gizmo.Mailbox.route(sender_mb, {state.id, header <> summary})
+        Gizmo.Mailbox.route(sender_mb, {state.id,
+          %{"text" => header <> summary, "matches" => length(hits), "first_line" => first_idx + 1}})
         {:noreply, %{state | cursor: first_idx}}
     end
   end
 
-  defp handle_other(sender_mb, "goto " <> n, state) do
-    line_num = String.to_integer(String.trim(n))
-    new_cursor = min(max(line_num - 1, 0), state.total - 1)
-    {page_text, next_cursor} = get_page(%{state | cursor: new_cursor})
-    header = "lines #{new_cursor + 1}-" <>
-      "#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
-    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
-    {:noreply, %{state | cursor: next_cursor}}
-  end
-
-  defp handle_other(sender_mb, "close", state) do
-    Gizmo.Mailbox.route(sender_mb, {state.id, "closed"})
+  def handle_info({:mailbox_msg, _id, {sender_mb, %{"action" => "close"}}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.id, %{"text" => "closed", "status" => "closed"}})
     Gizmo.Mailbox.unregister(state.id)
     {:stop, :normal, state}
   end
@@ -852,11 +845,11 @@ defmodule Gizmo.Services.PagerSession do
     {:stop, :normal, state}
   end
 
-  defp get_page(state) do
-    end_idx = min(state.cursor + state.page_size, state.total)
-    page_lines = Enum.slice(state.lines, state.cursor, end_idx - state.cursor)
+  defp get_page(lines, cursor, page_size, total) do
+    end_idx = min(cursor + page_size, total)
+    page_lines = Enum.slice(lines, cursor, end_idx - cursor)
     numbered = page_lines
-      |> Enum.with_index(state.cursor + 1)
+      |> Enum.with_index(cursor + 1)
       |> Enum.map(fn {line, num} -> "#{num}: #{line}" end)
       |> Enum.join("\n")
     {numbered, end_idx}
@@ -867,16 +860,16 @@ end
 From the agent's perspective, opening a document looks like this:
 
 ```json
-{"op": "send", "mailbox": "pager", "msg": "open /etc/hosts"}
+{"op": "send", "mailbox": "pager", "msg": {"action": "open", "path": "/etc/hosts"}}
 ```
 
 The response arrives as `${_msg}` on the next cycle: `"opened:pager_0:12 lines"`. The agent extracts the session ID (`pager_0`) and talks to it directly from then on:
 
 ```json
-{"op": "send", "mailbox": "pager_0", "msg": "next"}
+{"op": "send", "mailbox": "pager_0", "msg": {"action": "next"}}
 ```
 
-Each `next` returns a page of numbered lines with a header. `prev` goes back. `goto 100` jumps to a line. `search TODO` finds matches and jumps the cursor. `close` terminates the session process. And if the agent dies without closing, the session's `Process.monitor` fires and the process cleans itself up.
+Each `{"action": "next"}` returns a page of numbered lines with a header. `{"action": "prev"}` goes back. `{"action": "goto", "line": 100}` jumps to a line. `{"action": "search", "pattern": "TODO"}` finds matches and jumps the cursor. `{"action": "close"}` terminates the session process. And if the agent dies without closing, the session's `Process.monitor` fires and the process cleans itself up.
 
 The agent can open multiple documents---each gets its own session process, its own mailbox ID, its own cursor. The factory is a singleton, but the sessions are not. This is the same pattern as `spawn`: you ask a service to create something, it gives you back an address, and you communicate with it.
 
@@ -893,10 +886,10 @@ You are a system inspector. Messages arrive as ${_msg}.
 
 @@step2
 The output of 'uname -a' arrived as ${_msg}.
-Send "System info: ${_msg}" to 'human', then terminate with [].
+Send {"text": "System info: ${_msg}"} to 'human', then terminate with [].
 @@end
 
-1. Send "uname -a" to 'bash'.
+1. Send {"command": "uname -a"} to 'bash'.
 2. Return frames: ["@step2"].
 ```
 
@@ -909,13 +902,13 @@ Send "System info: ${_msg}" to 'human', then terminate with [].
   ┌─────────────────────────────────┐
   │ "You are a system inspector..." │  ← boot frame (frame 0)
   │ @@step2 ... @@end               │
-  │ 1. Send "uname -a" to bash.     │
+  │ 1. Send {"command":...} to bash. │
   └─────────────────────────────────┘
 
   Bindings: {_self: "agent_1", _msg: "init", _msg_source: "runtime"}
 
   LLM returns:
-    ops:    [send("bash", "uname -a")]
+    ops:    [send("bash", {"command": "uname -a"})]
     frames: ["@step2"]
 
   After interpolation:
@@ -924,7 +917,7 @@ Send "System info: ${_msg}" to 'human', then terminate with [].
     (${_msg} inside section text is ESCAPED — stays literal)
 
   Execute ops:
-    → deliver "uname -a" to "bash" mailbox
+    → deliver {"command":"uname -a"} to "bash" mailbox
 
   Context stack (after):
   ┌──────────────────────────────────────┐
@@ -953,14 +946,14 @@ Send "System info: ${_msg}" to 'human', then terminate with [].
   System prompt = boot frame + step2 frame + runtime preamble
 
   LLM returns:
-    ops:    [send("human", "System info: ${_msg}")]
+    ops:    [send("human", {"text": "System info: ${_msg}"})]
     frames: []
 
   After interpolation:
-    ops:    [send("human", "System info: Linux hostname 6.12...")]
+    ops:    [send("human", {"text": "System info: Linux hostname 6.12..."})]
 
   Execute ops:
-    → deliver "System info: Linux hostname 6.12..." to "human"
+    → deliver {"text":"System info: Linux hostname 6.12..."} to "human"
     → printed to terminal
 
   Context stack (after): []
@@ -1002,7 +995,7 @@ This is *stack reduction* in action. The agent started with one frame (boot), gr
 The most fundamental technique. When an agent needs to span multiple cycles (e.g., send a command to bash and use the result), it returns a _continuation frame_ telling its future self what to do.
 
 ```
-Step 1: Send "uname -a" to 'bash'.
+Step 1: Send {"command": "uname -a"} to 'bash'.
 Return frames with a continuation:
   "The bash output arrived as ${_msg}. Send it to 'human' and terminate."
 ```
@@ -1103,7 +1096,7 @@ graph TD
 Do something, return empty frames. The simplest pattern.
 
 ```
-Send "Hello!" to 'human'. Return frames: [].
+Send {"text": "Hello!"} to 'human'. Return frames: [].
 ```
 
 One cycle. Agent terminates on empty stack.
@@ -1114,11 +1107,11 @@ Send to a service, return a continuation frame, use `${_msg}` next cycle.
 
 ```json
 // Cycle 1:
-{ "ops": [{"op":"send", "mailbox":"bash", "msg":"ls -la"}],
+{ "ops": [{"op":"send", "mailbox":"bash", "msg":{"command":"ls -la"}}],
   "frames": ["Listing arrived as ${_msg}. Send to human. Terminate."] }
 
 // Cycle 2: ${_msg} = bash output
-{ "ops": [{"op":"send", "mailbox":"human", "msg":"${_msg}"}],
+{ "ops": [{"op":"send", "mailbox":"human", "msg":{"text":"${_msg}"}}],
   "frames": [] }
 ```
 
@@ -1159,7 +1152,7 @@ The trap fires on `child_died:` regardless of which frame the parent is currentl
 Spawn independent agents that find each other via the blackboard:
 
 ```
-1. send("blackboard", "write coordinator_mb ${_self}")
+1. send("blackboard", {"action": "write", "key": "coordinator_mb", "value": "${_self}"})
 2. spawn(["@bank-program"], dest: "bank", disown: true)
 3. spawn(["@store-program"], dest: "store", disown: true)
 ```
@@ -1232,8 +1225,8 @@ Runs built-in unit tests for interpolation, response parsing, op validation, and
 *Wrong:*
 ```json
 { "ops": [
-    {"op": "send", "mailbox": "bash", "msg": "uname -a"},
-    {"op": "send", "mailbox": "human", "msg": "Result: ${_msg}"}
+    {"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}},
+    {"op": "send", "mailbox": "human", "msg": {"text": "Result: ${_msg}"}}
   ] }
 ```
 
@@ -1259,7 +1252,7 @@ Don't use `receive` in message-driven mode. Responses arrive as `${_msg}`.
 
 === Pitfall 5: Same-cycle receive + interpolation
 
-`${roll}` in `send("human", "You rolled ${roll}")` resolves _before_ `receive("roll")` executes. The binding is stale or unresolved.
+`${roll}` in `send("human", {"text": "You rolled ${roll}"})` resolves _before_ `receive("roll")` executes. The binding is stale or unresolved.
 
 Use the two-cycle roll pattern.
 
@@ -1371,16 +1364,17 @@ If this test fails, nothing else will work. It's the "does the runtime start, ca
 You are a system inspector. Do the following in order:
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@step2
 The output of 'uname -a' arrived as ${_msg}.
-Send a message to 'human' that says: "System info: ${_msg}"
+Send {"text": "System info: ${_msg}"} to 'human'.
 Then terminate with an empty frames array [].
 Do NOT issue a receive op.
 @@end
 
-1. Send the command "uname -a" to the 'bash' mailbox.
+1. Send {"command": "uname -a"} to the 'bash' mailbox.
 2. Return frames: ["@step2"] to continue to the next step.
 
 Do NOT issue a receive op — the bash output arrives automatically as ${_msg}
@@ -1419,37 +1413,38 @@ Also demonstrates:
 You are a memo-taker. Complete the following steps across multiple cycles.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@step2
 The write acknowledgement arrived as ${_msg}. Now write the key "author"
-with value "gizmo-agent" by sending "{write, author, gizmo-agent}" to
-'blackboard'. Return frames: ["@step3"]
+with value "gizmo-agent" by sending {"action": "write", "key": "author", "value": "gizmo-agent"}
+to 'blackboard'. Return frames: ["@step3"]
 Do NOT issue a receive op.
 @@end
 
 @@step3
 The second write acknowledgement arrived as ${_msg}. Now read back the
-"greeting" key by sending "{read, greeting}" to 'blackboard'.
+"greeting" key by sending {"action": "read", "key": "greeting"} to 'blackboard'.
 Return frames: ["@step4"]
 Do NOT issue a receive op.
 @@end
 
 @@step4
-The blackboard value arrived as ${_msg}. Send "Blackboard says: ${_msg}"
+The blackboard value arrived as ${_msg}. Send {"text": "Blackboard says: ${_msg}"}
 to 'human', then terminate with an empty frames array [].
 Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
-by sending "{write, greeting, Hello from the blackboard!}" to 'blackboard'.
-Return frames: ["@step2"]
+by sending {"action": "write", "key": "greeting", "value": "Hello from the blackboard!"}
+to 'blackboard'. Return frames: ["@step2"]
 Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.
 ```
 
 === What to Learn
 
-- The blackboard's string protocol: `"write <key> <value>"` and `"read <key>"`.
+- The blackboard's JSON protocol: `{"action": "write", "key": "...", "value": "..."}` and `{"action": "read", "key": "..."}`.
 - Multi-step linear sequences using section-chained continuations (`@step2` #sym.arrow `@step3` #sym.arrow `@step4`).
 - Each blackboard operation takes a full cycle (send request, wait for response as `${_msg}`).
 - The `"ok"` acknowledgment from writes---every blackboard operation has a response.
@@ -1457,7 +1452,7 @@ Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.
 === Questions for Reflection
 
 + Why does this take 4 cycles? Could you collapse any steps?
-+ The blackboard accepts both `{write, key, value}` and `"write key value"` formats. Which is used here and why might you prefer one over the other?
++ The blackboard accepts JSON objects with an `"action"` field. What would happen if you sent a plain string instead?
 + If two agents write to the same key simultaneously, what happens? Is the blackboard thread-safe?
 
 === Extension Projects
@@ -1474,30 +1469,31 @@ Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.
 You are a supervisor that delegates work to a child process.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@worker
 You are a child worker process. Messages arrive between cycles as ${_msg}.
 
-This is your first cycle (${_msg} is "init"). Send the command 'date +%s'
+This is your first cycle (${_msg} is "init"). Send {"command": "date +%s"}
 to 'bash'. Return a continuation frame that says: "The bash output arrived
-as ${_msg}. Send 'timestamp: ${_msg}' to ${_parent} and return empty
-frames []. Do NOT issue a receive op."
+as ${_msg}. Send {"text": "timestamp: ${_msg}"} to ${_parent} and return
+empty frames []. Do NOT issue a receive op."
 Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
 @@got-result
-The child sent its result, which arrived as ${_msg}. Send "Supervisor:
-child reported: ${_msg}" to 'human', then terminate with an empty frames
+The child sent its result, which arrived as ${_msg}. Send {"text": "Supervisor:
+child reported: ${_msg}"} to 'human', then terminate with an empty frames
 array [].
 Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1:
-1. Send "Supervisor: spawning worker..." to 'human'.
+1. Send {"text": "Supervisor: spawning worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], and dest "child".
 3. Register a trap for "^child_died:" with handler frames:
-   ["The child crashed: ${_interrupt}. Send this error to 'human'
+   ["The child crashed: ${_interrupt}. Send {"text": "error: ${_interrupt}"} to 'human'
     and terminate with empty frames."]
 4. Return frames: ["@got-result"]
 ```
@@ -1530,19 +1526,20 @@ Step 1:
 You are an echo-bot. This is the first cycle (setup).
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 Do NOT issue receive ops — input arrives automatically as ${_msg}.
 
 @@loop
 You are an echo-bot in the main loop. The user's most recent message
 arrived as ${_msg}. Check it now:
 - If ${_msg} is "quit": your response MUST be exactly:
-  ops: [{"op":"send","mailbox":"human","msg":"echo-bot: goodbye!"}]
+  ops: [{"op":"send","mailbox":"human","msg":{"text":"echo-bot: goodbye!"}}]
   frames: []
   notes: {}
 - Otherwise: your response MUST be exactly:
   ops: [
     {"op":"send","mailbox":"human_input",
-     "msg":"echo-bot: you said: ${_msg}\necho-bot> "}
+     "msg":{"prompt":"echo-bot: you said: ${_msg}\necho-bot> "}}
   ]
   frames: ["@loop"]
   notes: {}
@@ -1552,8 +1549,7 @@ arrived as ${_msg}. Check it now:
 This is setup (${_msg} is "init"). Your response MUST be exactly:
 ops: [
   {"op":"send","mailbox":"human_input",
-   "msg":"echo-bot: Hello! Type anything, I'll echo it.
-          Type 'quit' to exit.\necho-bot> "}
+   "msg":{"prompt":"echo-bot: Hello! Type anything, I'll echo it. Type 'quit' to exit.\necho-bot> "}}
 ]
 frames: ["@loop"]
 notes: {}
@@ -1588,19 +1584,20 @@ Do NOT issue a receive op.
 You are a friendly chatbot called "gizmo-chat". This is the first cycle (setup).
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 Do NOT issue receive ops — input arrives automatically as ${_msg}.
 
 @@loop
 You are gizmo-chat, a friendly conversational chatbot. The user's input
 arrived as ${_msg}. Check it now:
 - If ${_msg} is "quit" or "exit" or "bye": your response MUST be:
-  ops: [{"op":"send","mailbox":"human","msg":"gizmo-chat: Bye!"}]
+  ops: [{"op":"send","mailbox":"human","msg":{"text":"gizmo-chat: Bye!"}}]
   frames: []
   notes: {}
 - Otherwise: think of a helpful, conversational response to what the user
   said. Then issue EXACTLY ONE op:
   ops: [{"op":"send","mailbox":"human_input",
-         "msg":"gizmo-chat: <your response>\nyou> "}]
+         "msg":{"prompt":"gizmo-chat: <your response>\nyou> "}}]
   frames: ["@loop"]
   notes: {}
 @@end
@@ -1608,8 +1605,7 @@ arrived as ${_msg}. Check it now:
 This is setup (${_msg} is "init"). Your response MUST be:
 ops: [
   {"op":"send","mailbox":"human_input",
-   "msg":"gizmo-chat: Hey! I'm gizmo-chat. Ask me anything,
-          or type 'quit' to exit.\nyou> "}
+   "msg":{"prompt":"gizmo-chat: Hey! I'm gizmo-chat. Ask me anything, or type 'quit' to exit.\nyou> "}}
 ]
 frames: ["@loop"]
 notes: {}
@@ -1642,21 +1638,22 @@ You are a supervisor that spawns a slow worker, then kills it via the
 reaper after a timeout.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@worker
 You are a slow worker process. Messages arrive between cycles as ${_msg}.
 
-On every cycle, send "worker: still thinking..." to ${_parent} and return
-frames: ["@worker"]. Never terminate on your own — your parent will kill
-you when it decides you've taken too long.
+On every cycle, send {"text": "worker: still thinking..."} to ${_parent}
+and return frames: ["@worker"]. Never terminate on your own — your parent
+will kill you when it decides you've taken too long.
 @@end
 
 @@wait-for-ack
 A message arrived as ${_msg} from ${_msg_source}. Check it now:
 - If ${_msg} starts with "worker:": the worker is still running. This is
-  your timeout signal — it has taken too long. Send ${child} to 'reaper'
-  to kill it. Return frames: ["@wait-for-death"].
+  your timeout signal — it has taken too long. Send {"target": "${child}"}
+  to 'reaper' to kill it. Return frames: ["@wait-for-death"].
 - If ${_msg} starts with "child_died:": the worker was already killed.
   Go to @report.
 Otherwise, return frames: ["@wait-for-ack"] to keep waiting.
@@ -1671,12 +1668,14 @@ Do NOT issue a receive op.
 @@end
 
 @@report
-The worker was killed by the reaper. Send "Supervisor: worker timed out,
-killed via reaper. Death notice: ${_msg}" to 'human'. Then terminate.
+The worker was killed by the reaper. Send {"text": "Supervisor: worker timed out,
+killed via reaper. Death notice: ${_msg}"} to 'human'. Then terminate with
+an empty frames array [].
+Do NOT issue a receive op.
 @@end
 
 Step 1:
-1. Send "Supervisor: spawning slow worker..." to 'human'.
+1. Send {"text": "Supervisor: spawning slow worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "child",
    "grind": true, "idle": true.
 3. Return frames: ["@wait-for-ack"]
@@ -1712,6 +1711,7 @@ that rolls random numbers autonomously. If the child rolls a 1, you
 kill it via the reaper. Otherwise the child keeps rolling on its own.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@roller
@@ -1720,9 +1720,9 @@ tight loop (grind mode — you cycle continuously without waiting for
 messages between cycles).
 
 EVERY cycle, do ALL of these steps in order:
-1. If ${roll} is in your bindings: send "rolled:${roll}" to ${_parent}
-   and send "Child: I rolled ${roll}" to 'human'.
-2. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+1. If ${roll} is in your bindings: send {"text": "rolled:${roll}"} to ${_parent}
+   and send {"text": "Child: I rolled ${roll}"} to 'human'.
+2. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
 3. Issue receive("roll") to block until bash responds.
 4. Return frames: ["@0"].
 
@@ -1734,31 +1734,33 @@ On every subsequent cycle ${roll} holds the previous bash result.
 A message arrived as ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "rolled:":
-  Send "Parent: child ${_msg}" to 'human'.
-  Extract the number after "rolled:".
+  Send {"text": "Parent: child ${_msg}"} to 'human'.
+  Extract the number after "rolled:" and trim whitespace.
   If the number is "1":
-    Send ${child} to 'reaper' to kill the child.
+    Send {"target": "${child}"} to 'reaper' to kill the child.
     Return frames: ["@wait-for-death"].
   Otherwise:
     Return frames: ["@check-roll"].
 
 If ${_msg} starts with "child_died:":
-  Send "Parent: child died! ${_msg}" to 'human'.
+  Send {"text": "Parent: child died! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 
 Otherwise: return frames: ["@check-roll"].
+Do NOT issue a receive op.
 @@end
 
 @@wait-for-death
 The reaper was asked to kill the child. A message arrived as ${_msg}.
 If ${_msg} starts with "child_died:":
-  Send "Parent: child was reaped! ${_msg}" to 'human'.
+  Send {"text": "Parent: child was reaped! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 Otherwise: return frames: ["@wait-for-death"].
+Do NOT issue a receive op.
 @@end
 
 Step 1:
-1. Send "Parent: spawning roller child..." to 'human'.
+1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller"], dest "child", "grind": true.
 3. Return frames: ["@check-roll"].
 ```
@@ -1795,18 +1797,19 @@ You are a supervisor for a number-guessing game. Spawn an idle child
 that rolls dice on a watchdog timer. If it rolls 1, kill it via reaper.
 Use a trap for child death notification.
 
-Messages arrive as ${_msg} from ${_msg_source}. This is the first
-cycle (${_msg} is "init").
+Messages arrive as ${_msg} from ${_msg_source}. All messages are JSON
+objects. The msg field in send ops must be a JSON object. This is the
+first cycle (${_msg} is "init").
 
 @@roller
 Roller child. Messages arrive as ${_msg} from ${_msg_source}.
 
 If ${_msg} is "init":
-  1. Send "every 2000" to 'watchdog'.
+  1. Send {"action": "every", "ms": 2000} to 'watchdog'.
   2. Return frames: [].
 
 If ${_msg_source} is "watchdog":
-  1. Send 'printf "%d" $(shuf -i 1-6 -n 1)' to 'bash'.
+  1. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
   2. Return frames: ["@1"].
 
 Otherwise: return frames: [].
@@ -1816,8 +1819,8 @@ Otherwise: return frames: [].
 Waiting for bash result. Message: ${_msg} from ${_msg_source}.
 
 If ${_msg_source} is "bash":
-  1. Send "rolled:${_msg}" to ${_parent}.
-  2. Send "Child: I rolled ${_msg}" to 'human'.
+  1. Send {"text": "rolled:${_msg}"} to ${_parent}.
+  2. Send {"text": "Child: I rolled ${_msg}"} to 'human'.
   3. Return frames: [].
 
 Otherwise: return frames: ["@0"].
@@ -1827,9 +1830,9 @@ Otherwise: return frames: ["@0"].
 Message: ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "rolled:":
-  Send "Parent: child ${_msg}" to 'human'.
+  Send {"text": "Parent: child ${_msg}"} to 'human'.
   Extract the number after "rolled:".
-  If it is "1": send ${child} to 'reaper'.
+  If it is "1": send {"target": "${child}"} to 'reaper'.
   Return frames: ["@check-roll"].
 
 Otherwise: return frames: ["@check-roll"].
@@ -1837,11 +1840,11 @@ Otherwise: return frames: ["@check-roll"].
 
 @@death-handler
 Child died: ${_interrupt}.
-Send "Parent: child was reaped! ${_interrupt}" to 'human'.
+Send {"text": "Parent: child was reaped! ${_interrupt}"} to 'human'.
 Return frames: [].
 @@end
 
-1. Send "Parent: spawning roller child..." to 'human'.
+1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller", "@wait-roll"],
    dest "child", "idle": true.
 3. Register a trap: pattern "^child_died:", frames ["@death-handler"].
@@ -1882,7 +1885,7 @@ Key structural comparison with test 08:
 === Extension Projects
 
 - *Adaptive timing:* Start the watchdog at 2000ms. After each roll, halve the interval. How fast can you go before ticks start racing the LLM?
-- *One-shot timer:* Replace `"every 2000"` with `"after 2000"` and have the child request a new timer after each roll. Compare behavior.
+- *One-shot timer:* Replace `{"action": "every", "ms": 2000}` with `{"action": "after", "ms": 2000}` and have the child request a new timer after each roll. Compare behavior.
 - *Hybrid:* Start in idle mode, switch to grind mode after 3 rolls (the parent sends a "go fast" message, the child adjusts).
 
 == 10: Marketplace
@@ -1895,6 +1898,7 @@ You are a marketplace coordinator. You spawn two independent peer agents
 and you through the blackboard service directory.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 
 @@bank-program
 You are the bank. You run in grind mode (cycle continuously).
@@ -1903,10 +1907,10 @@ Use receive ops to block for messages. Return frames: ["@0"] to loop.
 Check your current bindings to determine what to do:
 
 If ${req} is in your bindings:
-  ${req} is a message you received. Check it:
-  If ${req} starts with "balance_request:":
-    Extract the reply address after "balance_request:" (no spaces).
-    Send "balance:42" to that address.
+  ${req} is the text summary of the message. ${req_payload} is the full JSON.
+  If ${req} contains "balance_request":
+    Parse ${req_payload} to extract the "reply_to" field.
+    Send {"text": "balance:42"} to that reply address.
     Terminate with empty frames [].
   Otherwise: Issue receive("req"). Return frames: ["@0"].
 
@@ -1916,7 +1920,8 @@ If ${ack} is in your bindings but ${req} is NOT:
   Return frames: ["@0"].
 
 Otherwise (first cycle, no ${ack} yet):
-  Register: send "write bank_mb ${_self}" to 'blackboard'.
+  Register: send {"action": "write", "key": "bank_mb", "value": "${_self}"}
+  to 'blackboard'.
   Issue receive("ack").
   Return frames: ["@0"].
 @@end
@@ -1929,35 +1934,37 @@ Check your current bindings to determine what to do:
 
 If ${coord} is in your bindings:
   Deliver the result.
-  Send "write marketplace_result ${bal}" to 'blackboard'.
-  Send ${bal} to ${coord}.
+  Send {"action": "write", "key": "marketplace_result", "value": "${bal}"}
+  to 'blackboard'.
+  Send {"text": "${bal}"} to ${coord}.
   Terminate with empty frames [].
 
 If ${bal} is in your bindings but ${coord} is NOT:
   You got the bank's reply. Look up the coordinator.
-  Send "read coordinator_mb" to 'blackboard'.
+  Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
   Issue receive("coord").
   Return frames: ["@0"].
 
 If ${bank} is in your bindings but ${bal} is NOT:
   You have the bank's address. Send it a request.
   If ${bank} starts with "agent_":
-    Send "balance_request:${_self}" to ${bank}.
+    Send {"text": "balance_request", "reply_to": "${_self}"} to ${bank}.
     Issue receive("bal").
     Return frames: ["@0"].
   Otherwise (bank not registered yet, retry):
-    Send "read bank_mb" to 'blackboard'.
+    Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
     Issue receive("bank").
     Return frames: ["@0"].
 
 If ${reg} is in your bindings but ${bank} is NOT:
   You registered. Now look up the bank.
-  Send "read bank_mb" to 'blackboard'.
+  Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
   Issue receive("bank").
   Return frames: ["@0"].
 
 Otherwise (first cycle, no ${reg} yet):
-  Register: send "write store_mb ${_self}" to 'blackboard'.
+  Register: send {"action": "write", "key": "store_mb", "value": "${_self}"}
+  to 'blackboard'.
   Issue receive("reg").
   Return frames: ["@0"].
 @@end
@@ -1967,7 +1974,7 @@ You are the coordinator. You already spawned the bank and store.
 A message arrived as ${_msg} from ${_msg_source}.
 Do NOT spawn any agents. Do NOT send to blackboard.
 If ${_msg} starts with "balance:":
-  Send "Marketplace result: ${_msg}" to 'human'.
+  Send {"text": "Marketplace result: ${_msg}"} to 'human'.
   Terminate with empty frames [].
 Otherwise:
   Ignore this message. Return frames: ["@wait-result"].
@@ -1975,8 +1982,9 @@ Otherwise:
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
-1. Send "write coordinator_mb ${_self}" to 'blackboard'.
-2. Send "Coordinator: spawning bank and store..." to 'human'.
+1. Send {"action": "write", "key": "coordinator_mb", "value": "${_self}"}
+   to 'blackboard'.
+2. Send {"text": "Coordinator: spawning bank and store..."} to 'human'.
 3. Spawn with frames: ["@bank-program"], dest "bank_id",
    "grind": true, "disown": true.
 4. Spawn with frames: ["@store-program"], dest "store_id",
@@ -2015,14 +2023,15 @@ The most complex test. Demonstrates:
 You are a supervisor that spawns a named child worker.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 
 @@worker
 You are a named worker. Your mailbox ID should be "myworker".
-Send "hello from ${_self}" to 'human', then terminate with empty frames [].
+Send {"text": "hello from ${_self}"} to 'human', then terminate with empty frames [].
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
-1. Send "Spawning named worker..." to 'human'.
+1. Send {"text": "Spawning named worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "kid",
    "grind": true, "name": "myworker".
 3. Return frames: []. Terminate immediately after spawning.
@@ -2051,7 +2060,7 @@ This is the first cycle (${_msg} is "init"). Do all of these steps:
 === Listing
 
 ```
-You are a one-shot greeter for the --each test. Send "Hello from ${_self}!"
+You are a one-shot greeter for the --each test. Send {"text": "Hello from ${_self}!"}
 to 'human', then terminate with empty frames [].
 ```
 
@@ -2319,8 +2328,8 @@ Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + bo
   stroke: 0.5pt + luma(200),
   inset: 3pt,
   table.header([*Op*], [*Syntax*], [*Blk?*], [*Binds*], [*Notes*]),
-  [`send`], [`{"op":"send", "mailbox":"id", "msg":"text"}`], [No], [---], [Fire-and-forget. Both fields interpolated.],
-  [`receive`], [`{"op":"receive", "dest":"name"}`], [Yes], [`name`], [Blocks until message arrives. Consumes it.],
+  [`send`], [`{"op":"send", "mailbox":"id", "msg":{...}}`], [No], [---], [Fire-and-forget. `msg` is a JSON object. Both fields interpolated.],
+  [`receive`], [`{"op":"receive", "dest":"name"}`], [Yes], [`name`, `name_payload`], [Blocks until message arrives. `name` = text summary, `name_payload` = full JSON.],
   [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `grind`/`idle` (bool, inherit), `disown` (bool, false), `name`/`model` (string, inherit).],
   [`trap`], [`{"op":"trap", "pattern":"regex", "frames":[...]}`], [No], [---], [Interrupt handler. Empty `frames` clears. Sets `_interrupt`/`_interrupt_source`.],
 )
@@ -2348,8 +2357,9 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   table.header([*Name*], [*Set By*], [*Description*]),
   [`_self`], [always], [This agent's mailbox ID],
   [`_parent`], [if spawned], [Parent's mailbox ID],
-  [`_msg`], [each cycle], [Wake message. `"init"` on cycle 0. Not re-bound in grind after cycle 0.],
+  [`_msg`], [each cycle], [Text summary of wake message. `"init"` on cycle 0. Not re-bound in grind after cycle 0.],
   [`_msg_source`], [each cycle], [Sender ID. `"runtime"` on cycle 0.],
+  [`_payload`], [each cycle], [Full JSON of wake message. `"{}"` on cycle 0.],
   [`_interrupt`], [trap fire], [Matched message content],
   [`_interrupt_source`], [trap fire], [Matched message sender],
 )
@@ -2362,14 +2372,14 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   stroke: 0.5pt + luma(200),
   inset: 3pt,
   table.header([*Mailbox*], [*Send*], [*Response*], [*Notes*]),
-  [`human`], [any string], [_(none)_], [Print to stdout],
-  [`human_input`], [prompt string], [`{id, line}`], [Print prompt, read stdin line],
-  [`bash`], [command string], [`{id, output}`], [Async shell. `--bash-timeout` applies.],
-  [`blackboard`], [`"write k v"` / `"read k"`], [`{id, "ok"}` / `{id, v}`], [Shared key-value store],
+  [`human`], [`{"text": "..."}`], [_(none)_], [Print to stdout],
+  [`human_input`], [`{"prompt": "..."}`], [`{"text": line}`], [Print prompt, read stdin line],
+  [`bash`], [`{"command": "..."}`], [`{"text": out, ...}`], [Async shell. `--bash-timeout` applies.],
+  [`blackboard`], [`{"action": "write/read", ...}`], [`{"text": "ok/val", ...}`], [Shared key-value store],
   [`exception`], [_(internal)_], [_(none)_], [Logs agent errors to stderr],
-  [`reaper`], [target mailbox ID], [_(none)_], [Force-kill descendant. Ancestor-only.],
-  [`watchdog`], [`"every N"` / `"after N"` / `"cancel"`], [`{id, "ok"}`], [Periodic/one-shot tick delivery],
-  [`pager`], [`"open <path>"`], [`{id, "opened:sid:lines"}`], [Spawns session: `next`/`prev`/`search`/`goto`/`close`],
+  [`reaper`], [`{"target": "mb_id"}`], [_(none)_], [Force-kill descendant. Ancestor-only.],
+  [`watchdog`], [`{"action": "every/after/cancel", ...}`], [`{"text": "tick"}`], [Periodic/one-shot tick delivery],
+  [`pager`], [`{"action": "open", "path": "..."}`], [`{"text": "opened:sid:N lines", ...}`], [Spawns session: `next`/`prev`/`search`/`goto`/`close`],
 )
 
 == CLI Flags
@@ -2386,7 +2396,7 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   table.cell(colspan: 2, fill: luma(240), [_Modes_]),
   [`--grind`], [Hot-loop: no inter-cycle message wait.],
   [`--idle`], [Restore boot frame on frame exhaust (daemon).],
-  [`--watchdog <ms>`], [Send `watchdog:tick` every N ms.],
+  [`--watchdog <ms>`], [Send `"tick"` (from `"watchdog"`) every N ms.],
   [`--max-cycles <N>`], [Cycle limit (default 50, 0 = unlimited).],
   [`--bash-timeout <ms>`], [Bash timeout (default 60000, 0 = none).],
   table.cell(colspan: 2, fill: luma(240), [_Model_]),

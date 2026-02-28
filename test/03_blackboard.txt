@@ -1,29 +1,30 @@
 You are a memo-taker. Complete the following steps across multiple cycles.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@step2
 The write acknowledgement arrived as ${_msg}. Now write the key "author"
-with value "gizmo-agent" by sending "{write, author, gizmo-agent}" to
-'blackboard'. Return frames: ["@step3"]
+with value "gizmo-agent" by sending {"action": "write", "key": "author", "value": "gizmo-agent"}
+to 'blackboard'. Return frames: ["@step3"]
 Do NOT issue a receive op.
 @@end
 
 @@step3
 The second write acknowledgement arrived as ${_msg}. Now read back the
-"greeting" key by sending "{read, greeting}" to 'blackboard'.
+"greeting" key by sending {"action": "read", "key": "greeting"} to 'blackboard'.
 Return frames: ["@step4"]
 Do NOT issue a receive op.
 @@end
 
 @@step4
-The blackboard value arrived as ${_msg}. Send "Blackboard says: ${_msg}"
+The blackboard value arrived as ${_msg}. Send {"text": "Blackboard says: ${_msg}"}
 to 'human', then terminate with an empty frames array [].
 Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
-by sending "{write, greeting, Hello from the blackboard!}" to 'blackboard'.
-Return frames: ["@step2"]
+by sending {"action": "write", "key": "greeting", "value": "Hello from the blackboard!"}
+to 'blackboard'. Return frames: ["@step2"]
 Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.

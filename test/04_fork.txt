@@ -1,28 +1,29 @@
 You are a supervisor that delegates work to a child process.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
 
 @@worker
 You are a child worker process. Messages arrive between cycles as ${_msg}.
 
-This is your first cycle (${_msg} is "init"). Send the command 'date +%s'
+This is your first cycle (${_msg} is "init"). Send {"command": "date +%s"}
 to 'bash'. Return a continuation frame that says: "The bash output arrived
-as ${_msg}. Send 'timestamp: ${_msg}' to ${_parent} and return empty
-frames []. Do NOT issue a receive op."
+as ${_msg}. Send {"text": "timestamp: ${_msg}"} to ${_parent} and return
+empty frames []. Do NOT issue a receive op."
 Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
 @@got-result
-The child sent its result, which arrived as ${_msg}. Send "Supervisor:
-child reported: ${_msg}" to 'human', then terminate with an empty frames
+The child sent its result, which arrived as ${_msg}. Send {"text": "Supervisor:
+child reported: ${_msg}"} to 'human', then terminate with an empty frames
 array [].
 Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1:
-1. Send "Supervisor: spawning worker..." to 'human'.
+1. Send {"text": "Supervisor: spawning worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], and dest "child".
 3. Register a trap for "^child_died:" with handler frames:
-   ["The child crashed: ${_interrupt}. Send this error to 'human' and terminate with empty frames."]
+   ["The child crashed: ${_interrupt}. Send {"text": "error: ${_interrupt}"} to 'human' and terminate with empty frames."]
 4. Return frames: ["@got-result"]

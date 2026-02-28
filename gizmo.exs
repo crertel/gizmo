@@ -50,7 +50,8 @@ defmodule Gizmo.Format do
   end
 
   def op_send(id, mailbox, msg) do
-    "#{agent_tag(id)}   #{@green}send#{@reset} #{@bold}#{mailbox}#{@reset} ← #{truncate(msg, 80)}"
+    msg_str = if is_map(msg), do: Jason.encode!(msg), else: msg
+    "#{agent_tag(id)}   #{@green}send#{@reset} #{@bold}#{mailbox}#{@reset} ← #{truncate(msg_str, 80)}"
   end
 
   def op_receive(id, dest, timeout) do
@@ -229,8 +230,8 @@ defmodule Gizmo.LLM do
                 description: "Target mailbox ID (for send)."
               },
               msg: %{
-                type: "string",
-                description: "Message content (for send)."
+                type: "object",
+                description: "Message content (for send). Must be a JSON object."
               },
               frames: %{
                 type: "array",
@@ -325,7 +326,7 @@ defmodule Gizmo.LLM do
 
   defp validate_op(%{"op" => "send"} = op) do
     with :ok <- require_string(op, "mailbox", "send"),
-         :ok <- require_string(op, "msg", "send") do
+         :ok <- require_map(op, "msg", "send") do
       {:ok, {:send, op["mailbox"], op["msg"]}}
     end
   end
@@ -398,6 +399,14 @@ defmodule Gizmo.LLM do
     end
   end
 
+  defp require_map(op, field, op_name) do
+    case op[field] do
+      v when is_map(v) -> :ok
+      nil -> {:error, {:invalid_op, op_name, "missing required field: #{field}"}}
+      _ -> {:error, {:invalid_op, op_name, "#{field} must be a JSON object"}}
+    end
+  end
+
   @doc """
   Apply interpolation to an eval_response's frames and op message strings.
   Takes an eval_response, bindings map, and optional sections map.
@@ -411,7 +420,7 @@ defmodule Gizmo.LLM do
       Enum.map(ops, fn
         {:send, mailbox, msg} ->
           {:send, Gizmo.Interpolation.resolve(mailbox, bindings, sections),
-           Gizmo.Interpolation.resolve(msg, bindings, sections)}
+           Gizmo.Interpolation.resolve_value(msg, bindings, sections)}
 
         {:spawn, spawn_frames, dest, spawn_opts} ->
           {:spawn, Enum.map(spawn_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)),
@@ -734,6 +743,14 @@ defmodule Gizmo.Interpolation do
       end
     end)
   end
+
+  @doc "Recursively resolve interpolation in strings, maps, and lists."
+  def resolve_value(v, b, s) when is_binary(v), do: resolve(v, b, s)
+  def resolve_value(v, b, s) when is_map(v),
+    do: Map.new(v, fn {k, val} -> {k, resolve_value(val, b, s)} end)
+  def resolve_value(v, b, s) when is_list(v),
+    do: Enum.map(v, &resolve_value(&1, b, s))
+  def resolve_value(v, _b, _s), do: v
 end
 
 # -----------------------------------------------------------------------------
@@ -785,7 +802,11 @@ defmodule Gizmo.Mailbox do
             _ -> {nil, message}
           end
 
-        content_str = if is_binary(content), do: content, else: inspect(content)
+        content_str = cond do
+          is_binary(content) -> content
+          is_map(content) -> Jason.encode!(content)
+          true -> inspect(content)
+        end
 
         Gizmo.Trace.emit_messages(%{
           event: "msg:route",
@@ -892,74 +913,19 @@ defmodule Gizmo.Services.Blackboard do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, {:read, key}}}, %{store: store} = state) do
-    found = Map.has_key?(store, key)
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"action" => "read", "key" => key}}}, state) do
+    found = Map.has_key?(state.store, key)
     Gizmo.Trace.emit_service(%{event: "blackboard:read", key: key, found: found})
-    value = Map.get(store, key, "")
-    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
+    value = Map.get(state.store, key, "")
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, %{"text" => value, "key" => key, "value" => value}})
     {:noreply, state}
   end
 
-  def handle_info(
-        {:mailbox_msg, _mailbox_id, {reply_to, {:write, key, value}}},
-        %{store: store} = state
-      ) do
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"action" => "write", "key" => key, "value" => value}}}, state) do
     value_str = if is_binary(value), do: value, else: inspect(value)
     Gizmo.Trace.emit_service(%{event: "blackboard:write", key: key, value_bytes: byte_size(value_str)})
-    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
-    {:noreply, %{state | store: Map.put(store, key, value)}}
-  end
-
-  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, msg}}, state) when is_binary(msg) do
-    case parse_command(msg) do
-      {:read, key} ->
-        found = Map.has_key?(state.store, key)
-        Gizmo.Trace.emit_service(%{event: "blackboard:read", key: key, found: found})
-        value = Map.get(state.store, key, "")
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, value})
-        {:noreply, state}
-
-      {:write, key, value} ->
-        Gizmo.Trace.emit_service(%{event: "blackboard:write", key: key, value_bytes: byte_size(value)})
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "ok"})
-        {:noreply, %{state | store: Map.put(state.store, key, value)}}
-
-      :error ->
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unrecognized command"})
-        {:noreply, state}
-    end
-  end
-
-  defp parse_command(msg) do
-    trimmed = msg |> String.trim() |> String.trim_leading("{") |> String.trim_trailing("}")
-
-    # Try comma-separated first, then fall back to space-separated
-    parts =
-      case String.split(trimmed, ",", parts: 2) do
-        [single] -> String.split(single, ~r/\s+/, parts: 2)
-        multi -> Enum.map(multi, &String.trim/1)
-      end
-
-    case parts do
-      ["read", key] ->
-        {:read, String.trim(key)}
-
-      ["write", rest] ->
-        # rest may be "key, value" or "key value"
-        kv =
-          case String.split(rest, ",", parts: 2) do
-            [single] -> String.split(single, ~r/\s+/, parts: 2)
-            multi -> Enum.map(multi, &String.trim/1)
-          end
-
-        case kv do
-          [key, value] -> {:write, String.trim(key), String.trim(value)}
-          _ -> :error
-        end
-
-      _ ->
-        :error
-    end
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, %{"text" => "ok", "status" => "ok"}})
+    {:noreply, %{state | store: Map.put(state.store, key, value)}}
   end
 end
 
@@ -995,20 +961,24 @@ defmodule Gizmo.Services.Bash do
   # --- Mailbox message (agent → bash) ---
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, message}}, state) do
-    case parse_message(message) do
-      {:run, timeout_ms, mode, note, command} ->
-        {:noreply, start_job(state, reply_to, command, timeout_ms, mode, note)}
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"action" => "kill", "handle" => handle}}}, state) do
+    {:noreply, kill_job(state, reply_to, handle)}
+  end
 
-      {:kill, handle} ->
-        {:noreply, kill_job(state, reply_to, handle)}
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"action" => "wait", "handle" => handle} = msg}}, state) do
+    new_timeout = msg["timeout"]
+    new_timeout = if is_integer(new_timeout), do: new_timeout, else: nil
+    {:noreply, wait_job(state, reply_to, handle, new_timeout)}
+  end
 
-      {:wait, handle, new_timeout} ->
-        {:noreply, wait_job(state, reply_to, handle, new_timeout)}
-
-      {:raw, command} ->
-        {:noreply, start_job(state, reply_to, command, state.default_timeout, :kill, nil)}
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"command" => command} = msg}}, state) do
+    timeout_ms = msg["timeout"] || state.default_timeout
+    mode = case msg["mode"] do
+      "notify" -> :notify
+      _ -> :kill
     end
+    note = msg["note"]
+    {:noreply, start_job(state, reply_to, command, timeout_ms, mode, note)}
   end
 
   # --- Port data accumulation ---
@@ -1043,12 +1013,11 @@ defmodule Gizmo.Services.Bash do
         })
 
         if status == 0 do
-          Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, output})
+          Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id,
+            %{"text" => output, "output" => output, "exit_code" => 0}})
         else
-          Gizmo.Mailbox.route(
-            job.reply_to,
-            {state.mailbox_id, "error: exit code #{status}: #{output}"}
-          )
+          Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id,
+            %{"text" => "error: exit code #{status}: #{output}", "output" => output, "exit_code" => status}})
         end
 
         {:noreply, cleanup_job(state, handle)}
@@ -1066,21 +1035,21 @@ defmodule Gizmo.Services.Bash do
         Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "kill"})
         kill_port(job.port)
 
-        Gizmo.Mailbox.route(
-          job.reply_to,
-          {state.mailbox_id, "error: timeout after #{job.timeout_ms}ms"}
-        )
+        Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id,
+          %{"text" => "error: timeout after #{job.timeout_ms}ms", "error" => "timeout", "timeout_ms" => job.timeout_ms}})
 
         {:noreply, cleanup_job(state, handle)}
 
       %{mode: :notify} = job ->
         Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "notify"})
 
-        notification =
-          case job.note do
-            nil -> "bash:timeout:#{handle}"
-            note -> "bash:timeout:#{handle}:#{note}"
-          end
+        text = case job.note do
+          nil -> "bash:timeout:#{handle}"
+          note -> "bash:timeout:#{handle}:#{note}"
+        end
+
+        notification = %{"text" => text, "error" => "timeout", "mode" => "notify", "handle" => handle}
+        notification = if job.note, do: Map.put(notification, "note", job.note), else: notification
 
         Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, notification})
         {:noreply, put_in(state.jobs[handle], %{job | status: :notified, timer_ref: nil})}
@@ -1088,36 +1057,6 @@ defmodule Gizmo.Services.Bash do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
-
-  # --- Message parsing ---
-
-  defp parse_message(message) do
-    case String.split(message, "\n", parts: 2) do
-      [first_line, command] ->
-        case String.split(first_line, ",", parts: 4) do
-          ["run", timeout_str, mode_str] ->
-            {:run, String.to_integer(timeout_str), parse_mode(mode_str), nil, command}
-
-          ["run", timeout_str, mode_str, note] ->
-            {:run, String.to_integer(timeout_str), parse_mode(mode_str), note, command}
-
-          _ ->
-            {:raw, message}
-        end
-
-      [single_line] ->
-        case String.split(single_line, ",", parts: 3) do
-          ["kill", handle] -> {:kill, handle}
-          ["wait", handle] -> {:wait, handle, nil}
-          ["wait", handle, timeout_str] -> {:wait, handle, String.to_integer(timeout_str)}
-          _ -> {:raw, message}
-        end
-    end
-  end
-
-  defp parse_mode("kill"), do: :kill
-  defp parse_mode("notify"), do: :notify
-  defp parse_mode(_), do: :kill
 
   # --- Job management ---
 
@@ -1169,13 +1108,15 @@ defmodule Gizmo.Services.Bash do
   defp kill_job(state, reply_to, handle) do
     case Map.get(state.jobs, handle) do
       nil ->
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unknown handle #{handle}"})
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id,
+          %{"text" => "error: unknown handle #{handle}", "error" => "unknown_handle", "handle" => handle}})
         state
 
       job ->
         Gizmo.Trace.emit_service(%{event: "bash:kill", handle: handle})
         kill_port(job.port)
-        Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id, "error: killed"})
+        Gizmo.Mailbox.route(job.reply_to, {state.mailbox_id,
+          %{"text" => "error: killed", "error" => "killed", "handle" => handle}})
         cleanup_job(state, handle)
     end
   end
@@ -1183,7 +1124,8 @@ defmodule Gizmo.Services.Bash do
   defp wait_job(state, reply_to, handle, new_timeout_ms) do
     case Map.get(state.jobs, handle) do
       nil ->
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: unknown handle #{handle}"})
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id,
+          %{"text" => "error: unknown handle #{handle}", "error" => "unknown_handle", "handle" => handle}})
         state
 
       %{status: :notified} = job ->
@@ -1201,7 +1143,8 @@ defmodule Gizmo.Services.Bash do
         put_in(state.jobs[handle], %{job | status: :running, timer_ref: timer_ref, timeout_ms: timeout})
 
       _job ->
-        Gizmo.Mailbox.route(reply_to, {state.mailbox_id, "error: job #{handle} is still running"})
+        Gizmo.Mailbox.route(reply_to, {state.mailbox_id,
+          %{"text" => "error: job #{handle} is still running", "error" => "still_running", "handle" => handle}})
         state
     end
   end
@@ -1259,7 +1202,7 @@ defmodule Gizmo.Services.Human do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {_reply_to, text}}, state) do
+  def handle_info({:mailbox_msg, _mailbox_id, {_reply_to, %{"text" => text}}}, state) do
     IO.puts(text)
     {:noreply, state}
   end
@@ -1283,10 +1226,10 @@ defmodule Gizmo.Services.HumanInput do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, prompt_text}}, state) do
-    IO.write(prompt_text)
+  def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"prompt" => prompt}}}, state) do
+    IO.write(prompt)
     line = IO.gets("") |> String.trim()
-    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, line})
+    Gizmo.Mailbox.route(reply_to, {state.mailbox_id, %{"text" => line, "input" => line}})
     {:noreply, state}
   end
 end
@@ -1310,28 +1253,16 @@ defmodule Gizmo.Services.Exception do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {from, error_info}}, state) do
-    Logger.error("[exception] from=#{from} #{format_error(error_info)}")
+  def handle_info({:mailbox_msg, _mailbox_id, {from, %{"type" => type} = error_info}}, state) do
+    text = Map.get(error_info, "text", inspect(error_info))
+    Logger.error("[exception] from=#{from} type=#{type} #{text}")
     {:noreply, state}
   end
 
-  defp format_error({:max_retries_exceeded, agent_id, retry_count, failing_frame}) do
-    "max_retries_exceeded agent=#{agent_id} retries=#{retry_count} frame=#{inspect(truncate(failing_frame, 120))}"
+  def handle_info({:mailbox_msg, _mailbox_id, {from, error_info}}, state) do
+    Logger.error("[exception] from=#{from} #{inspect(error_info)}")
+    {:noreply, state}
   end
-
-  defp format_error({:max_cycles_exceeded, agent_id, cycle_count}) do
-    "max_cycles_exceeded agent=#{agent_id} cycles=#{cycle_count}"
-  end
-
-  defp format_error(other) do
-    inspect(other)
-  end
-
-  defp truncate(s, max) when is_binary(s) do
-    if String.length(s) > max, do: String.slice(s, 0, max) <> "…", else: s
-  end
-
-  defp truncate(other, _max), do: inspect(other)
 end
 
 # -----------------------------------------------------------------------------
@@ -1353,7 +1284,7 @@ defmodule Gizmo.Services.Reaper do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {caller_mb, target_mb}}, state) do
+  def handle_info({:mailbox_msg, _mailbox_id, {caller_mb, %{"target" => target_mb}}}, state) do
     case Gizmo.Mailbox.lookup_with_parent(target_mb) do
       {:ok, target_pid, _parent} ->
         allowed = ancestor?(caller_mb, target_mb)
@@ -1426,12 +1357,13 @@ defmodule Gizmo.Services.Watchdog do
   # }
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => action} = msg}}, state) do
     state = ensure_monitored(sender_mb, state)
 
     state =
-      case parse_command(cmd) do
-        {:every, ms} ->
+      case action do
+        "every" ->
+          ms = msg["ms"]
           Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "every", interval_ms: ms})
           {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
@@ -1442,7 +1374,8 @@ defmodule Gizmo.Services.Watchdog do
             cancel_ref: cancel_ref
           })
 
-        {:after, ms} ->
+        "after" ->
+          ms = msg["ms"]
           Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "after", interval_ms: ms})
           {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
@@ -1453,17 +1386,18 @@ defmodule Gizmo.Services.Watchdog do
             cancel_ref: cancel_ref
           })
 
-        :cancel ->
+        "cancel" ->
           Gizmo.Trace.emit_service(%{event: "watchdog:cancel", agent: sender_mb})
           cancel_all_timers(state, sender_mb)
 
-        :list ->
-          reply = format_timer_list(state, sender_mb)
-          Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, reply})
+        "list" ->
+          {summary, timers_list} = format_timer_list(state, sender_mb)
+          Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+            %{"text" => summary, "timers" => timers_list}})
           state
 
-        :unknown ->
-          Logger.error("[watchdog] unknown command from #{sender_mb}: #{inspect(cmd)}")
+        _ ->
+          Logger.error("[watchdog] unknown action from #{sender_mb}: #{inspect(action)}")
           state
       end
 
@@ -1482,7 +1416,7 @@ defmodule Gizmo.Services.Watchdog do
 
           %{type: :every, interval: ms} ->
             Gizmo.Trace.emit_service(%{event: "watchdog:tick", agent: agent_mb})
-            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
+            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, %{"text" => "tick", "tick" => true}})
             {new_id, new_cancel_ref} = schedule_fire(agent_mb, ms)
 
             timers =
@@ -1495,7 +1429,7 @@ defmodule Gizmo.Services.Watchdog do
 
           %{type: :after} ->
             Gizmo.Trace.emit_service(%{event: "watchdog:tick", agent: agent_mb})
-            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, "watchdog:tick"})
+            Gizmo.Mailbox.route(agent_mb, {state.mailbox_id, %{"text" => "tick", "tick" => true}})
             timers = Enum.reject(agent_entry.timers, &(&1.id == timer_id))
             {:noreply, put_in(state, [:agents, agent_mb, :timers], timers)}
         end
@@ -1510,27 +1444,6 @@ defmodule Gizmo.Services.Watchdog do
 
       nil ->
         {:noreply, state}
-    end
-  end
-
-  defp parse_command(cmd) do
-    trimmed = String.trim(cmd)
-
-    cond do
-      match = Regex.run(~r/^every\s+(\d+)$/i, trimmed) ->
-        {:every, String.to_integer(Enum.at(match, 1))}
-
-      match = Regex.run(~r/^after\s+(\d+)$/i, trimmed) ->
-        {:after, String.to_integer(Enum.at(match, 1))}
-
-      trimmed =~ ~r/^cancel$/i ->
-        :cancel
-
-      trimmed =~ ~r/^list$/i ->
-        :list
-
-      true ->
-        :unknown
     end
   end
 
@@ -1576,15 +1489,19 @@ defmodule Gizmo.Services.Watchdog do
   defp format_timer_list(state, agent_mb) do
     case get_in(state, [:agents, agent_mb]) do
       nil ->
-        "none"
+        {"none", []}
 
       %{timers: []} ->
-        "none"
+        {"none", []}
 
       %{timers: timers} ->
-        timers
-        |> Enum.map(fn %{type: type, interval: ms} -> "#{type}:#{ms}" end)
-        |> Enum.join(", ")
+        timers_list = Enum.map(timers, fn %{type: type, interval: ms} ->
+          %{"type" => Atom.to_string(type), "ms" => ms}
+        end)
+        summary = timers
+          |> Enum.map(fn %{type: type, interval: ms} -> "#{type}:#{ms}" end)
+          |> Enum.join(", ")
+        {summary, timers_list}
     end
   end
 end
@@ -1608,34 +1525,35 @@ defmodule Gizmo.Services.Pager do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
-    case Regex.run(~r/^open\s+(.+)$/i, String.trim(cmd)) do
-      [_, path] ->
-        path = String.trim(path)
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "open", "path" => path}}}, state) do
+    path = String.trim(path)
 
-        case File.read(path) do
-          {:ok, content} ->
-            lines = String.split(content, "\n")
-            session_id = "pager_#{state.counter}"
+    case File.read(path) do
+      {:ok, content} ->
+        lines = String.split(content, "\n")
+        session_id = "pager_#{state.counter}"
 
-            {:ok, _pid} =
-              Gizmo.Services.PagerSession.start(session_id, lines, sender_mb)
+        {:ok, _pid} =
+          Gizmo.Services.PagerSession.start(session_id, lines, sender_mb)
 
-            line_count = length(lines)
-            Gizmo.Trace.emit_service(%{event: "pager:open", path: path, session: session_id, lines: line_count})
-            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "opened:#{session_id}:#{line_count} lines"})
-            {:noreply, %{state | counter: state.counter + 1}}
+        line_count = length(lines)
+        Gizmo.Trace.emit_service(%{event: "pager:open", path: path, session: session_id, lines: line_count})
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "opened:#{session_id}:#{line_count} lines", "session" => session_id, "lines" => line_count}})
+        {:noreply, %{state | counter: state.counter + 1}}
 
-          {:error, reason} ->
-            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:#{reason}"})
-            {:noreply, state}
-        end
-
-      nil ->
-        Logger.error("[pager] unknown command from #{sender_mb}: #{inspect(cmd)}")
-        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:unknown command"})
+      {:error, reason} ->
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "error:#{reason}", "error" => to_string(reason)}})
         {:noreply, state}
     end
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    Logger.error("[pager] unknown message from #{sender_mb}: #{inspect(msg)}")
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "error:unknown command", "error" => "unknown_command"}})
+    {:noreply, state}
   end
 end
 
@@ -1675,58 +1593,69 @@ defmodule Gizmo.Services.PagerSession do
   end
 
   @impl true
-  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
-    trimmed = String.trim(cmd)
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "next"}}}, state) do
+    {page_text, new_cursor} = get_page(state.lines, state.cursor, state.page_size, state.total)
+    from = state.cursor + 1
+    to = min(state.cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
+    {:noreply, %{state | cursor: new_cursor}}
+  end
 
-    cond do
-      trimmed =~ ~r/^next$/i ->
-        {page_text, new_cursor} = get_page(state.lines, state.cursor, state.page_size, state.total)
-        header = "lines #{state.cursor + 1}-#{min(state.cursor + state.page_size, state.total)} of #{state.total}\n"
-        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
-        {:noreply, %{state | cursor: new_cursor}}
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "prev"}}}, state) do
+    new_cursor = max(state.cursor - state.page_size, 0)
+    {page_text, _} = get_page(state.lines, new_cursor, state.page_size, state.total)
+    from = new_cursor + 1
+    to = min(new_cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
+    {:noreply, %{state | cursor: new_cursor}}
+  end
 
-      trimmed =~ ~r/^prev$/i ->
-        new_cursor = max(state.cursor - state.page_size, 0)
-        {page_text, _} = get_page(state.lines, new_cursor, state.page_size, state.total)
-        header = "lines #{new_cursor + 1}-#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
-        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
-        {:noreply, %{state | cursor: new_cursor}}
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "goto", "line" => line_num}}}, state) do
+    line_num = if is_binary(line_num), do: String.to_integer(line_num), else: line_num
+    new_cursor = min(max(line_num - 1, 0), state.total - 1)
+    {page_text, next_cursor} = get_page(state.lines, new_cursor, state.page_size, state.total)
+    from = new_cursor + 1
+    to = min(new_cursor + state.page_size, state.total)
+    header = "lines #{from}-#{to} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => header <> page_text, "content" => page_text, "from" => from, "to" => to, "total" => state.total}})
+    {:noreply, %{state | cursor: next_cursor}}
+  end
 
-      match = Regex.run(~r/^goto\s+(\d+)$/i, trimmed) ->
-        line_num = String.to_integer(Enum.at(match, 1))
-        new_cursor = min(max(line_num - 1, 0), state.total - 1)
-        {page_text, next_cursor} = get_page(state.lines, new_cursor, state.page_size, state.total)
-        header = "lines #{new_cursor + 1}-#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
-        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
-        {:noreply, %{state | cursor: next_cursor}}
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "search", "pattern" => pattern}}}, state) do
+    matches = find_matches(state.lines, pattern)
 
-      match = Regex.run(~r/^search\s+(.+)$/i, trimmed) ->
-        pattern = Enum.at(match, 1)
-        matches = find_matches(state.lines, pattern)
-
-        case matches do
-          [] ->
-            Gizmo.Mailbox.route(sender_mb, {state.id, "no matches for: #{pattern}"})
-            {:noreply, state}
-
-          hits ->
-            {first_line, _} = hd(hits)
-            new_cursor = first_line
-            match_summary = Enum.map(hits, fn {ln, text} -> "#{ln + 1}: #{text}" end) |> Enum.take(20) |> Enum.join("\n")
-            header = "#{length(hits)} matches, showing at line #{first_line + 1}\n"
-            Gizmo.Mailbox.route(sender_mb, {state.id, header <> match_summary})
-            {:noreply, %{state | cursor: new_cursor}}
-        end
-
-      trimmed =~ ~r/^close$/i ->
-        Gizmo.Mailbox.route(sender_mb, {state.id, "closed"})
-        Gizmo.Mailbox.unregister(state.id)
-        {:stop, :normal, state}
-
-      true ->
-        Gizmo.Mailbox.route(sender_mb, {state.id, "error:unknown command: #{trimmed}"})
+    case matches do
+      [] ->
+        Gizmo.Mailbox.route(sender_mb, {state.id,
+          %{"text" => "no matches for: #{pattern}", "matches" => 0}})
         {:noreply, state}
+
+      hits ->
+        {first_line, _} = hd(hits)
+        new_cursor = first_line
+        match_summary = Enum.map(hits, fn {ln, text} -> "#{ln + 1}: #{text}" end) |> Enum.take(20) |> Enum.join("\n")
+        header = "#{length(hits)} matches, showing at line #{first_line + 1}\n"
+        Gizmo.Mailbox.route(sender_mb, {state.id,
+          %{"text" => header <> match_summary, "matches" => length(hits), "first_line" => first_line + 1}})
+        {:noreply, %{state | cursor: new_cursor}}
     end
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "close"}}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.id, %{"text" => "closed", "status" => "closed"}})
+    Gizmo.Mailbox.unregister(state.id)
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.id,
+      %{"text" => "error:unknown command: #{inspect(msg)}", "error" => "unknown_command"}})
+    {:noreply, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
@@ -1891,19 +1820,19 @@ defmodule Gizmo.Agent do
     ## Cycle lifecycle
 
     Each eval cycle follows this sequence: wake (receive a message, or
-    immediately in grind mode) → bind ${_msg}/${_msg_source} → build system
-    prompt from context stack → call LLM → interpolate returned ops and
-    frames against current bindings → execute ops in order → replace context
-    stack with returned frames → sleep (or loop in grind mode). Interpolation
-    happens BEFORE ops execute, so a binding set by receive() in this cycle
-    is not available via ${name} until the NEXT cycle.
+    immediately in grind mode) → bind ${_msg}/${_msg_source}/${_payload} →
+    build system prompt from context stack → call LLM → interpolate returned
+    ops and frames against current bindings → execute ops in order → replace
+    context stack with returned frames → sleep (or loop in grind mode).
+    Interpolation happens BEFORE ops execute, so a binding set by receive()
+    in this cycle is not available via ${name} until the NEXT cycle.
 
     ## eval_response contract
 
     The tool takes three fields — ops, frames, and notes:
 
       {
-        "ops": [{"op": "send", "mailbox": "human", "msg": "Hello!"}],
+        "ops": [{"op": "send", "mailbox": "human", "msg": {"text": "Hello!"}}],
         "frames": ["next cycle instructions"],
         "notes": {"_msg": "greeting from user"}
       }
@@ -1918,21 +1847,34 @@ defmodule Gizmo.Agent do
       annotate what each binding contains. Notes persist across cycles and are
       shown alongside binding values in the user message.
 
+    ## Messages are JSON objects
+
+    Every message in the system is a JSON object (not a string). The "text"
+    key is the conventional human-readable summary. When a message arrives:
+    - ${_msg} = message["text"] if present, otherwise the full JSON encoding.
+    - ${_payload} = the full JSON encoding of the message, always.
+    - Trap regex matching operates against the ${_msg} string.
+    - receive("x") stores the text summary in ${x} and the full JSON in ${x_payload}.
+
     ## Ops
 
     You have four ops, issued as JSON objects in the ops array. Only include
     the ops you actually need. Do NOT include ops you don't use.
 
     - send: Send a message to a named mailbox. Non-blocking, fire-and-forget.
-      The mailbox can be any registered service or agent.
-      {"op": "send", "mailbox": "<target>", "msg": "<content>"}
+      The mailbox can be any registered service or agent. The "msg" field
+      MUST be a JSON object (not a string). Use the "text" key for the
+      human-readable summary. ${name} interpolation works inside msg values.
+      {"op": "send", "mailbox": "<target>", "msg": {"text": "hello"}}
 
-    - receive: Block until a message arrives in your mailbox. The message
-      content is stored in the binding named by "dest". Also pushed to your
-      messages queue. NOTE: In message-driven mode (the default), you usually
-      do NOT need receive — messages arrive automatically as ${_msg} between
-      cycles. Use receive only in grind mode or when you need to explicitly
-      block mid-cycle.
+    - receive: Block until a message arrives in your mailbox. Two bindings
+      are created: ${dest} holds the text summary (the "text" field of the
+      JSON message, or the full JSON if no "text" key), and ${dest_payload}
+      holds the full JSON encoding. This mirrors _msg/_payload.
+      NOTE: In message-driven mode (the default), you usually do NOT need
+      receive — messages arrive automatically as ${_msg} between cycles.
+      Use receive only in grind mode or when you need to explicitly block
+      mid-cycle.
       {"op": "receive", "dest": "<binding_name>"}
 
     - spawn: Create a child process with the given frames as its context
@@ -1946,11 +1888,11 @@ defmodule Gizmo.Agent do
         "name": "<id>" — custom mailbox ID (must be unique; spawn fails if taken).
         "model": "<model_id>" — LLM model for the child (default: inherit parent's model).
 
-    - trap: Register an interrupt handler. When a message matching the PCRE
-      regex "pattern" arrives between cycles, the handler frames are prepended
-      to your context stack. The message is bound to ${_interrupt} and
-      ${_interrupt_source}. Only one trap can be active; a new trap replaces
-      the old one.
+    - trap: Register an interrupt handler. When a message whose "text" field
+      matches the PCRE regex "pattern" arrives between cycles, the handler
+      frames are prepended to your context stack. The message text is bound
+      to ${_interrupt} and the sender to ${_interrupt_source}. Only one trap
+      can be active; a new trap replaces the old one.
       {"op": "trap", "pattern": "<pcre_regex>", "frames": ["<handler>"]}
       To clear a trap, pass an empty frames array:
       {"op": "trap", "pattern": ".*", "frames": []}
@@ -1965,6 +1907,10 @@ defmodule Gizmo.Agent do
       agents or services where to reply.
     - ${_parent}: Your parent's mailbox ID (only set for spawned children).
       Use this to send results back to the agent that spawned you.
+    - ${_msg}: The summary text of the last received message (the "text"
+      field of the JSON message, or the full JSON encoding if no "text" key).
+    - ${_msg_source}: The mailbox ID of the sender of the last message.
+    - ${_payload}: Full JSON encoding of the last received message.
 
     ## Bindings visibility
 
@@ -1978,12 +1924,15 @@ defmodule Gizmo.Agent do
 
     ## Interpolation
 
-    In message strings and frames, you can use:
+    In message object values and frames, you can use:
     - ${name} — named binding from receive or spawn results
     - $$ — literal dollar sign
     - @N — inject frame N (0-indexed) from your current context stack verbatim
     - @name — inject the contents of a named section (see below)
     - @@ — literal @ sign
+
+    Interpolation is applied recursively to all string values in the msg
+    object, so ${name} references work in any nested string field.
 
     You can define named sections in your frames using:
       @@section-name
@@ -1997,74 +1946,81 @@ defmodule Gizmo.Agent do
 
     - human: The user's terminal. Send messages here to display text.
       Fire-and-forget — no response comes back.
+      {"op": "send", "mailbox": "human", "msg": {"text": "Hello!"}}
 
-    - human_input: Send a prompt string here. The user's typed input arrives
+    - human_input: Send a prompt object here. The user's typed input arrives
       as ${_msg} on your next cycle.
+      {"op": "send", "mailbox": "human_input", "msg": {"prompt": "Enter name: "}}
+      Response: {"text": "<user input>", "input": "<user input>"}
 
     - bash: Shell command execution with timeout.
+      Send a command object:
+        {"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}}
+      Optional fields in msg:
+        "timeout": <ms>      — override default timeout (default: 60s, 0 = none)
+        "mode": "kill"|"notify" — timeout behavior (default: "kill")
+        "note": "<tag>"      — optional tag for notify-mode timeout messages
 
-      Raw command: send a plain command string.
-        {"op": "send", "mailbox": "bash", "msg": "uname -a"}
-      Output arrives as ${_msg} next cycle.
+      Success response: {"text": "<output>", "output": "<output>", "exit_code": 0}
+      Error response: {"text": "error: exit code N: <output>", "output": "<output>", "exit_code": N}
+      Kill-mode timeout: {"text": "error: timeout after Nms", "error": "timeout", "timeout_ms": N}
+      Notify-mode timeout: {"text": "bash:timeout:<handle>", "error": "timeout", "mode": "notify", "handle": "<handle>"}
 
-      Structured run: first line is metadata, rest is the command.
-        {"op": "send", "mailbox": "bash", "msg": "run,5000,kill\\nfind / -name '*.log'"}
-        {"op": "send", "mailbox": "bash", "msg": "run,5000,notify,compiling\\nmake all"}
-      Format: run,<timeout_ms>,<mode>[,<note>]\n<command>
-      Mode is "kill" (terminate on timeout) or "notify" (send notification,
-      keep running). Note is an optional tag for your reference.
+      After a notify timeout, you can manage the job:
+        {"op": "send", "mailbox": "bash", "msg": {"action": "wait", "handle": "<handle>"}}
+        {"op": "send", "mailbox": "bash", "msg": {"action": "wait", "handle": "<handle>", "timeout": 5000}}
+        {"op": "send", "mailbox": "bash", "msg": {"action": "kill", "handle": "<handle>"}}
 
-      Timeout behavior:
-        Default timeout is set by the runtime (typically 60s, 0 = none).
-        kill mode: on timeout you receive "error: timeout after Nms".
-        notify mode: on timeout you receive "bash:timeout:<handle>" (or
-        "bash:timeout:<handle>:<note>" if you set a note). The command
-        keeps running. You can then send to bash:
-          "wait,<handle>"           — reset timer, same duration
-          "wait,<handle>,<timeout>" — reset timer, new duration
-          "kill,<handle>"           — terminate the job
-        The final result still arrives normally when the command completes.
+    - blackboard: Key-value store.
+      Read:  {"op": "send", "mailbox": "blackboard", "msg": {"action": "read", "key": "<key>"}}
+      Write: {"op": "send", "mailbox": "blackboard", "msg": {"action": "write", "key": "<key>", "value": "<value>"}}
+      Read response:  {"text": "<value>", "key": "<key>", "value": "<value>"}
+      Write response: {"text": "ok", "status": "ok"}
 
-      Normal completion: stdout as ${_msg} (exit 0) or
-      "error: exit code N: <output>" (non-zero exit).
-
-    - blackboard: Key-value store. Send "read <key>" or "write <key> <value>".
-      The result arrives as ${_msg} on your next cycle. Read returns the
-      value (or "" if missing), write returns "ok".
-
-    - exception: Error notification sink. The runtime sends error tuples here
+    - exception: Error notification sink. The runtime sends error maps here
       when an agent exceeds retry or cycle limits. You do not normally send
       to this mailbox yourself.
 
     - reaper: Force-kill a descendant agent. Send the target's mailbox ID.
       The reaper verifies you are an ancestor before killing. Fire-and-forget.
-      The target's parent receives a child_died: notification automatically.
+      The target's parent receives a child_died notification automatically.
+      {"op": "send", "mailbox": "reaper", "msg": {"target": "<mailbox_id>"}}
 
-    - watchdog: Timer service. Send "every N" for periodic ticks or
-      "after N" for a one-shot tick (N in milliseconds). Ticks arrive as
-      "watchdog:tick" from source "watchdog". Send "cancel" to clear all
-      your timers, or "list" to get a summary. Fire-and-forget except list.
+    - watchdog: Timer service.
+      Schedule periodic: {"op": "send", "mailbox": "watchdog", "msg": {"action": "every", "ms": 5000}}
+      Schedule one-shot: {"op": "send", "mailbox": "watchdog", "msg": {"action": "after", "ms": 5000}}
+      Cancel all:        {"op": "send", "mailbox": "watchdog", "msg": {"action": "cancel"}}
+      List timers:       {"op": "send", "mailbox": "watchdog", "msg": {"action": "list"}}
+      Tick message: {"text": "tick", "tick": true} from source "watchdog".
+      List response: {"text": "<summary>", "timers": [...]}
 
     - pager: Document pager for reading large files page by page.
-      Send "open <path>" to get a session ID. Then send commands to that
-      session ID: "next" for the next page, "prev" to go back,
-      "search <pattern>" to find text, "goto <N>" to jump to a line,
-      "close" to end. Sessions auto-close if your process dies.
+      Open: {"op": "send", "mailbox": "pager", "msg": {"action": "open", "path": "/path/to/file"}}
+      Response: {"text": "opened:<session>:<N> lines", "session": "<session>", "lines": N}
+
+      Then send commands to the session mailbox ID:
+        {"op": "send", "mailbox": "<session>", "msg": {"action": "next"}}
+        {"op": "send", "mailbox": "<session>", "msg": {"action": "prev"}}
+        {"op": "send", "mailbox": "<session>", "msg": {"action": "goto", "line": N}}
+        {"op": "send", "mailbox": "<session>", "msg": {"action": "search", "pattern": "<text>"}}
+        {"op": "send", "mailbox": "<session>", "msg": {"action": "close"}}
+      Page response: {"text": "<header+content>", "content": "<content>", "from": N, "to": N, "total": N}
 
     ## Message-driven model
 
     By default, your process sleeps between eval cycles and only wakes when
     a message arrives in your mailbox. The runtime automatically binds:
 
-    - ${_msg}: Content of the message that woke you this cycle.
+    - ${_msg}: The "text" field of the message (or full JSON if no "text").
     - ${_msg_source}: Mailbox ID of the sender.
+    - ${_payload}: Full JSON encoding of the message.
 
-    On the first cycle, ${_msg} = "init" and ${_msg_source} = "runtime" —
-    no actual message is needed to start.
+    On the first cycle, ${_msg} = "init", ${_msg_source} = "runtime",
+    ${_payload} = "{}" — no actual message is needed to start.
 
-    To get periodic heartbeats, send "every N" to the "watchdog" mailbox
-    (N in milliseconds). The watchdog delivers "watchdog:tick" from source
-    "watchdog" on each interval. Send "cancel" to stop all your timers.
+    To get periodic heartbeats, send {"action": "every", "ms": N} to
+    "watchdog". Ticks arrive with ${_msg} = "tick" from source "watchdog".
+    Send {"action": "cancel"} to stop all your timers.
 
     ## Grind mode
 
@@ -2092,10 +2048,10 @@ defmodule Gizmo.Agent do
 
     ## Trap (interrupt handler)
 
-    Register an interrupt handler via the trap op. When a message matching
-    the PCRE regex pattern arrives between cycles:
+    Register an interrupt handler via the trap op. When a message whose
+    "text" field matches the PCRE regex pattern arrives between cycles:
     - The handler frames are prepended to your context stack.
-    - ${_interrupt} and ${_interrupt_source} are bound to the message.
+    - ${_interrupt} and ${_interrupt_source} are bound to the message text.
     - ${_msg} and ${_msg_source} are also bound as usual.
 
     The trap persists across cycles — it fires again on the next matching
@@ -2151,26 +2107,26 @@ defmodule Gizmo.Agent do
     ## Examples
 
     One-shot greeter (send to human, terminate):
-      {"ops": [{"op": "send", "mailbox": "human", "msg": "Hello!"}],
+      {"ops": [{"op": "send", "mailbox": "human", "msg": {"text": "Hello!"}}],
        "frames": [], "notes": {}}
 
     Bash call with continuation (message-driven):
       Cycle 1 — send command, return frame describing what to do with output:
-      {"ops": [{"op": "send", "mailbox": "bash", "msg": "uname -a"}],
+      {"ops": [{"op": "send", "mailbox": "bash", "msg": {"command": "uname -a"}}],
        "frames": ["The bash output arrived as ${_msg}. Send it to 'human', then terminate."],
        "notes": {}}
       Cycle 2 — ${_msg} now contains the bash output:
-      {"ops": [{"op": "send", "mailbox": "human", "msg": "System: ${_msg}"}],
+      {"ops": [{"op": "send", "mailbox": "human", "msg": {"text": "System: ${_msg}"}}],
        "frames": [], "notes": {}}
 
     Named section workflow (advance to next step):
       If your boot frame defines @@step2 ... @@end:
-      {"ops": [{"op": "send", "mailbox": "bash", "msg": "ls"}],
+      {"ops": [{"op": "send", "mailbox": "bash", "msg": {"command": "ls"}}],
        "frames": ["@step2"], "notes": {}}
 
     Spawn child and receive result (grind mode):
       {"ops": [
-         {"op": "spawn", "frames": ["Send 'done' to ${_parent}, then terminate."], "dest": "kid"},
+         {"op": "spawn", "frames": ["Send result to ${_parent}, then terminate."], "dest": "kid"},
          {"op": "receive", "dest": "result"}
        ],
        "frames": ["@0"], "notes": {"result": "child's reply"}}
@@ -2268,10 +2224,17 @@ defmodule Gizmo.Agent do
   # Message-driven (default): block on receive, bind _msg/_msg_source, check trap.
   defp maybe_wait_for_message(_state, %{cycles: 0}, bindings, binding_notes, context_stack) do
     # First cycle: no wait, synthetic init message
-    bindings = bindings |> Map.put("_msg", "init") |> Map.put("_msg_source", "runtime")
+    bindings =
+      bindings
+      |> Map.put("_msg", "init")
+      |> Map.put("_msg_source", "runtime")
+      |> Map.put("_payload", "{}")
 
     binding_notes =
-      binding_notes |> Map.put("_msg", "init message") |> Map.put("_msg_source", "message source")
+      binding_notes
+      |> Map.put("_msg", "init message")
+      |> Map.put("_msg_source", "message source")
+      |> Map.put("_payload", "full JSON payload")
 
     {bindings, binding_notes, context_stack}
   end
@@ -2290,21 +2253,36 @@ defmodule Gizmo.Agent do
           {message, from_mb}
       end
 
-    bindings = bindings |> Map.put("_msg", msg_content) |> Map.put("_msg_source", msg_source)
+    # Extract _msg (summary text) and _payload (full JSON) from message content
+    {msg_text, payload_text} =
+      case msg_content do
+        m when is_map(m) ->
+          {Map.get(m, "text", Jason.encode!(m)), Jason.encode!(m)}
+
+        s when is_binary(s) ->
+          {s, s}
+      end
+
+    bindings =
+      bindings
+      |> Map.put("_msg", msg_text)
+      |> Map.put("_msg_source", msg_source)
+      |> Map.put("_payload", payload_text)
 
     binding_notes =
       binding_notes
       |> Map.put("_msg", "last received message")
       |> Map.put("_msg_source", "message source")
+      |> Map.put("_payload", "full JSON payload")
 
-    # Check trap
+    # Check trap against msg_text (the summary string)
     case trap do
-      {regex, handler_frames} when is_binary(msg_content) ->
-        if Regex.match?(regex, msg_content) do
+      {regex, handler_frames} ->
+        if Regex.match?(regex, msg_text) do
           # Trap fires: bind interrupt, prepend handler frames
           bindings =
             bindings
-            |> Map.put("_interrupt", msg_content)
+            |> Map.put("_interrupt", msg_text)
             |> Map.put("_interrupt_source", msg_source)
 
           binding_notes =
@@ -2341,7 +2319,9 @@ defmodule Gizmo.Agent do
       "[agent:#{state.mailbox_id}] max eval cycles (#{max_cycles}) reached, terminating"
     )
 
-    error_info = {:max_cycles_exceeded, state.mailbox_id, cycles}
+    error_info = %{"type" => "max_cycles_exceeded", "agent" => state.mailbox_id,
+                    "cycles" => cycles,
+                    "text" => "max_cycles_exceeded agent=#{state.mailbox_id} cycles=#{cycles}"}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
@@ -2352,7 +2332,11 @@ defmodule Gizmo.Agent do
     )
 
     failing_frame = List.first(context_stack) || ""
-    error_info = {:max_retries_exceeded, state.mailbox_id, retries, failing_frame}
+    truncated_frame = if is_binary(failing_frame) and String.length(failing_frame) > 500,
+      do: String.slice(failing_frame, 0, 500), else: failing_frame
+    error_info = %{"type" => "max_retries_exceeded", "agent" => state.mailbox_id,
+                    "retries" => retries, "frame" => truncated_frame,
+                    "text" => "max_retries_exceeded agent=#{state.mailbox_id} retries=#{retries}"}
     Gizmo.Mailbox.route("exception", {state.mailbox_id, error_info})
   end
 
@@ -2565,7 +2549,20 @@ defmodule Gizmo.Agent do
           "timeout"
       end
 
-    {:cont, frames, Map.put(bindings, dest, message), trap}
+    {text_str, payload_str} =
+      case message do
+        m when is_map(m) ->
+          {Map.get(m, "text", Jason.encode!(m)), Jason.encode!(m)}
+        s when is_binary(s) ->
+          {s, s}
+      end
+
+    new_bindings =
+      bindings
+      |> Map.put(dest, text_str)
+      |> Map.put("#{dest}_payload", payload_str)
+
+    {:cont, frames, new_bindings, trap}
   end
 
   defp execute_op({:spawn, child_frames, dest, spawn_opts}, frames, state, bindings, trap) do
@@ -2625,7 +2622,9 @@ defmodule Gizmo.Agent do
 
             Gizmo.Mailbox.route(
               parent_mb,
-              {child_mb, "child_died:#{child_mb} reason=#{inspect(reason)}"}
+              {child_mb, %{"text" => "child_died:#{child_mb} reason=#{inspect(reason)}",
+                           "type" => "child_died", "child" => child_mb,
+                           "reason" => inspect(reason)}}
             )
         end
       end)
@@ -3070,7 +3069,7 @@ defmodule Gizmo.CLI do
     # Valid ops
     good_input = %{
       "ops" => [
-        %{"op" => "send", "mailbox" => "human", "msg" => "hello"},
+        %{"op" => "send", "mailbox" => "human", "msg" => %{"text" => "hello"}},
         %{"op" => "receive", "dest" => "msg"},
         %{"op" => "spawn", "frames" => ["f1", "f2"], "dest" => "child"},
         %{"op" => "trap", "pattern" => "^alert:", "frames" => ["handler"]}
@@ -3085,7 +3084,7 @@ defmodule Gizmo.CLI do
     failures =
       failures ++
         assert_eq("valid ops parse", good_result.ops, [
-          {:send, "human", "hello"},
+          {:send, "human", %{"text" => "hello"}},
           {:receive, "msg"},
           {:spawn, ["f1", "f2"], "child", %{}},
           {:trap, "^alert:", ["handler"]}
@@ -3097,7 +3096,7 @@ defmodule Gizmo.CLI do
     IO.puts("  valid ops: OK")
 
     # send missing mailbox
-    bad_send = %{"ops" => [%{"op" => "send", "msg" => "hi"}], "frames" => []}
+    bad_send = %{"ops" => [%{"op" => "send", "msg" => %{"text" => "hi"}}], "frames" => []}
 
     failures =
       failures ++
@@ -3116,6 +3115,18 @@ defmodule Gizmo.CLI do
         assert_error_op(
           "send missing msg",
           Gizmo.LLM.normalize_eval(bad_send2),
+          :invalid_op,
+          "send"
+        )
+
+    # send msg is string (must be map)
+    bad_send3 = %{"ops" => [%{"op" => "send", "mailbox" => "x", "msg" => "hello"}], "frames" => []}
+
+    failures =
+      failures ++
+        assert_error_op(
+          "send msg must be map",
+          Gizmo.LLM.normalize_eval(bad_send3),
           :invalid_op,
           "send"
         )
@@ -3494,10 +3505,10 @@ defmodule Gizmo.CLI do
 
     eval_resp = %{
       ops: [
-        {:send, "human", "Hello ${name}, status: ${status}"},
+        {:send, "human", %{"text" => "Hello ${name}, status: ${status}"}},
         {:receive, "reply"},
         {:spawn, ["child frame ${name}"], "child", %{grind: true}},
-        {:send, "${_parent}", "result: ${result}"}
+        {:send, "${_parent}", %{"text" => "result: ${result}"}}
       ],
       frames: ["next frame ${name} ${ctx}"],
       notes: %{"name" => "the user's name"}
@@ -3517,7 +3528,7 @@ defmodule Gizmo.CLI do
         assert_eq(
           "interpolate send msg",
           Enum.at(interpolated.ops, 0),
-          {:send, "human", "Hello Alice, status: ok"}
+          {:send, "human", %{"text" => "Hello Alice, status: ok"}}
         )
 
     failures =
@@ -3541,7 +3552,7 @@ defmodule Gizmo.CLI do
         assert_eq(
           "interpolate send to parent",
           Enum.at(interpolated.ops, 3),
-          {:send, "mb_parent_1", "result: 42"}
+          {:send, "mb_parent_1", %{"text" => "result: 42"}}
         )
 
     failures =
@@ -3558,6 +3569,23 @@ defmodule Gizmo.CLI do
           "interpolate notes passthrough",
           interpolated.notes,
           %{"name" => "the user's name"}
+        )
+
+    # Interpolate resolve_value on nested map
+    nested_resp = %{
+      ops: [{:send, "human", %{"text" => "Hi ${name}", "data" => %{"val" => "${status}"}}}],
+      frames: [],
+      notes: %{}
+    }
+
+    nested_interpolated = Gizmo.LLM.interpolate_response(nested_resp, %{"name" => "Alice", "status" => "ok"})
+
+    failures =
+      failures ++
+        assert_eq(
+          "interpolate nested map values",
+          Enum.at(nested_interpolated.ops, 0),
+          {:send, "human", %{"text" => "Hi Alice", "data" => %{"val" => "ok"}}}
         )
 
     # Interpolate trap op (handler frames get interpolated, pattern left as-is)
@@ -3748,14 +3776,14 @@ defmodule Gizmo.CLI do
     failures = failures ++ assert_eq("blackboard keys", bb_keys, ["color", "size"])
     GenServer.stop(bb_pid)
 
-    # Blackboard — string command protocol (as agents actually use it)
+    # Blackboard — JSON message protocol (as agents actually use it)
     bb_str_mb = Gizmo.Mailbox.generate_id("bb_str")
     {:ok, bb_str_pid} = Gizmo.Services.Blackboard.start_link(bb_str_mb)
     bb_reply_mb = Gizmo.Mailbox.generate_id("bb_reply")
     Gizmo.Mailbox.register(bb_reply_mb)
 
-    # Write via string command
-    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{write, greeting, Hello from the blackboard!}"})
+    # Write via map message
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, %{"action" => "write", "key" => "greeting", "value" => "Hello from the blackboard!"}})
 
     bb_write_result =
       receive do
@@ -3764,10 +3792,10 @@ defmodule Gizmo.CLI do
         1_000 -> :timeout
       end
 
-    failures = failures ++ assert_eq("blackboard string write", bb_write_result, "ok")
+    failures = failures ++ assert_eq("blackboard map write", bb_write_result["text"], "ok")
 
-    # Read via string command
-    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{read, greeting}"})
+    # Read via map message
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, %{"action" => "read", "key" => "greeting"}})
 
     bb_read_result =
       receive do
@@ -3778,10 +3806,10 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("blackboard string read", bb_read_result, "Hello from the blackboard!")
+        assert_eq("blackboard map read", bb_read_result["value"], "Hello from the blackboard!")
 
-    # Read missing key via string command
-    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, "{read, nope}"})
+    # Read missing key via map message
+    Gizmo.Mailbox.route(bb_str_mb, {bb_reply_mb, %{"action" => "read", "key" => "nope"}})
 
     bb_read_missing =
       receive do
@@ -3790,7 +3818,7 @@ defmodule Gizmo.CLI do
         1_000 -> :timeout
       end
 
-    failures = failures ++ assert_eq("blackboard string read missing", bb_read_missing, "")
+    failures = failures ++ assert_eq("blackboard map read missing", bb_read_missing["value"], "")
 
     Gizmo.Mailbox.unregister(bb_reply_mb)
     GenServer.stop(bb_str_pid)
@@ -3800,31 +3828,24 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(receiver_mb)
     bash_mb = Gizmo.Mailbox.generate_id("bash_svc")
     {:ok, _bash_pid} = Gizmo.Services.Bash.start_link(bash_mb)
-    Gizmo.Mailbox.route(bash_mb, {receiver_mb, "echo hello"})
+    Gizmo.Mailbox.route(bash_mb, {receiver_mb, %{"command" => "echo hello"}})
 
     bash_result =
       receive do
-        {:mailbox_msg, ^receiver_mb, result} -> result
+        {:mailbox_msg, ^receiver_mb, {_from, msg}} -> msg
       after
         5_000 -> :timeout
       end
 
     failures =
-      failures ++
-        case bash_result do
-          {_from, stdout} when is_binary(stdout) ->
-            assert_eq("bash echo hello", String.trim(stdout), "hello")
-
-          other ->
-            assert_eq("bash echo hello", other, {bash_mb, "hello\n"})
-        end
+      failures ++ assert_eq("bash echo hello", String.trim(bash_result["text"]), "hello")
 
     Gizmo.Mailbox.unregister(receiver_mb)
 
     # Human — send a message, verify no crash
     human_mb = Gizmo.Mailbox.generate_id("human_svc")
     {:ok, human_pid} = Gizmo.Services.Human.start_link(human_mb)
-    Gizmo.Mailbox.route(human_mb, {"_nobody", "Hello from human service test!"})
+    Gizmo.Mailbox.route(human_mb, {"_nobody", %{"text" => "Hello from human service test!"}})
     Process.sleep(50)
     failures = failures ++ assert_eq("human service alive", Process.alive?(human_pid), true)
 
@@ -3857,7 +3878,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(test_target_mb)
 
     one_shot_chat_fn = fn _system, _messages, _opts ->
-      {:ok, %{ops: [{:send, test_target_mb, "hi"}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, test_target_mb, %{"text" => "hi"}}], frames: [], notes: %{}}}
     end
 
     {:ok, _agent_mb, agent_pid} =
@@ -3871,7 +3892,7 @@ defmodule Gizmo.CLI do
 
     send_result =
       receive do
-        {:mailbox_msg, ^test_target_mb, {_from, "hi"}} -> :ok
+        {:mailbox_msg, ^test_target_mb, {_from, %{"text" => "hi"}}} -> :ok
       after
         2_000 -> :timeout
       end
@@ -3903,7 +3924,7 @@ defmodule Gizmo.CLI do
       if c == 0 do
         {:ok, %{ops: [{:receive, "msg"}], frames: ["got it"], notes: %{}}}
       else
-        {:ok, %{ops: [{:send, timeout_test_mb, "${msg}"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [{:send, timeout_test_mb, %{"text" => "${msg}"}}], frames: [], notes: %{}}}
       end
     end
 
@@ -3926,7 +3947,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("receive timeout stores 'timeout' in binding", timeout_sent_msg, "timeout")
+        assert_eq("receive timeout stores 'timeout' in binding", timeout_sent_msg, %{"text" => "timeout"})
 
     receive do
       {:DOWN, ^timeout_ref, :process, ^timeout_pid, _} -> :ok
@@ -3946,7 +3967,7 @@ defmodule Gizmo.CLI do
       cond do
         # Child: system contains "child frame" — send result to parent and terminate
         String.contains?(sys, "child frame") ->
-          {:ok, %{ops: [{:send, "${_parent}", "result from child"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, "${_parent}", %{"text" => "result from child"}}], frames: [], notes: %{}}}
 
         # Parent cycle 1+: system contains "parent waiting" — capture and exit
         String.contains?(sys, "parent waiting") ->
@@ -4057,7 +4078,7 @@ defmodule Gizmo.CLI do
 
         2 ->
           # Cycle 2: got the message in ${input}, forward it and terminate
-          {:ok, %{ops: [{:send, idle_test_mb, "${input}"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, idle_test_mb, %{"text" => "${input}"}}], frames: [], notes: %{}}}
 
         _ ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -4087,7 +4108,7 @@ defmodule Gizmo.CLI do
       end
 
     failures =
-      failures ++ assert_eq("idle: agent wakes and forwards message", idle_result, "wake up!")
+      failures ++ assert_eq("idle: agent wakes and forwards message", idle_result, %{"text" => "wake up!"})
 
     receive do
       {:DOWN, ^idle_ref, :process, ^idle_pid, _} -> :ok
@@ -4178,14 +4199,14 @@ defmodule Gizmo.CLI do
       if not exception_already do
         failures ++
           case exc_notification do
-            {:max_retries_exceeded, _agent_id, 3, "always fail frame"} ->
+            %{"type" => "max_retries_exceeded", "retries" => 3} ->
               assert_eq("exception mailbox receives retry exhaustion", :ok, :ok)
 
             other ->
               assert_eq(
                 "exception mailbox receives retry exhaustion",
                 other,
-                {:max_retries_exceeded, :_, 3, "always fail frame"}
+                %{"type" => "max_retries_exceeded", "retries" => 3}
               )
           end
       else
@@ -4305,7 +4326,7 @@ defmodule Gizmo.CLI do
             end
 
           Agent.update(notes_capture_agent, fn _ -> user_msg end)
-          {:ok, %{ops: [{:send, notes_test_mb, "${data}"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, notes_test_mb, %{"text" => "${data}"}}], frames: [], notes: %{}}}
 
         _ ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -4334,7 +4355,7 @@ defmodule Gizmo.CLI do
       end
 
     failures =
-      failures ++ assert_eq("dest/notes: binding value forwarded", notes_fwd, "hello_data")
+      failures ++ assert_eq("dest/notes: binding value forwarded", notes_fwd, %{"text" => "hello_data"})
 
     receive do
       {:DOWN, ^notes_ref, :process, ^notes_pid, _} -> :ok
@@ -4440,7 +4461,7 @@ defmodule Gizmo.CLI do
 
     qoe_chat_fn = fn _system, _messages, _opts ->
       :counters.add(qoe_cycle, 1, 1)
-      {:ok, %{ops: [{:send, qoe_test_mb, "hello"}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, qoe_test_mb, %{"text" => "hello"}}], frames: [], notes: %{}}}
     end
 
     {:ok, _qoe_mb, qoe_pid} =
@@ -4459,7 +4480,7 @@ defmodule Gizmo.CLI do
         2_000 -> :no_message
       end
 
-    failures = failures ++ assert_eq("quit_on_exhaust: sends message", qoe_msg, "hello")
+    failures = failures ++ assert_eq("quit_on_exhaust: sends message", qoe_msg["text"], "hello")
 
     receive do
       {:DOWN, ^qoe_ref, :process, ^qoe_pid, _} -> :ok
@@ -4483,9 +4504,9 @@ defmodule Gizmo.CLI do
       c = :counters.add(idle_mode_cycle, 1, 1) || :counters.get(idle_mode_cycle, 1)
 
       if c <= 2 do
-        {:ok, %{ops: [{:send, idle_mode_test_mb, "cycle-#{c}"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [{:send, idle_mode_test_mb, %{"text" => "cycle-#{c}"}}], frames: [], notes: %{}}}
       else
-        {:ok, %{ops: [{:send, idle_mode_test_mb, "cycle-#{c}"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [{:send, idle_mode_test_mb, %{"text" => "cycle-#{c}"}}], frames: [], notes: %{}}}
       end
     end
 
@@ -4556,7 +4577,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(sup_test_mb)
 
     sup_chat_fn = fn _system, _messages, _opts ->
-      {:ok, %{ops: [{:send, sup_test_mb, "hello"}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, sup_test_mb, %{"text" => "hello"}}], frames: [], notes: %{}}}
     end
 
     {:ok, _sup_agent_mb, sup_agent_pid} =
@@ -4576,7 +4597,7 @@ defmodule Gizmo.CLI do
         2_000 -> :no_message
       end
 
-    failures = failures ++ assert_eq("supervised agent sends message", sup_msg, "hello")
+    failures = failures ++ assert_eq("supervised agent sends message", sup_msg["text"], "hello")
 
     receive do
       {:DOWN, ^sup_ref, :process, ^sup_agent_pid, _} -> :ok
@@ -4614,7 +4635,7 @@ defmodule Gizmo.CLI do
         end
 
       Agent.update(init_capture_agent, fn _ -> user_msg end)
-      {:ok, %{ops: [{:send, init_test_mb, "${_msg}/${_msg_source}"}], frames: [], notes: %{}}}
+      {:ok, %{ops: [{:send, init_test_mb, %{"text" => "${_msg}/${_msg_source}"}}], frames: [], notes: %{}}}
     end
 
     {:ok, _init_mb, init_pid} =
@@ -4629,7 +4650,7 @@ defmodule Gizmo.CLI do
         2_000 -> :no_message
       end
 
-    failures = failures ++ assert_eq("first cycle _msg=init", init_msg, "init/runtime")
+    failures = failures ++ assert_eq("first cycle _msg=init", init_msg, %{"text" => "init/runtime"})
 
     receive do
       {:DOWN, ^init_ref, :process, ^init_pid, _} -> :ok
@@ -4666,7 +4687,7 @@ defmodule Gizmo.CLI do
 
         1 ->
           # Second cycle (woke from message): forward _msg and exit
-          {:ok, %{ops: [{:send, reactive_test_mb, "${_msg}"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, reactive_test_mb, %{"text" => "${_msg}"}}], frames: [], notes: %{}}}
 
         _ ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -4692,7 +4713,7 @@ defmodule Gizmo.CLI do
       end
 
     failures =
-      failures ++ assert_eq("message-driven wake: _msg bound", reactive_result, "wake_msg")
+      failures ++ assert_eq("message-driven wake: _msg bound", reactive_result, %{"text" => "wake_msg"})
 
     receive do
       {:DOWN, ^reactive_ref, :process, ^reactive_pid, _} -> :ok
@@ -4723,7 +4744,7 @@ defmodule Gizmo.CLI do
 
         1 ->
           # Second cycle: woke from trap match — forward the interrupt binding
-          {:ok, %{ops: [{:send, trap_test_mb, "${_interrupt}"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, trap_test_mb, %{"text" => "${_interrupt}"}}], frames: [], notes: %{}}}
 
         _ ->
           {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -4747,7 +4768,7 @@ defmodule Gizmo.CLI do
         5_000 -> :no_message
       end
 
-    failures = failures ++ assert_eq("trap fires: _interrupt bound", trap_result, "alert:fire!")
+    failures = failures ++ assert_eq("trap fires: _interrupt bound", trap_result["text"], "alert:fire!")
 
     receive do
       {:DOWN, ^trap_ref, :process, ^trap_pid, _} -> :ok
@@ -4785,7 +4806,7 @@ defmodule Gizmo.CLI do
           # Send both _msg and whether interrupt was bound
           {:ok,
            %{
-             ops: [{:send, notrap_test_mb, "${_msg}|interrupt=#{has_interrupt}"}],
+             ops: [{:send, notrap_test_mb, %{"text" => "${_msg}|interrupt=#{has_interrupt}"}}],
              frames: [],
              notes: %{}
            }}
@@ -4815,7 +4836,7 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "trap no-match: _msg bound, no interrupt",
-          notrap_result,
+          notrap_result["text"],
           "hello_normal|interrupt=false"
         )
 
@@ -4839,7 +4860,7 @@ defmodule Gizmo.CLI do
       if c < 3 do
         {:ok, %{ops: [], frames: ["grind frame"], notes: %{}}}
       else
-        {:ok, %{ops: [{:send, grind_test_mb, "ground_#{c}"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [{:send, grind_test_mb, %{"text" => "ground_#{c}"}}], frames: [], notes: %{}}}
       end
     end
 
@@ -4861,7 +4882,7 @@ defmodule Gizmo.CLI do
 
     # Should have looped 4 times (0,1,2 → keep going, 3 → send + exit)
     failures =
-      failures ++ assert_eq("grind mode loops without messages", grind_result, "ground_3")
+      failures ++ assert_eq("grind mode loops without messages", grind_result["text"], "ground_3")
 
     receive do
       {:DOWN, ^grind_ref, :process, ^grind_pid, _} -> :ok
@@ -4910,7 +4931,7 @@ defmodule Gizmo.CLI do
             {:ok,
              %{
                ops: [
-                 {:send, "reaper", "${kid}"},
+                 {:send, "reaper", %{"target" => "${kid}"}},
                  {:receive, "death_note"}
                ],
                frames: ["parent: forward death notification"],
@@ -4919,7 +4940,7 @@ defmodule Gizmo.CLI do
 
           # Parent cycle 2: forward the death notification to test and exit
           2 ->
-            {:ok, %{ops: [{:send, reaper_test_mb, "${death_note}"}], frames: [], notes: %{}}}
+            {:ok, %{ops: [{:send, reaper_test_mb, %{"text" => "${death_note}"}}], frames: [], notes: %{}}}
 
           _ ->
             {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -4954,7 +4975,7 @@ defmodule Gizmo.CLI do
         assert_eq(
           "reaper: parent kills child",
           reaper_result != :no_message &&
-            String.contains?(to_string(reaper_result), "child_died:"),
+            String.contains?(to_string(reaper_result["text"]), "child_died:"),
           true
         )
 
@@ -4980,10 +5001,10 @@ defmodule Gizmo.CLI do
 
       case c do
         0 ->
-          {:ok, %{ops: [{:send, "reaper", target_mb}], frames: ["attacker: done"], notes: %{}}}
+          {:ok, %{ops: [{:send, "reaper", %{"target" => target_mb}}], frames: ["attacker: done"], notes: %{}}}
 
         _ ->
-          {:ok, %{ops: [{:send, reaper_deny_mb, "done"}], frames: [], notes: %{}}}
+          {:ok, %{ops: [{:send, reaper_deny_mb, %{"text" => "done"}}], frames: [], notes: %{}}}
       end
     end
 
@@ -4996,7 +5017,7 @@ defmodule Gizmo.CLI do
 
     # Wait for attacker to signal it's done
     receive do
-      {:mailbox_msg, ^reaper_deny_mb, {_from, "done"}} -> :ok
+      {:mailbox_msg, ^reaper_deny_mb, {_from, %{"text" => "done"}}} -> :ok
     after
       10_000 -> :timeout
     end
@@ -5039,7 +5060,7 @@ defmodule Gizmo.CLI do
           # Child cycle 0 (init): stay alive, wait for real message
           0 -> {:ok, %{ops: [], frames: ["msg-child"], notes: %{}}}
           # Child cycle 1+: forward _msg to test mailbox and exit
-          _ -> {:ok, %{ops: [{:send, spawn_opts_test_mb, "${_msg}"}], frames: [], notes: %{}}}
+          _ -> {:ok, %{ops: [{:send, spawn_opts_test_mb, %{"text" => "${_msg}"}}], frames: [], notes: %{}}}
         end
       else
         c = :counters.get(spawn_opts_cycle, 1)
@@ -5057,7 +5078,7 @@ defmodule Gizmo.CLI do
 
           1 ->
             # Parent cycle 1: send message to child, then exit
-            {:ok, %{ops: [{:send, "${kid}", "hello from parent"}], frames: [], notes: %{}}}
+            {:ok, %{ops: [{:send, "${kid}", %{"text" => "hello from parent"}}], frames: [], notes: %{}}}
 
           _ ->
             {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -5089,7 +5110,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("spawn opts: grind parent, msg-driven child", so_result, "hello from parent")
+        assert_eq("spawn opts: grind parent, msg-driven child", so_result["text"], "hello from parent")
 
     Gizmo.Mailbox.unregister(spawn_opts_test_mb)
 
@@ -5105,7 +5126,7 @@ defmodule Gizmo.CLI do
 
       if String.contains?(sys, "grind-child") do
         # Child: grind mode, sends result and exits immediately
-        {:ok, %{ops: [{:send, spawn_opts_test_mb2, "grind child done"}], frames: [], notes: %{}}}
+        {:ok, %{ops: [{:send, spawn_opts_test_mb2, %{"text" => "grind child done"}}], frames: [], notes: %{}}}
       else
         c = :counters.get(spawn_opts_cycle2, 1)
         :counters.add(spawn_opts_cycle2, 1, 1)
@@ -5131,7 +5152,7 @@ defmodule Gizmo.CLI do
       )
 
     # Send a message to parent to kick off its first cycle (it's message-driven)
-    Gizmo.Mailbox.route(so_mb2, {"test", "start"})
+    Gizmo.Mailbox.route(so_mb2, {"test", %{"text" => "start"}})
 
     so_ref2 = Process.monitor(so_pid2)
 
@@ -5150,7 +5171,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("spawn opts: msg-driven parent, grind child", so_result2, "grind child done")
+        assert_eq("spawn opts: msg-driven parent, grind child", so_result2["text"], "grind child done")
 
     Gizmo.Mailbox.unregister(spawn_opts_test_mb2)
 
@@ -5173,7 +5194,7 @@ defmodule Gizmo.CLI do
             # If disowned, _parent won't exist. Send "_parent" binding presence to test.
             {:ok,
              %{
-               ops: [{:send, disown_test_mb, "has_parent=${_parent}"}],
+               ops: [{:send, disown_test_mb, %{"text" => "has_parent=${_parent}"}}],
                frames: [],
                notes: %{}
              }}
@@ -5228,7 +5249,7 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "spawn opts: disown child has no _parent",
-          disown_result,
+          disown_result["text"],
           "has_parent=${_parent}"
         )
 
@@ -5258,7 +5279,7 @@ defmodule Gizmo.CLI do
         # Child: report own _self to test mailbox
         {:ok,
          %{
-           ops: [{:send, name_test_mb, "self=${_self}"}],
+           ops: [{:send, name_test_mb, %{"text" => "self=${_self}"}}],
            frames: [],
            notes: %{}
          }}
@@ -5305,7 +5326,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("spawn opts: named child gets custom ID", name_result, "self=my_worker")
+        assert_eq("spawn opts: named child gets custom ID", name_result["text"], "self=my_worker")
 
     Gizmo.Mailbox.unregister(name_test_mb)
 
@@ -5395,7 +5416,7 @@ defmodule Gizmo.CLI do
 
         {:ok,
          %{
-           ops: [{:send, model_test_mb, "model=#{model_val}"}],
+           ops: [{:send, model_test_mb, %{"text" => "model=#{model_val}"}}],
            frames: [],
            notes: %{}
          }}
@@ -5442,7 +5463,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("spawn opts: child receives model override", model_result, "model=test-model")
+        assert_eq("spawn opts: child receives model override", model_result["text"], "model=test-model")
 
     # Test 7: spawn without model — child inherits parent's chat_fn unchanged
     model_inherit_test_mb = Gizmo.Mailbox.generate_id("model_inherit_test")
@@ -5457,7 +5478,7 @@ defmodule Gizmo.CLI do
       if String.contains?(sys, "inherit-child") do
         {:ok,
          %{
-           ops: [{:send, model_inherit_test_mb, "child_model=#{model_val}"}],
+           ops: [{:send, model_inherit_test_mb, %{"text" => "child_model=#{model_val}"}}],
            frames: [],
            notes: %{}
          }}
@@ -5506,7 +5527,7 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "spawn opts: child without model inherits parent chat_fn",
-          inherit_result,
+          inherit_result["text"],
           "child_model=none"
         )
 
@@ -5535,7 +5556,7 @@ defmodule Gizmo.CLI do
           # Cycle 0 (init): register in blackboard
           {:ok,
            %{
-             ops: [{:send, "blackboard", "write server_mb ${_self}"}],
+             ops: [{:send, "blackboard", %{"action" => "write", "key" => "server_mb", "value" => "${_self}"}}],
              frames: ["server: registered"],
              notes: %{}
            }}
@@ -5548,7 +5569,7 @@ defmodule Gizmo.CLI do
           # Cycle 2: got message from client, forward to test and exit
           {:ok,
            %{
-             ops: [{:send, xline_test_mb, "${_msg}"}],
+             ops: [{:send, xline_test_mb, %{"text" => "${_msg}"}}],
              frames: [],
              notes: %{}
            }}
@@ -5567,7 +5588,7 @@ defmodule Gizmo.CLI do
           # Cycle 0 (init): look up server from blackboard
           {:ok,
            %{
-             ops: [{:send, "blackboard", "read server_mb"}],
+             ops: [{:send, "blackboard", %{"action" => "read", "key" => "server_mb"}}],
              frames: ["client: lookup"],
              notes: %{}
            }}
@@ -5576,7 +5597,7 @@ defmodule Gizmo.CLI do
           # Cycle 1: got server mailbox ID, send message to server
           {:ok,
            %{
-             ops: [{:send, "${_msg}", "hello from client"}],
+             ops: [{:send, "${_msg}", %{"text" => "hello from client"}}],
              frames: [],
              notes: %{}
            }}
@@ -5629,7 +5650,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("cross-lineage: client→server→test", xline_result, "hello from client")
+        assert_eq("cross-lineage: client→server→test", xline_result["text"], "hello from client")
 
     Gizmo.Mailbox.unregister(xline_test_mb)
 
@@ -5643,7 +5664,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(bj_recv1)
     bj_bash1 = Gizmo.Mailbox.generate_id("bj_bash1")
     {:ok, bj_pid1} = Gizmo.Services.Bash.start_link(bj_bash1)
-    Gizmo.Mailbox.route(bj_bash1, {bj_recv1, "echo hello"})
+    Gizmo.Mailbox.route(bj_bash1, {bj_recv1, %{"command" => "echo hello"}})
 
     bj_result1 =
       receive do
@@ -5653,7 +5674,7 @@ defmodule Gizmo.CLI do
       end
 
     failures =
-      failures ++ assert_eq("bash jobs: raw command", String.trim(bj_result1), "hello")
+      failures ++ assert_eq("bash jobs: raw command", String.trim(bj_result1["text"]), "hello")
 
     Gizmo.Mailbox.unregister(bj_recv1)
     GenServer.stop(bj_pid1)
@@ -5663,7 +5684,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(bj_recv2)
     bj_bash2 = Gizmo.Mailbox.generate_id("bj_bash2")
     {:ok, bj_pid2} = Gizmo.Services.Bash.start_link({bj_bash2, 200})
-    Gizmo.Mailbox.route(bj_bash2, {bj_recv2, "sleep 30"})
+    Gizmo.Mailbox.route(bj_bash2, {bj_recv2, %{"command" => "sleep 30"}})
 
     bj_result2 =
       receive do
@@ -5674,7 +5695,7 @@ defmodule Gizmo.CLI do
 
     failures =
       failures ++
-        assert_eq("bash jobs: kill-mode timeout", bj_result2, "error: timeout after 200ms")
+        assert_eq("bash jobs: kill-mode timeout", bj_result2["text"], "error: timeout after 200ms")
 
     Gizmo.Mailbox.unregister(bj_recv2)
     GenServer.stop(bj_pid2)
@@ -5684,7 +5705,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(bj_recv3)
     bj_bash3 = Gizmo.Mailbox.generate_id("bj_bash3")
     {:ok, bj_pid3} = Gizmo.Services.Bash.start_link({bj_bash3, 0})
-    Gizmo.Mailbox.route(bj_bash3, {bj_recv3, "run,200,kill\nsleep 30"})
+    Gizmo.Mailbox.route(bj_bash3, {bj_recv3, %{"command" => "sleep 30", "timeout" => 200, "mode" => "kill"}})
 
     bj_result3 =
       receive do
@@ -5697,7 +5718,7 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "bash jobs: structured kill timeout",
-          bj_result3,
+          bj_result3["text"],
           "error: timeout after 200ms"
         )
 
@@ -5709,7 +5730,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(bj_recv4)
     bj_bash4 = Gizmo.Mailbox.generate_id("bj_bash4")
     {:ok, bj_pid4} = Gizmo.Services.Bash.start_link({bj_bash4, 0})
-    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, "run,200,notify\nsleep 30"})
+    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, %{"command" => "sleep 30", "timeout" => 200, "mode" => "notify"}})
 
     # Should get timeout notification
     bj_result4a =
@@ -5723,15 +5744,15 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "bash jobs: notify timeout notification",
-          String.starts_with?(to_string(bj_result4a), "bash:timeout:bash_"),
+          String.starts_with?(to_string(bj_result4a["text"]), "bash:timeout:bash_"),
           true
         )
 
     # Extract handle from notification
-    "bash:timeout:" <> handle4 = bj_result4a
+    handle4 = bj_result4a["handle"]
 
     # Kill the job
-    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, "kill,#{handle4}"})
+    Gizmo.Mailbox.route(bj_bash4, {bj_recv4, %{"action" => "kill", "handle" => handle4}})
 
     bj_result4b =
       receive do
@@ -5741,7 +5762,7 @@ defmodule Gizmo.CLI do
       end
 
     failures =
-      failures ++ assert_eq("bash jobs: notify then kill", bj_result4b, "error: killed")
+      failures ++ assert_eq("bash jobs: notify then kill", bj_result4b["text"], "error: killed")
 
     Gizmo.Mailbox.unregister(bj_recv4)
     GenServer.stop(bj_pid4)
@@ -5752,7 +5773,7 @@ defmodule Gizmo.CLI do
     bj_bash5 = Gizmo.Mailbox.generate_id("bj_bash5")
     {:ok, bj_pid5} = Gizmo.Services.Bash.start_link({bj_bash5, 0})
     # Command takes ~1s, notify timeout at 200ms, then extend with 5s wait
-    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, "run,200,notify\necho waited && sleep 1 && echo done"})
+    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, %{"command" => "echo waited && sleep 1 && echo done", "timeout" => 200, "mode" => "notify"}})
 
     # Get timeout notification
     bj_result5a =
@@ -5762,10 +5783,10 @@ defmodule Gizmo.CLI do
         5_000 -> :timeout
       end
 
-    "bash:timeout:" <> handle5 = bj_result5a
+    handle5 = bj_result5a["handle"]
 
     # Extend wait
-    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, "wait,#{handle5},5000"})
+    Gizmo.Mailbox.route(bj_bash5, {bj_recv5, %{"action" => "wait", "handle" => handle5, "timeout" => 5000}})
 
     # Wait for final result
     bj_result5b =
@@ -5779,7 +5800,7 @@ defmodule Gizmo.CLI do
       failures ++
         assert_eq(
           "bash jobs: notify then wait completes",
-          String.trim(bj_result5b),
+          String.trim(bj_result5b["text"]),
           "waited\ndone"
         )
 
@@ -5791,7 +5812,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(bj_recv6)
     bj_bash6 = Gizmo.Mailbox.generate_id("bj_bash6")
     {:ok, bj_pid6} = Gizmo.Services.Bash.start_link({bj_bash6, 0})
-    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, "run,200,notify,compiling\nsleep 30"})
+    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, %{"command" => "sleep 30", "timeout" => 200, "mode" => "notify", "note" => "compiling"}})
 
     bj_result6 =
       receive do
@@ -5800,22 +5821,20 @@ defmodule Gizmo.CLI do
         5_000 -> :timeout
       end
 
-    # Extract handle — notification is "bash:timeout:<handle>:<note>"
-    # The handle is between the second and third colons
+    # Verify note is in the response
     failures =
       failures ++
         assert_eq(
           "bash jobs: note in timeout notification",
-          String.ends_with?(bj_result6, ":compiling"),
-          true
+          bj_result6["note"],
+          "compiling"
         )
 
-    # Also verify the handle is present
-    parts6 = String.split(bj_result6, ":")
-    handle6 = Enum.at(parts6, 2)
+    # Extract handle from map
+    handle6 = bj_result6["handle"]
 
     # Kill to clean up
-    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, "kill,#{handle6}"})
+    Gizmo.Mailbox.route(bj_bash6, {bj_recv6, %{"action" => "kill", "handle" => handle6}})
 
     receive do
       {:mailbox_msg, ^bj_recv6, _} -> :ok
@@ -5838,7 +5857,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(trace_bash_recv)
     {:ok, trace_bash_pid} = Gizmo.Services.Bash.start_link({"trace_bash", 5_000})
 
-    Gizmo.Mailbox.route("trace_bash", {trace_bash_recv, "echo trace_test"})
+    Gizmo.Mailbox.route("trace_bash", {trace_bash_recv, %{"command" => "echo trace_test"}})
     receive do
       {:mailbox_msg, ^trace_bash_recv, {"trace_bash", _output}} -> :ok
     after
@@ -5961,7 +5980,7 @@ defmodule Gizmo.CLI do
     Gizmo.Mailbox.register(pager_recv)
 
     # Test 1: Open a file
-    Gizmo.Mailbox.route("pager", {pager_recv, "open #{pager_tmp}"})
+    Gizmo.Mailbox.route("pager", {pager_recv, %{"action" => "open", "path" => pager_tmp}})
 
     pager_open_result =
       receive do
@@ -5970,17 +5989,14 @@ defmodule Gizmo.CLI do
         2_000 -> :timeout
       end
 
-    # Parse "opened:pager_0:100 lines"
-    [_, session_id, line_info] =
-      case Regex.run(~r/^opened:([^:]+):(.+)$/, pager_open_result) do
-        m when is_list(m) -> m
-        nil -> [nil, "?", "?"]
-      end
+    # Parse from map response
+    session_id = pager_open_result["session"]
+    line_count = pager_open_result["lines"]
 
-    failures = failures ++ assert_eq("pager open response", line_info, "100 lines")
+    failures = failures ++ assert_eq("pager open response", line_count, 100)
 
     # Test 2: Next page — first 40 lines
-    Gizmo.Mailbox.route(session_id, {pager_recv, "next"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "next"}})
 
     pager_next1 =
       receive do
@@ -5991,18 +6007,18 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager next: header",
-      String.starts_with?(pager_next1, "lines 1-40 of 100\n"),
+      String.starts_with?(pager_next1["text"], "lines 1-40 of 100\n"),
       true
     )
 
     failures = failures ++ assert_eq(
       "pager next: first line",
-      pager_next1 |> String.split("\n") |> Enum.at(1),
+      pager_next1["text"] |> String.split("\n") |> Enum.at(1),
       "1: line 1: content here"
     )
 
     # Test 3: Next again — lines 41-80
-    Gizmo.Mailbox.route(session_id, {pager_recv, "next"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "next"}})
 
     pager_next2 =
       receive do
@@ -6013,12 +6029,12 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager next page 2: header",
-      String.starts_with?(pager_next2, "lines 41-80 of 100\n"),
+      String.starts_with?(pager_next2["text"], "lines 41-80 of 100\n"),
       true
     )
 
     # Test 4: Prev — back to lines 41-80 (cursor was at 80, prev goes to 40)
-    Gizmo.Mailbox.route(session_id, {pager_recv, "prev"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "prev"}})
 
     pager_prev =
       receive do
@@ -6029,12 +6045,12 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager prev: header",
-      String.starts_with?(pager_prev, "lines 41-80 of 100\n"),
+      String.starts_with?(pager_prev["text"], "lines 41-80 of 100\n"),
       true
     )
 
     # Test 5: Goto line 90
-    Gizmo.Mailbox.route(session_id, {pager_recv, "goto 90"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "goto", "line" => 90}})
 
     pager_goto =
       receive do
@@ -6045,12 +6061,12 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager goto 90: header",
-      String.starts_with?(pager_goto, "lines 90-100 of 100\n"),
+      String.starts_with?(pager_goto["text"], "lines 90-100 of 100\n"),
       true
     )
 
     # Test 6: Search
-    Gizmo.Mailbox.route(session_id, {pager_recv, "search line 50"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "search", "pattern" => "line 50"}})
 
     pager_search =
       receive do
@@ -6061,18 +6077,18 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager search: finds match",
-      String.starts_with?(pager_search, "1 match"),
+      String.starts_with?(pager_search["text"], "1 match"),
       true
     )
 
     failures = failures ++ assert_eq(
       "pager search: shows line",
-      String.contains?(pager_search, "50: line 50: content here"),
+      String.contains?(pager_search["text"], "50: line 50: content here"),
       true
     )
 
     # Test 7: Close
-    Gizmo.Mailbox.route(session_id, {pager_recv, "close"})
+    Gizmo.Mailbox.route(session_id, {pager_recv, %{"action" => "close"}})
 
     pager_close =
       receive do
@@ -6081,7 +6097,7 @@ defmodule Gizmo.CLI do
         2_000 -> :timeout
       end
 
-    failures = failures ++ assert_eq("pager close", pager_close, "closed")
+    failures = failures ++ assert_eq("pager close", pager_close["text"], "closed")
 
     # Verify session mailbox is gone
     Process.sleep(50)
@@ -6093,7 +6109,7 @@ defmodule Gizmo.CLI do
     )
 
     # Test 8: Open nonexistent file
-    Gizmo.Mailbox.route("pager", {pager_recv, "open /nonexistent/path/xyz.txt"})
+    Gizmo.Mailbox.route("pager", {pager_recv, %{"action" => "open", "path" => "/nonexistent/path/xyz.txt"}})
 
     pager_err =
       receive do
@@ -6104,7 +6120,7 @@ defmodule Gizmo.CLI do
 
     failures = failures ++ assert_eq(
       "pager open nonexistent: error",
-      String.starts_with?(pager_err, "error:"),
+      String.starts_with?(pager_err["text"], "error:"),
       true
     )
 
@@ -6115,13 +6131,12 @@ defmodule Gizmo.CLI do
     owner_pid = spawn(fn ->
       owner_mb = Gizmo.Mailbox.generate_id("pager_owner")
       Gizmo.Mailbox.register(owner_mb)
-      Gizmo.Mailbox.route("pager", {owner_mb, "open #{pager_tmp}"})
+      Gizmo.Mailbox.route("pager", {owner_mb, %{"action" => "open", "path" => pager_tmp}})
 
       sid =
         receive do
           {:mailbox_msg, _, {"pager", msg}} ->
-            [_, sid, _] = Regex.run(~r/^opened:([^:]+):(.+)$/, msg)
-            sid
+            msg["session"]
         after
           2_000 -> nil
         end
@@ -6390,7 +6405,7 @@ defmodule Gizmo.CLI do
     {:ok, agent_mb, agent_pid} = Gizmo.Agent.start(frames, run_opts)
 
     if watchdog_ms do
-      Gizmo.Mailbox.route("watchdog", {agent_mb, "every #{watchdog_ms}"})
+      Gizmo.Mailbox.route("watchdog", {agent_mb, %{"action" => "every", "ms" => watchdog_ms}})
     end
 
     ref = Process.monitor(agent_pid)
@@ -6416,7 +6431,7 @@ defmodule Gizmo.CLI do
         {:ok, mb, pid} = Gizmo.Agent.start(frames, run_opts)
 
         if watchdog_ms do
-          Gizmo.Mailbox.route("watchdog", {mb, "every #{watchdog_ms}"})
+          Gizmo.Mailbox.route("watchdog", {mb, %{"action" => "every", "ms" => watchdog_ms}})
         end
 
         {mb, pid}
