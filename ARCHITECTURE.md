@@ -288,6 +288,33 @@ calls on idle spinning.
   continuously without waiting for messages. Preserves the pre-Stage 12
   behavior for worker agents that need to churn.
 
+## Grind and Idle: The Two Axes
+
+`grind` and `idle` control two orthogonal aspects of agent behavior. **Grind**
+controls cycle pacing: does the agent wait for a message between cycles
+(message-driven, the default) or hot-loop continuously? **Idle** controls
+frame-exhaust behavior: does the agent terminate when frames drain to `[]`
+(the default) or restore the boot frame and wait for more work?
+
+| | **terminate on exhaust** (default) | **idle on exhaust** (`--idle`) |
+|---|---|---|
+| **message-driven** (default) | One-shot / request-response. Agent wakes on message, does work, terminates when frames drain to `[]`. | Daemon. Agent wakes on message, does work, idles back to boot frame to wait for more. |
+| **grind** (`--grind`) | Worker loop. Agent hot-loops with explicit `receive` ops, terminates when frames drain to `[]`. | Hot-loop daemon. Agent hot-loops, restores boot frame on exhaust. Bindings reset. Rare. |
+
+Key invariants across the grid:
+
+- **`_msg` binding:** Updated from the mailbox message each cycle in
+  message-driven mode. Stays `"init"` in grind mode (only the first cycle
+  gets the wake message).
+- **Bindings accumulation:** Bindings from `receive`/`spawn` persist across
+  cycles. On idle restore, bindings reset to `{_self, _parent}` only.
+- **Trap availability:** Traps fire between cycles in message-driven mode
+  only. In grind mode, there is no inter-cycle message check, so traps do
+  not fire.
+- **Performance:** Grind skips the inter-cycle mailbox wait, yielding ~2x
+  faster cycle throughput. Message-driven mode pays one LLM roundtrip per
+  message boundary.
+
 ## Trap (Interrupt Handler)
 
 A single-slot interrupt handler registered via the `trap` op:

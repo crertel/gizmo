@@ -497,3 +497,54 @@ Grind-mode agents that need to receive external messages must use explicit
 blocks until a message arrives, then the bank-handle phase checks `${req}`
 (not `${_msg}`). This is the two-cycle roll pattern applied to message
 reception rather than service calls.
+
+## String-Based Message Protocols
+
+**Introduced:** Stage 5 (Well-known services)
+**Removed:** replaced by JSON object messages
+
+Messages between agents and services were plain strings with ad-hoc formats.
+Each service had its own text protocol: `"write key value"` for blackboard,
+`"open /path/to/file"` for the pager, `"every 5000"` for watchdog. The `msg`
+field in send ops was a string. Service responses were also strings.
+
+### Why it didn't work
+
+- **Fragile parsing.** Every service needed a custom `parse_command/1` or
+  `parse_message/1` function using regex or `String.split`. Edge cases
+  multiplied: values containing spaces broke blackboard writes, file paths
+  with special characters broke pager opens.
+- **No structured data in responses.** Bash returned `"4"` — was that stdout,
+  an exit code, or an error message? The agent had to guess from context. The
+  pager returned `"opened:pager_0:142 lines"` and the agent had to parse out
+  the session ID with string manipulation.
+- **`receive` bindings were lossy.** When services started returning richer
+  information, agents needed both a human-readable summary (for interpolation
+  into frames) and the full structured data (for extracting fields like
+  `reply_to`). A single string couldn't serve both purposes.
+- **Tracing and debugging was harder.** String messages in trace output
+  required knowing each service's protocol to interpret. JSON objects are
+  self-describing.
+- **No path to richer content.** Strings can only carry text. Future features
+  like image attachments, binary data, or multi-part messages would require
+  inventing an encoding scheme on top of strings — effectively reinventing
+  structured messages poorly.
+
+### What replaced it
+
+All messages are JSON objects (Elixir maps). The `msg` field in send ops is
+always a map. Services pattern-match on map keys instead of parsing strings:
+
+```json
+{"op": "send", "mailbox": "bash", "msg": {"command": "ls -la"}}
+{"op": "send", "mailbox": "blackboard", "msg": {"action": "write", "key": "k", "value": "v"}}
+{"op": "send", "mailbox": "pager", "msg": {"action": "open", "path": "/etc/hosts"}}
+```
+
+The `"text"` key convention provides the human-readable summary:
+- `${_msg}` / `${dest}` gets the `"text"` field (or `Jason.encode!` if absent)
+- `${_payload}` / `${dest_payload}` gets the full JSON string
+
+This gives agents clean values for interpolation (`${roll}` = `"4"`) while
+preserving structured access when needed (`${roll_payload}` =
+`{"text":"4","output":"4","exit_code":0}`).

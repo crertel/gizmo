@@ -421,6 +421,52 @@ The pattern works because:
 - **The child's entire program is self-contained** in one section — no
   cross-section references needed.
 
+### Understanding grind and idle
+
+The `--grind` and `--idle` flags control two independent axes of agent behavior.
+Choosing the right combination is the most important design decision for an
+agent's lifecycle.
+
+**Cycle pacing** (`--grind`): Should the agent wait for a mailbox message
+between cycles (message-driven, the default), or hot-loop continuously?
+
+**Frame-exhaust behavior** (`--idle`): Should the agent terminate when its
+frames drain to `[]` (the default), or restore the boot frame and wait for
+more work?
+
+| | **terminate on exhaust** (default) | **idle on exhaust** (`--idle`) |
+|---|---|---|
+| **message-driven** (default) | One-shot / request-response. Agent wakes on message, does work, terminates when frames drain to `[]`. | Daemon. Agent wakes on message, does work, idles back to boot frame to wait for more. |
+| **grind** (`--grind`) | Worker loop. Agent hot-loops with explicit `receive` ops, terminates when frames drain to `[]`. | Hot-loop daemon. Agent hot-loops, restores boot frame on exhaust. Bindings reset. Rare. |
+
+**Which combination to use:**
+
+- **Message-driven + terminate** (default): Most agents. One-shot tasks,
+  request-response children, multi-step workflows that terminate when frames
+  drain to `[]`.
+  Responses arrive as `${_msg}` between cycles — no `receive` ops needed.
+- **Message-driven + idle**: Long-running daemons that handle many requests.
+  Interactive bots, service agents. Combine with `--boot` so the boot frame
+  defines the idle behavior. Bindings reset on idle restore.
+- **Grind + terminate**: Autonomous worker loops. The child hot-loops with
+  explicit `receive` ops to block for service responses (bash, blackboard).
+  ~2x faster cycle throughput than message-driven. Use the two-cycle roll
+  pattern below.
+- **Grind + idle**: Rarely needed. A hot-looping daemon that restores its
+  boot frame when frames drain. Bindings reset on restore. Consider whether
+  message-driven + idle is simpler for your use case.
+
+**Key things to remember:**
+
+- In grind mode, `${_msg}` stays `"init"` after the first cycle — use
+  `receive` ops to get data instead.
+- Idle restore resets bindings to `{_self, _parent}`. Any accumulated
+  bindings from `receive`/`spawn` are lost.
+- Traps only fire in message-driven mode (between cycles). Grind mode has
+  no inter-cycle message check.
+- `receive` ops should only be used in grind mode. In message-driven mode,
+  they consume the mailbox message and cause the inter-cycle wait to hang.
+
 ### Grind child with receive (two-cycle roll)
 
 For a child that needs to call a service (like `bash`) and use the result

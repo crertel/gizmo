@@ -16,8 +16,13 @@ could enable:
 - **Audit trails.** Tags could record which op or cycle produced a frame,
   making the context stack's history inspectable.
 
-No concrete design yet. The mechanism (how tags are attached, propagated, and
-checked) matters more than the use cases listed above.
+No concrete design yet.
+
+### Open questions
+
+- How are tags attached — op field, frame wrapper, or runtime annotation?
+- How do tags propagate through interpolation and spawn?
+- Who checks them — the runtime, the LLM, or both?
 
 ## Cognitohazard Vault (Secrets Mechanism)
 
@@ -32,9 +37,18 @@ about the value without seeing it. This prevents both prompt injection (a
 malicious payload in a secret never reaches the LLM) and inadvertent leaking
 (the LLM can't echo what it never saw).
 
-Open questions: vault population (CLI flags, env vars, boot frame directives),
-handle syntax (`~name` vs something else), whether summaries are auto-generated
-or author-provided, and how vault entries interact with interpolation order.
+The vault could also double as a way to pass binary data between agents.
+Binary blobs (images, compiled artifacts, serialized state) can't appear in
+LLM context, but agents could store them in the vault, pass the opaque handle
+via messages, and have the receiving agent or service dereference the handle
+at the runtime level.
+
+### Open questions
+
+- Vault population — CLI flags, env vars, or boot frame directives?
+- Handle syntax — `~name` vs something else?
+- Are summaries auto-generated or author-provided?
+- How do vault entries interact with interpolation order?
 
 ## Pledge-for-Address
 
@@ -47,10 +61,12 @@ back to `${_parent}` shouldn't be able to send to `human_input`, `reaper`, or
 arbitrary other agents. Combined with the cognitohazard vault, it constrains
 both what an agent can say and who it can say it to.
 
-Open questions: pledge syntax (allowlist vs denylist, literal IDs vs patterns),
-whether pledges are inherited by children, enforcement on `spawn` (can a parent
-grant a child more access than it has?), and whether violations are silent drops
-or fatal errors.
+### Open questions
+
+- Pledge syntax — allowlist vs denylist, literal IDs vs patterns?
+- Are pledges inherited by children?
+- Enforcement on `spawn` — can a parent grant a child more access than it has?
+- Are violations silent drops or fatal errors?
 
 ## Pledge-for-Content
 
@@ -64,10 +80,12 @@ pattern (for the runtime to enforce). If an agent somehow reconstructs or
 receives the raw secret and tries to send it, the pledge-for-content check
 catches it.
 
-Open questions: redaction vs rejection (replace with `[REDACTED]` vs fail the
-op), pattern source (inline in pledge vs vault references), interaction with
-`spawn` frames (are patterns checked in child frame content at spawn time?),
-and performance cost of regex scanning every outbound message.
+### Open questions
+
+- Redaction vs rejection — replace with `[REDACTED]` or fail the op?
+- Pattern source — inline in pledge or vault references?
+- Are patterns checked in child frame content at spawn time?
+- Performance cost of regex scanning every outbound message?
 
 ## OpenAI-Compatible Backend Hardening
 
@@ -90,6 +108,66 @@ ministral-3-14b-reasoning. All consistently garbled send ops (using `model`,
 but can't overcome models that don't understand "which fields go with which op
 type" in a flat union. Likely need 30B+ with strong instruction tuning for
 reliable structured output.
+
+## Session Persistence and Snapshotting
+
+Agent state is currently ephemeral — when the BEAM shuts down, all agent
+context stacks, bindings, mailbox contents, and trap registrations are lost.
+Session persistence would serialize agent state to durable storage so agents
+can be suspended and resumed across VM restarts.
+
+The simplest backend is SQLite or DETS (Erlang's built-in disk-based term
+storage). Either works for single-machine use: snapshot an agent's state
+(context stack, bindings, trap, message queue, cycle count, sections cache)
+as a single record keyed by mailbox ID. DETS is zero-dependency on the BEAM
+but limited to 2 GB and single-node; SQLite is more robust and inspectable
+from outside Elixir.
+
+Eventually the storage backend could be a remote database or filesystem —
+Postgres, S3, or a networked KV store — enabling agents that migrate between
+machines or survive host failures. The serialization format should be
+backend-agnostic so swapping storage is a configuration change, not a
+rewrite.
+
+This is also a prerequisite for the self-modifying runtime (below): agents
+need to survive VM transitions for blue-green deploys to work.
+
+### Open questions
+
+- What exactly constitutes "agent state" vs "runtime state"?
+- Snapshot granularity — per-cycle, on-demand, or on idle?
+- Do snapshots include in-flight message queue contents?
+- How to handle stale references (a resumed agent's `_parent` may no longer exist)?
+
+## Debug Visualization
+
+The current debugging tools (`-v` flags, `--trace` NDJSON, `--dry-run`) are
+text-based and post-hoc. Better visualization could make multi-agent systems
+significantly easier to understand and debug.
+
+Possible directions:
+
+- **Live message sequence diagrams.** Render agent-to-agent and
+  agent-to-service message flow as a sequence diagram in real time. Show
+  send/receive causality, message content, and timing.
+- **Context stack inspector.** Visualize the context stack as a
+  live-updating list of frames, with interpolation results shown inline.
+  Highlight which frame the LLM is "in" and how frames change across cycles.
+- **Binding timeline.** Show how each binding evolves over cycles — when it
+  was created, overwritten, or reset (on idle restore). Useful for
+  diagnosing stale-binding bugs.
+- **Agent lifecycle view.** A tree or graph showing spawn relationships,
+  agent status (running, idle, terminated), and death notifications.
+  Especially useful for multi-agent systems with disowned peers.
+- **Trace replay.** Load a `--trace-file` NDJSON trace and step through it
+  cycle-by-cycle, with full system prompt, user message, ops, and frames
+  visible at each step.
+
+### Open questions
+
+- Terminal UI (e.g. Ratatui via a Rust sidecar) or web UI (e.g. LiveView dashboard)?
+- How to handle high-frequency grind-mode agents without overwhelming the display?
+- Separate tool or integrated into the runtime?
 
 ## Self-Modifying Runtime (Blue-Green Gizmo)
 

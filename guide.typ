@@ -390,6 +390,29 @@ The *runtime bindings* are always available:
 - `${_msg_source}` --- the sender's mailbox ID. `"runtime"` on cycle 0.
 - `${_payload}` --- full JSON of the wake message. `"{}"` on cycle 0.
 
+=== Grind and Idle: The Two Axes
+
+The `grind` and `idle` flags control two orthogonal aspects of agent behavior. *Grind* controls _cycle pacing_: does the agent wait for a message between cycles (message-driven, the default) or hot-loop continuously? *Idle* controls _frame-exhaust behavior_: does the agent terminate when frames drain to `[]` (the default) or restore the boot frame and wait for more work?
+
+#table(
+  columns: (auto, 1fr, 1fr),
+  align: (left, left, left),
+  stroke: 0.5pt + luma(200),
+  inset: 6pt,
+  table.header(
+    [], [*Terminate on exhaust* (default)], [*Idle on exhaust* (`--idle`)],
+  ),
+  [*Message-driven* (default)], [One-shot / request-response. Agent wakes on message, does work, terminates when frames drain to `[]`.], [Daemon. Agent wakes on message, does work, idles back to boot frame to wait for more.],
+  [*Grind* (`--grind`)], [Worker loop. Agent hot-loops with explicit `receive` ops, terminates when frames drain to `[]`.], [Hot-loop daemon. Agent hot-loops, restores boot frame on exhaust. Bindings reset. Rare.],
+)
+
+Key invariants across the grid:
+
+- *`_msg` binding:* Updated from the mailbox each cycle in message-driven mode. Stays `"init"` in grind mode (only the first cycle gets the wake message).
+- *Bindings:* Accumulate across cycles from `receive`/`spawn`. On idle restore, bindings reset to `{_self, _parent}` only.
+- *Trap:* Fires between cycles in message-driven mode only. Grind mode has no inter-cycle message check, so traps do not fire.
+- *Performance:* Grind skips the inter-cycle mailbox wait, yielding ~2x faster cycle throughput.
+
 == In-Depth on Interpolation
 
 Interpolation is the mechanism by which the runtime resolves references in the ops and frames returned by the LLM. Understanding when and how it runs is essential---most common mistakes stem from wrong assumptions about interpolation timing.
@@ -1038,7 +1061,7 @@ graph TD
 
 === The Two-Cycle Roll (Grind + Receive)
 
-For grind-mode agents that call a service and use the result:
+This pattern uses the *grind + terminate* combination from the 2#sym.times;2 grid above. For grind-mode agents that call a service and use the result:
 
 #diagram-box[
   #set text(size: 9pt, font: "DejaVu Sans Mono")
@@ -1284,11 +1307,24 @@ Inline terminal behavior: send goodbye _and_ return `[]` in the same cycle.
 
 Tag frames with metadata like `code`, `quote`, or security taint markers. Potential uses: taint tracking for prompt injection defense (mark frames from untrusted input), rendering hints (syntax highlighting), and audit trails (which op/cycle produced a frame). No concrete design yet.
 
+=== Open Questions
+
+- How are tags attached---op field, frame wrapper, or runtime annotation?
+- How do tags propagate through interpolation and spawn?
+- Who checks them---the runtime, the LLM, or both?
+
 == Cognitohazard Vault
 
 A vault for values that should never appear in LLM context. Agents refer to entries via opaque handles like `~SECRET_API_KEY`. The LLM sees the handle; the actual value is never interpolated. Prevents both prompt injection and inadvertent leaking.
 
-Open questions: vault population, handle syntax, auto-generated vs. author-provided summaries, interaction with interpolation order.
+The vault could also double as a way to pass binary data between agents. Binary blobs (images, compiled artifacts, serialized state) can't appear in LLM context, but agents could store them in the vault, pass the opaque handle via messages, and have the receiving agent or service dereference the handle at the runtime level.
+
+=== Open Questions
+
+- Vault population---CLI flags, env vars, or boot frame directives?
+- Handle syntax---`~name` vs something else?
+- Are summaries auto-generated or author-provided?
+- How do vault entries interact with interpolation order?
 
 == Pledge-for-Address and Pledge-for-Content <future-pledges>
 
@@ -1297,6 +1333,47 @@ Open questions: vault population, handle syntax, auto-generated vs. author-provi
 *Pledge-for-content:* restrict what content an agent can send. Patterns (strings, regexes, vault handles) that are redacted or rejected in outbound messages. The content-level complement to pledge-for-address.
 
 Together, these constrain both _who_ an agent can talk to and _what_ it can say.
+
+=== Open Questions
+
+- Pledge syntax---allowlist vs denylist, literal IDs vs patterns?
+- Are pledges inherited by children?
+- Enforcement on `spawn`---can a parent grant a child more access than it has?
+- Are violations silent drops or fatal errors?
+- Redaction vs rejection for content pledges?
+
+== Session Persistence and Snapshotting
+
+Agent state is currently ephemeral---when the BEAM shuts down, everything is lost. Session persistence would serialize agent state (context stack, bindings, trap, message queue, cycle count, sections cache) to durable storage so agents can be suspended and resumed across VM restarts.
+
+The simplest backends are *SQLite* or *DETS* (Erlang's built-in disk-based term storage). DETS is zero-dependency on the BEAM but limited to 2 GB and single-node; SQLite is more robust and inspectable from outside Elixir. Eventually the backend could be a remote database or filesystem---Postgres, S3, a networked KV store---enabling agents that migrate between machines or survive host failures. The serialization format should be backend-agnostic so swapping storage is a configuration change.
+
+This is also a prerequisite for the self-modifying runtime below: agents need to survive VM transitions for blue-green deploys to work.
+
+=== Open Questions
+
+- Snapshot granularity---per-cycle, on-demand, or on idle?
+- Do snapshots include in-flight message queue contents?
+- How to handle stale references (a resumed agent's `_parent` may no longer exist)?
+- Where is the boundary between "agent state" and "runtime state"?
+
+== Debug Visualization
+
+The current debugging tools (`-v` flags, `--trace` NDJSON, `--dry-run`) are text-based and post-hoc. Better visualization could make multi-agent systems significantly easier to understand and debug.
+
+Possible directions:
+
+- *Live message sequence diagrams.* Render agent-to-agent and agent-to-service message flow as a sequence diagram in real time. Show send/receive causality, message content, and timing.
+- *Context stack inspector.* Visualize the context stack as a live-updating list of frames, with interpolation results shown inline. Highlight which frame the LLM is "in" and how frames change across cycles.
+- *Binding timeline.* Show how each binding evolves over cycles---when it was created, overwritten, or reset (on idle restore). Useful for diagnosing stale-binding bugs.
+- *Agent lifecycle view.* A tree or graph showing spawn relationships, agent status (running, idle, terminated), and death notifications. Especially useful for multi-agent systems with disowned peers.
+- *Trace replay.* Load a `--trace-file` NDJSON trace and step through it cycle-by-cycle, with full system prompt, user message, ops, and frames visible at each step.
+
+=== Open Questions
+
+- Terminal UI (e.g. Ratatui via a Rust sidecar) or web UI (e.g. LiveView dashboard)?
+- How to handle high-frequency grind-mode agents without overwhelming the display?
+- Separate tool or integrated into the runtime?
 
 == Self-Modifying Runtime (Blue-Green Gizmo)
 
@@ -1315,6 +1392,14 @@ graph TD
 )
 
 Isolation levels: bare OS process (cheap, unsafe) #sym.arrow Nix sandbox (restricted filesystem/network) #sym.arrow full NixOS VM (maximum safety, slowest).
+
+=== Open Questions
+
+- State serialization format---what exactly gets persisted?
+- Migration protocol---drain to quiescent state or hot-migrate mid-cycle?
+- Multi-agent coordination during migration---atomic registry transfer?
+- Convergence---what stops the self-modifying loop from oscillating?
+- Human-in-the-loop diff review gates before promotion?
 
 // ============================================================================
 // 5. Appendix A: Test Programs
