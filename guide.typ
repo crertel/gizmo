@@ -2292,3 +2292,127 @@ Compared to Gizmo:
 - *Termination.* Ralph Loops use external verification (test suites, linters, string matching). Gizmo agents self-terminate via `frames: []`. Neither trusts the LLM's self-assessment, but they enforce it differently: external script vs. runtime semantics.
 
 The Ralph Loop is what you use when the problem is "keep hammering until the tests pass." Gizmo is what you use when the problem is "coordinate multiple agents that need to talk to each other."
+
+= Appendix D: Developer Cheatsheet
+
+#set text(size: 8pt)
+#set par(spacing: 0.5em)
+
+== Eval Cycle
+
+Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + boot + frames) #sym.arrow LLM #sym.arrow interpolate ops & frames #sym.arrow execute ops #sym.arrow replace frames #sym.arrow sleep (or loop if grind). \
+*Interpolation happens BEFORE ops execute.* A `receive()` binding is not available via `${name}` until the next cycle.
+
+== Ops
+#table(
+  columns: (auto, 1fr, auto, auto, 1fr),
+  align: (left, left, center, left, left),
+  stroke: 0.5pt + luma(200),
+  inset: 3pt,
+  table.header([*Op*], [*Syntax*], [*Blk?*], [*Binds*], [*Notes*]),
+  [`send`], [`{"op":"send", "mailbox":"id", "msg":"text"}`], [No], [---], [Fire-and-forget. Both fields interpolated.],
+  [`receive`], [`{"op":"receive", "dest":"name"}`], [Yes], [`name`], [Blocks until message arrives. Consumes it.],
+  [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `grind`/`idle` (bool, inherit), `disown` (bool, false), `name`/`model` (string, inherit).],
+  [`trap`], [`{"op":"trap", "pattern":"regex", "frames":[...]}`], [No], [---], [Interrupt handler. Empty `frames` clears. Sets `_interrupt`/`_interrupt_source`.],
+)
+
+#columns(2, gutter: 8pt)[
+=== Interpolation
+#table(
+  columns: (auto, 1fr),
+  stroke: 0.5pt + luma(200),
+  inset: 3pt,
+  table.header([*Syntax*], [*Expansion*]),
+  [`${name}`], [Binding value (literal if unbound)],
+  [`@N`], [Frame at index N],
+  [`@name`], [Named section `@@name...@@end`],
+  [`$$` / `@@`], [Literal `$` / `@`],
+)
+Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep flat.
+#colbreak()
+
+=== Runtime Bindings
+#table(
+  columns: (auto, auto, 1fr),
+  stroke: 0.5pt + luma(200),
+  inset: 3pt,
+  table.header([*Name*], [*Set By*], [*Description*]),
+  [`_self`], [always], [This agent's mailbox ID],
+  [`_parent`], [if spawned], [Parent's mailbox ID],
+  [`_msg`], [each cycle], [Wake message. `"init"` on cycle 0. Not re-bound in grind after cycle 0.],
+  [`_msg_source`], [each cycle], [Sender ID. `"runtime"` on cycle 0.],
+  [`_interrupt`], [trap fire], [Matched message content],
+  [`_interrupt_source`], [trap fire], [Matched message sender],
+)
+]
+
+== Well-Known Services
+#table(
+  columns: (auto, auto, 1fr, 1fr),
+  align: (left, left, left, left),
+  stroke: 0.5pt + luma(200),
+  inset: 3pt,
+  table.header([*Mailbox*], [*Send*], [*Response*], [*Notes*]),
+  [`human`], [any string], [_(none)_], [Print to stdout],
+  [`human_input`], [prompt string], [`{id, line}`], [Print prompt, read stdin line],
+  [`bash`], [command string], [`{id, output}`], [Async shell. `--bash-timeout` applies.],
+  [`blackboard`], [`"write k v"` / `"read k"`], [`{id, "ok"}` / `{id, v}`], [Shared key-value store],
+  [`exception`], [_(internal)_], [_(none)_], [Logs agent errors to stderr],
+  [`reaper`], [target mailbox ID], [_(none)_], [Force-kill descendant. Ancestor-only.],
+  [`watchdog`], [`"every N"` / `"after N"` / `"cancel"`], [`{id, "ok"}`], [Periodic/one-shot tick delivery],
+  [`pager`], [`"open <path>"`], [`{id, "opened:sid:lines"}`], [Spawns session: `next`/`prev`/`search`/`goto`/`close`],
+)
+
+== CLI Flags
+#table(
+  columns: (auto, 1fr),
+  stroke: 0.5pt + luma(200),
+  inset: 3pt,
+  table.header([*Flag*], [*Effect*]),
+  table.cell(colspan: 2, fill: luma(240), [_Files_]),
+  [`<file> [file...]`], [Boot frame file(s). Multiple = stacked frames.],
+  [`--boot <f>`], [Separate boot frame (always in system prompt).],
+  [`--init <f>`], [Write starter template and exit.],
+  [`--each`], [One agent per positional file.],
+  table.cell(colspan: 2, fill: luma(240), [_Modes_]),
+  [`--grind`], [Hot-loop: no inter-cycle message wait.],
+  [`--idle`], [Restore boot frame on frame exhaust (daemon).],
+  [`--watchdog <ms>`], [Send `watchdog:tick` every N ms.],
+  [`--max-cycles <N>`], [Cycle limit (default 50, 0 = unlimited).],
+  [`--bash-timeout <ms>`], [Bash timeout (default 60000, 0 = none).],
+  table.cell(colspan: 2, fill: luma(240), [_Model_]),
+  [`--model <id>`], [LLM model (default: env or `claude-sonnet-4-20250514`).],
+  [`--thinking`], [Extended thinking (Anthropic only).],
+  [`--list-models`], [List models from all backends.],
+  [`--runtime <f>` / `--dump-runtime <f>`], [Custom runtime preamble / dump built-in.],
+  table.cell(colspan: 2, fill: luma(240), [_Debug & Trace_]),
+  [`-v` / `-vv` / `-vvv`], [Increasing verbosity.],
+  [`--log-timings` / `--log-full-prompts`], [Show timing / full prompt each cycle.],
+  [`--dry-run`], [Print initial prompt and exit.],
+  [`--trace` / `--trace-file <f>`], [NDJSON trace to stderr / file.],
+  [`--trace-service` / `--trace-messages`], [Include service / message-routing events.],
+  [`--test`], [Run smoke tests and exit.],
+)
+
+#columns(2, gutter: 8pt)[
+=== Key Patterns
+- *One-shot:* No ops, `frames: []`. Simplest agent.
+- *Service call:* `send`, continuation frame, `${_msg}` next cycle.
+- *`@0` loop:* `frames: ["@0"]` re-executes. Beware replaying setup.
+- *Two-cycle roll:* `send`+`receive`, use binding next cycle, `@0`.
+- *Binding-conditional FSM:* "if `${x}` is in bindings" branches.
+- *Named sections:* `@@step1`...`@@end`, transition via `["@step2"]`.
+- *Interactive:* `send` to `human_input`, `${_msg}` next cycle, `@0`.
+- *Idle daemon:* `--idle`, frames drain, boot restores, wait.
+#colbreak()
+
+=== Pitfalls
++ `${_msg}` is not a future --- it's this cycle's wake message.
++ Terse continuations (`"step2"`) lose context. Be explicit.
++ `@0` replays _everything_ in the frame. Use `@@loop` sections.
++ `receive` in msg-driven mode hangs (consumes wake message).
++ Same-cycle `receive` + `${}` fails (interpolation is first).
++ Children can't see parent `@@sections`. Use conditionals + `@0`.
++ Boot frame re-executes every cycle. Wrap setup in `@@section`.
++ `frames: ["@quit"]` hangs in msg-driven. Inline + `[]` instead.
+]
