@@ -1968,3 +1968,160 @@ Children defined as `@@sections` in the parent tried to use `["@step2"]` to tran
 Grind-mode children expected `${_msg}` to update between cycles. It doesn't---`_msg` is only bound by the inter-cycle message wait, which grind mode skips.
 
 *Fix:* Use explicit `receive("dest")` ops in grind mode. Check the named binding, not `${_msg}`.
+
+// ============================================================================
+// Appendix C: How Gizmo Compares
+// ============================================================================
+
+= Appendix C: How Gizmo Compares
+
+Gizmo occupies an unusual point in the design space. This appendix compares it to related systems---from the simplest (a plain LLM chat) to the most formal (the #sym.pi\-calculus)---to clarify what Gizmo is and is not.
+
+== vs. Stock LLMs (ChatGPT, Claude, etc.)
+
+A stock LLM is a stateless text-to-text function. You send a prompt, you get a response. There is no execution loop, no persistent state between calls, and no mechanism for the model to take actions in the world. Tool use (function calling) exists, but is orchestrated by _your_ code---the model emits a structured request, your application dispatches it, and you feed the result back. The model has no agency over this process; it is a passive oracle.
+
+Gizmo inverts this. The LLM is inside a loop that _it controls_. Each cycle, the model reads its context stack, emits ops to execute and frames to continue with. It decides what to do, what tools to call, when to spawn children, and when to stop. The runtime is the executor; the LLM is the program counter. A stock LLM is a function you call. A Gizmo agent is a process that runs.
+
+== vs. OpenClaw
+
+OpenClaw is a batteries-included AI agent framework: gateway routing across chat platforms (WhatsApp, Telegram, Slack), a skill marketplace, cron scheduling, and a memory system backed by Markdown files with hybrid vector/BM25 search. It runs a ReAct loop internally---the LLM reasons, selects a tool, observes the result, and loops.
+
+The key architectural differences:
+
+- *Scope.* OpenClaw is a full-featured personal assistant with 100+ skills and multi-channel integration. Gizmo is a minimal runtime with four ops.
+- *Agent composition.* OpenClaw runs a single agent with modular skills. Gizmo supports hierarchical and peer-to-peer multi-agent coordination via `spawn`, `send`, and `receive`.
+- *Control flow.* OpenClaw's ReAct loop is sequential---one thought, one action, one observation. Gizmo agents run concurrently on the BEAM, communicating via mailboxes.
+- *State.* OpenClaw externalizes state to Markdown files on disk. Gizmo keeps state in per-process bindings and the context stack, with the blackboard as optional shared memory.
+- *Memory.* OpenClaw has a sophisticated memory system with temporal decay and deduplication. Gizmo has no built-in memory beyond bindings and the blackboard.
+
+OpenClaw optimizes for breadth of capability. Gizmo optimizes for composability from minimal primitives.
+
+== vs. ReAct
+
+ReAct (Reason+Act, Yao et al. 2022) is the dominant pattern for LLM tool use. The agent alternates between three phases: _thought_ (free-text reasoning), _action_ (structured tool call), and _observation_ (tool result appended to context). The loop repeats until the LLM emits a terminal action.
+
+Gizmo differs structurally:
+
+- *Concurrency.* ReAct is single-threaded. One agent, one loop, one tool call at a time. Gizmo agents are concurrent BEAM processes that communicate via message passing. A parent can spawn children that run in parallel.
+- *State representation.* ReAct keeps all state in the context window---the growing concatenation of thoughts, actions, and observations. Gizmo separates concerns: bindings for named values, the context stack for the prompt, and messages for inter-process communication.
+- *Control flow.* ReAct's control flow is emergent from token prediction. The LLM "decides" what to do by generating text that a harness parses. Gizmo's control flow is explicit: the LLM returns structured JSON with typed ops, and the runtime dispatches them deterministically.
+- *Composition.* ReAct has no native mechanism for agent-to-agent communication. Multi-agent setups require external orchestration. Gizmo's `spawn`/`send`/`receive` make multi-agent coordination a first-class concern.
+- *Error handling.* ReAct hopes the LLM notices when something goes wrong. Gizmo has supervision trees, death monitors, and the `trap` op for structured failure handling.
+
+ReAct is simple to implement and reason about for single-agent tasks. Gizmo is what you reach for when agents need to coordinate, fail gracefully, or run in parallel.
+
+== vs. LangGraph
+
+LangGraph models agent workflows as directed graphs with typed state. Nodes are Python functions (or LLM calls); edges define transitions. Conditional edges let developer-written router functions inspect state and choose the next node. Execution follows a Pregel-style superstep model with synchronization barriers.
+
+The fundamental contrast is _who is in the driver's seat_:
+
+- *Developer vs. LLM control.* In LangGraph, the developer defines the graph topology in code. The LLM fills in content at specific nodes and may influence conditional edges, but only through developer-written gate functions. In Gizmo, the LLM defines its own continuation---it returns frames that _become_ the next prompt. The "graph" is implicit and dynamic, shaped by the model's output each cycle.
+- *State model.* LangGraph uses a shared typed dictionary with reducer functions for merging concurrent updates. Gizmo uses per-process bindings with message passing between processes---no shared mutable state.
+- *Concurrency model.* LangGraph runs parallel nodes within a superstep, then synchronizes. Gizmo processes are fully asynchronous---no synchronization barriers, no supersteps. Coordination happens through messages.
+- *Persistence.* LangGraph checkpoints state at every superstep, enabling time-travel debugging and fault recovery. Gizmo has no built-in checkpointing; process state lives only in memory.
+
+LangGraph gives the developer fine-grained, verifiable control over agent workflows. Gizmo gives the LLM autonomy within the constraints of a minimal op set and prompt design.
+
+== vs. Erlang/OTP
+
+Gizmo is explicitly modeled on Erlang/OTP, and the resemblance is deliberate:
+
+#table(
+  columns: (auto, 1fr, 1fr),
+  align: (left, left, left),
+  stroke: 0.5pt + luma(200),
+  inset: 6pt,
+  table.header(
+    [*Concept*], [*Erlang/OTP*], [*Gizmo*],
+  ),
+  [Process], [Erlang process (lightweight, preemptive)], [Agent process (`:proc_lib` wrapper)],
+  [Mailbox], [Per-process message queue], [Mailbox Registry + `MessagesQueue` GenServer],
+  [Supervision], [`Supervisor` / `DynamicSupervisor`], [`Gizmo.Supervision` / `Gizmo.AgentSupervisor`],
+  [Failure], [`link` / `monitor` / `EXIT` signals], [`Process.monitor` + `child_died:` messages],
+  [State], [Tail-recursive loop with accumulator], [Context stack + bindings, rewritten each cycle],
+  [Program], [Deterministic Erlang code], [Non-deterministic LLM output],
+)
+
+The critical difference is the last row. An Erlang process executes deterministic code that the developer wrote. A Gizmo agent executes whatever the LLM returns---which is non-deterministic, may hallucinate, and requires prompt engineering to steer. Gizmo borrows Erlang's _execution model_ (processes, mailboxes, supervision) but replaces its _computation model_ (pattern matching on messages, tail recursion) with LLM inference over a context stack.
+
+This means Gizmo inherits Erlang's strengths (fault tolerance, concurrency, message-driven architecture) but _not_ its guarantees (determinism, exhaustive pattern matching, formally verifiable behavior). An Erlang process that handles message `X` will always do the same thing. A Gizmo agent that receives message `X` will do whatever the LLM decides, given the current prompt.
+
+== vs. the #sym.pi\-Calculus
+
+The #sym.pi\-calculus (Milner, 1992) is a formal model of concurrent computation built on three primitives: _send_ a name on a channel, _receive_ a name from a channel, and _create_ a new channel. Processes run in parallel and synchronize through channels. Channel names can be sent as messages, enabling dynamic reconfiguration of communication topology---a process can receive a channel name it didn't know about and start communicating on it.
+
+Gizmo's op set maps onto the #sym.pi\-calculus surprisingly directly:
+
+#table(
+  columns: (auto, 1fr, 1fr),
+  align: (left, left, left),
+  stroke: 0.5pt + luma(200),
+  inset: 6pt,
+  table.header(
+    [*#sym.pi\-calculus*], [*Gizmo*], [*Notes*],
+  ),
+  [#math.overline($x$)#math.chevron.l $y$ #math.chevron.r (send $y$ on $x$)], [`send(mailbox, msg)`], [Fire-and-forget to a named mailbox],
+  [$x(y)$ (receive $y$ from $x$)], [`receive(dest)` / `${_msg}`], [Block until a message arrives],
+  [#sym.nu $x$ (create channel $x$)], [`spawn(dest: "x")`], [New process = new mailbox ID],
+  [$P | Q$ (parallel composition)], [`spawn` creates concurrent processes], [Agents run on the BEAM],
+  [$!P$ (replication)], [`@0` loop / idle restore], [Persistent behavior],
+)
+
+The key difference is that in the #sym.pi\-calculus, every process is a precisely specified term in a formal algebra. You can prove properties about it: deadlock freedom, bisimulation equivalence, type safety (via session types). A Gizmo agent's "program" is a natural-language boot frame interpreted by an LLM. You cannot prove anything about it. The same boot frame can produce different behavior on different runs, or with different models, or even on the same model with different temperatures.
+
+Gizmo is the #sym.pi\-calculus with the computation model replaced by vibes.
+
+This is not entirely a joke. The structural correspondence means that techniques from the process calculus literature---session types for communication protocols, bisimulation for behavioral equivalence, type-and-effect systems for resource tracking---are _conceptually applicable_ to Gizmo, even if they can't be formally verified. The pledges described in @future-work are an informal version of session types: constraining who an agent can talk to and what it can say.
+
+== vs. Gas Town
+
+Gas Town (Steve Yegge, 2026) is a multi-agent workspace orchestrator written in Go. It coordinates 20--30 Claude Code or Codex instances working in parallel across one or more codebases. The name is a Mad Max reference; the operational metaphor is a factory floor.
+
+Gas Town is not a runtime for defining agent behavior---it is a _management layer_ on top of existing coding agents. Its key abstractions:
+
+- *Beads:* atomic units of work stored as JSONL in Git. A persistent issue tracker that survives agent session crashes.
+- *Hooks:* Git worktree-based queues. Work is "slung" onto an agent's hook; the agent picks it up via the GUPP protocol ("Git Up, Pull, Push").
+- *Hierarchical roles:* Mayor (human-facing coordinator), Witness (supervises workers), Polecats (ephemeral grunt workers), Refinery (merge queue manager). Clear chain of command prevents agents from interfering with each other.
+- *Sessions are disposable:* when context runs out, new sessions spawn with identity and work restored from Git. Agent memory lives in Beads, not the context window.
+
+The architectural contrast with Gizmo:
+
+- *Abstraction level.* Gas Town orchestrates full coding agent sessions (Claude Code). Gizmo _is_ the agent runtime---it defines how an agent thinks, acts, and communicates from four primitives.
+- *State location.* Gas Town externalizes all state to Git (beads, hooks, worktrees). Gizmo keeps state in-process (bindings, context stack, message queues). Both agree that LLM context windows are ephemeral, but solve it differently.
+- *Coordination mechanism.* Gas Town uses git-based handoffs and role hierarchies. Gizmo uses message passing between concurrent BEAM processes. Gas Town's GUPP protocol is deterministic file-system polling; Gizmo's `send`/`receive` is async message delivery.
+- *Agent identity.* Gas Town agents carry persistent identity via Role Beads that survive restarts. Gizmo agents are `:temporary` processes---if they die, they're gone (though `child_died:` notifies the parent).
+- *Scale target.* Gas Town is designed for 10--30 parallel agents burning ~\$100/hour in API costs. Gizmo targets small process trees where the interesting question is _how agents compose_, not how many you can run.
+
+Gas Town and Gizmo share the Erlang-inspired insight that agent systems need supervision hierarchies and message-based coordination. They diverge on where to draw the boundary: Gas Town wraps existing agents in an orchestration layer; Gizmo builds the agent from scratch.
+
+== vs. Ralph Loops
+
+The Ralph Loop (Geoffrey Huntley, 2025) is the simplest possible agent architecture: an outer `while` loop that repeatedly invokes an LLM coding agent against the same task specification until external verification confirms completion. Named after Ralph Wiggum from The Simpsons---cheerful, persistent iteration despite repeated setbacks.
+
+In its most distilled form:
+
+```bash
+while :; do
+  cat PROMPT.md | coding_agent
+done
+```
+
+Each iteration spawns a _fresh_ agent session with a clean context window. Progress is tracked on the filesystem (committed code, progress files, test results), never in the LLM's context. When the agent tries to exit, a stop hook checks whether the task is actually done. If not, a new iteration begins.
+
+The pattern's power is in what it _doesn't_ do:
+
+- No process model. One agent, one repo, one task.
+- No message passing. No concurrency. No coordination.
+- No in-context state. Disk is the only memory.
+- No agent self-assessment for termination. External verification decides.
+
+Compared to Gizmo:
+
+- *The Ralph Loop is a degenerate case of Gizmo.* A single grind-mode agent with one frame and `@0` return is structurally similar: the runtime re-invokes the LLM each cycle, and the frame persists. The difference is that Gizmo keeps bindings and messages in-process, while the Ralph Loop offloads everything to the filesystem.
+- *Context freshness.* Ralph Loops get a clean context window each iteration, eliminating "context rot." Gizmo agents accumulate bindings and the context stack grows and shrinks across cycles---which is powerful for multi-step tasks but can degrade over long runs.
+- *Composition.* The Ralph Loop is deliberately non-compositional. It solves one task at a time. Gizmo's `spawn`/`send`/`receive` exist precisely because interesting problems require multiple agents coordinating. The Ralph Loop's answer to coordination is "don't."
+- *Termination.* Ralph Loops use external verification (test suites, linters, string matching). Gizmo agents self-terminate via `frames: []`. Neither trusts the LLM's self-assessment, but they enforce it differently: external script vs. runtime semantics.
+
+The Ralph Loop is what you use when the problem is "keep hammering until the tests pass." Gizmo is what you use when the problem is "coordinate multiple agents that need to talk to each other."
