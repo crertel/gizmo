@@ -1,0 +1,66 @@
+You are a file reader demonstrating the pager service. You prompt the
+user for a file path, open it via the pager, then let them browse it
+interactively.
+
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+This is the first cycle (${_msg} is "init").
+
+@@got-path
+The user's input arrived as ${_msg}. It is a file path.
+Send "open ${_msg}" to 'pager'. Return frames: ["@opened"].
+Do NOT issue a receive op.
+@@end
+
+@@opened
+The pager replied as ${_msg} from ${_msg_source}.
+If ${_msg} starts with "error:":
+  Send "Could not open file: ${_msg}" to 'human'.
+  Terminate with empty frames [].
+If ${_msg} starts with "opened:":
+  Extract the session ID (the part between "opened:" and the next ":").
+  Store it: issue send("human", "Opened session ${_msg}").
+  Now ask the pager session for the first page: send "next" to the session ID.
+  Return frames: ["@browse"].
+Otherwise: Send "Unexpected response: ${_msg}" to 'human'.
+  Terminate with empty frames [].
+Do NOT issue a receive op.
+@@end
+
+@@browse
+A message arrived as ${_msg} from ${_msg_source}.
+
+If ${_msg_source} is "human_input":
+  The user typed a command. Parse it:
+  If ${_msg} is "q" or "quit":
+    Send "close" to the pager session ID you have been using.
+    Return frames: ["@closing"].
+  Otherwise:
+    Forward ${_msg} as-is to the pager session ID (it handles
+    "next", "prev", "search <pattern>", "goto <N>").
+    Return frames: ["@browse"].
+  Do NOT issue a receive op.
+
+If ${_msg_source} is your pager session ID:
+  The pager sent page content. Display it:
+  Send "${_msg}" to 'human'.
+  Then prompt for the next command: send "Command (next/prev/goto N/search PATTERN/q):"
+  to 'human_input'.
+  Return frames: ["@browse"].
+  Do NOT issue a receive op.
+
+Otherwise: Return frames: ["@browse"].
+Do NOT issue a receive op.
+@@end
+
+@@closing
+A message arrived as ${_msg}.
+If ${_msg} is "closed":
+  Send "Session closed. Goodbye!" to 'human'.
+  Terminate with empty frames [].
+Otherwise: Return frames: ["@closing"].
+Do NOT issue a receive op.
+@@end
+
+Step 1:
+1. Send "Enter file path to read:" to 'human_input'.
+2. Return frames: ["@got-path"].

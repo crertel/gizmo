@@ -708,6 +708,173 @@ end
 
 The protocol is simple: send `"start"` to begin, send `"elapsed"` to get the duration. The agent addresses it like any other mailbox.
 
+=== Services as Stateful Peers: A Document Pager
+
+The timer example is simple, but it understates the power of the mailbox abstraction. Consider a more substantial service: a document pager that lets an agent read through a large file page by page, despite the agent's limited context window.
+
+The design uses two modules: a *factory* (singleton service) and a *session* (one process per open document). When an agent sends `"open /path"` to the `"pager"` mailbox, the factory spawns a new session process, registers it with a unique mailbox ID, and tells the agent the ID. The agent then talks directly to the session. This means an agent can have multiple documents open simultaneously---each is a separate process with its own mailbox.
+
+```elixir
+defmodule Gizmo.Services.Pager do
+  @moduledoc "Factory: receives 'open' requests, spawns session processes."
+  use GenServer
+
+  def start_link(mailbox_id \\ "pager") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, counter: 0}}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state)
+      when is_binary(cmd) do
+    case Regex.run(~r/^open\s+(.+)$/i, String.trim(cmd)) do
+      [_, path] ->
+        case File.read(String.trim(path)) do
+          {:ok, content} ->
+            id = "pager_#{state.counter}"
+            lines = String.split(content, "\n")
+            {:ok, _} = Gizmo.Services.PagerSession.start(id, lines, sender_mb)
+            Gizmo.Mailbox.route(sender_mb,
+              {state.mailbox_id, "opened:#{id}:#{length(lines)} lines"})
+            {:noreply, %{state | counter: state.counter + 1}}
+
+          {:error, reason} ->
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:#{reason}"})
+            {:noreply, state}
+        end
+
+      nil ->
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:unknown command"})
+        {:noreply, state}
+    end
+  end
+end
+
+defmodule Gizmo.Services.PagerSession do
+  @moduledoc "Per-document session: holds file contents, cursor, page size."
+  use GenServer
+
+  @default_page_size 40
+
+  def start(id, lines, owner_mailbox_id) do
+    GenServer.start(__MODULE__, {id, lines, owner_mailbox_id})
+  end
+
+  def init({id, lines, owner_mb}) do
+    Gizmo.Mailbox.register(id)
+    monitor_ref =
+      case Gizmo.Mailbox.lookup(owner_mb) do
+        {:ok, pid} -> Process.monitor(pid)
+        {:error, _} -> nil
+      end
+    {:ok, %{id: id, lines: lines, total: length(lines),
+            cursor: 0, page_size: @default_page_size,
+            owner_mb: owner_mb, monitor_ref: monitor_ref}}
+  end
+
+  def handle_info({:mailbox_msg, _id, {sender_mb, "next"}}, state) do
+    {page_text, new_cursor} = get_page(state)
+    header = "lines #{state.cursor + 1}-" <>
+      "#{min(state.cursor + state.page_size, state.total)} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+    {:noreply, %{state | cursor: new_cursor}}
+  end
+
+  def handle_info({:mailbox_msg, _id, {sender_mb, "prev"}}, state) do
+    new_cursor = max(state.cursor - state.page_size, 0)
+    {page_text, _} = get_page(%{state | cursor: new_cursor})
+    header = "lines #{new_cursor + 1}-" <>
+      "#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+    {:noreply, %{state | cursor: new_cursor}}
+  end
+
+  def handle_info({:mailbox_msg, _id, {sender_mb, cmd}}, state)
+      when is_binary(cmd) do
+    case Regex.run(~r/^search\s+(.+)$/i, String.trim(cmd)) do
+      [_, pattern] -> handle_search(sender_mb, pattern, state)
+      nil -> handle_other(sender_mb, String.trim(cmd), state)
+    end
+  end
+
+  defp handle_search(sender_mb, pattern, state) do
+    matches = state.lines
+      |> Enum.with_index()
+      |> Enum.filter(fn {line, _} -> String.contains?(line, pattern) end)
+
+    case matches do
+      [] ->
+        Gizmo.Mailbox.route(sender_mb,
+          {state.id, "no matches for: #{pattern}"})
+        {:noreply, state}
+      [{_, first_idx} | _] = hits ->
+        summary = hits |> Enum.take(20)
+          |> Enum.map(fn {line, idx} -> "#{idx + 1}: #{line}" end)
+          |> Enum.join("\n")
+        header = "#{length(hits)} matches, showing at line #{first_idx + 1}\n"
+        Gizmo.Mailbox.route(sender_mb, {state.id, header <> summary})
+        {:noreply, %{state | cursor: first_idx}}
+    end
+  end
+
+  defp handle_other(sender_mb, "goto " <> n, state) do
+    line_num = String.to_integer(String.trim(n))
+    new_cursor = min(max(line_num - 1, 0), state.total - 1)
+    {page_text, next_cursor} = get_page(%{state | cursor: new_cursor})
+    header = "lines #{new_cursor + 1}-" <>
+      "#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
+    Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+    {:noreply, %{state | cursor: next_cursor}}
+  end
+
+  defp handle_other(sender_mb, "close", state) do
+    Gizmo.Mailbox.route(sender_mb, {state.id, "closed"})
+    Gizmo.Mailbox.unregister(state.id)
+    {:stop, :normal, state}
+  end
+
+  # Agent died — self-terminate
+  def handle_info({:DOWN, ref, :process, _pid, _reason},
+                  %{monitor_ref: ref} = state) do
+    Gizmo.Mailbox.unregister(state.id)
+    {:stop, :normal, state}
+  end
+
+  defp get_page(state) do
+    end_idx = min(state.cursor + state.page_size, state.total)
+    page_lines = Enum.slice(state.lines, state.cursor, end_idx - state.cursor)
+    numbered = page_lines
+      |> Enum.with_index(state.cursor + 1)
+      |> Enum.map(fn {line, num} -> "#{num}: #{line}" end)
+      |> Enum.join("\n")
+    {numbered, end_idx}
+  end
+end
+```
+
+From the agent's perspective, opening a document looks like this:
+
+```json
+{"op": "send", "mailbox": "pager", "msg": "open /etc/hosts"}
+```
+
+The response arrives as `${_msg}` on the next cycle: `"opened:pager_0:12 lines"`. The agent extracts the session ID (`pager_0`) and talks to it directly from then on:
+
+```json
+{"op": "send", "mailbox": "pager_0", "msg": "next"}
+```
+
+Each `next` returns a page of numbered lines with a header. `prev` goes back. `goto 100` jumps to a line. `search TODO` finds matches and jumps the cursor. `close` terminates the session process. And if the agent dies without closing, the session's `Process.monitor` fires and the process cleans itself up.
+
+The agent can open multiple documents---each gets its own session process, its own mailbox ID, its own cursor. The factory is a singleton, but the sessions are not. This is the same pattern as `spawn`: you ask a service to create something, it gives you back an address, and you communicate with it.
+
+The agent doesn't know---and doesn't need to know---that these are GenServers. It interacts with the pager session exactly the way it interacts with `bash` or `human_input` or another LLM agent: send a message, get a message back. This is the Erlang principle that _on the network, nobody knows you're a C port_ applied to LLM agents. Any process that can hold state and respond to messages fits behind a mailbox. The four-op model isn't just sufficient for agent-to-agent coordination---it's sufficient for agent-to-_anything_ coordination, because anything stateful can present itself as a communicating peer.
+
+This is also how you extend an agent's effective memory beyond the context window. The agent's context is finite, but the pager's buffer is bounded only by system memory. The agent pages through a 10,000-line file 40 lines at a time, reasoning about each page and deciding what to look at next---all through the same `send`/`receive` protocol it uses for everything else.
+
 == Worked Execution Cycle
 
 Let's trace through a concrete two-cycle agent that runs `uname -a` and reports the result. The boot frame is:

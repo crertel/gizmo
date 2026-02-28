@@ -1590,6 +1590,175 @@ defmodule Gizmo.Services.Watchdog do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Pager — Factory that spawns per-document pager sessions
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Pager do
+  use GenServer
+  require Logger
+
+  def start_link(mailbox_id \\ "pager") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, counter: 0}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
+    case Regex.run(~r/^open\s+(.+)$/i, String.trim(cmd)) do
+      [_, path] ->
+        path = String.trim(path)
+
+        case File.read(path) do
+          {:ok, content} ->
+            lines = String.split(content, "\n")
+            session_id = "pager_#{state.counter}"
+
+            {:ok, _pid} =
+              Gizmo.Services.PagerSession.start(session_id, lines, sender_mb)
+
+            line_count = length(lines)
+            Gizmo.Trace.emit_service(%{event: "pager:open", path: path, session: session_id, lines: line_count})
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "opened:#{session_id}:#{line_count} lines"})
+            {:noreply, %{state | counter: state.counter + 1}}
+
+          {:error, reason} ->
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:#{reason}"})
+            {:noreply, state}
+        end
+
+      nil ->
+        Logger.error("[pager] unknown command from #{sender_mb}: #{inspect(cmd)}")
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, "error:unknown command"})
+        {:noreply, state}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.PagerSession — Per-document pager with cursor navigation
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.PagerSession do
+  use GenServer
+  require Logger
+
+  @default_page_size 40
+
+  def start(id, lines, owner_mailbox_id) do
+    GenServer.start(__MODULE__, {id, lines, owner_mailbox_id})
+  end
+
+  @impl true
+  def init({id, lines, owner_mb}) do
+    Gizmo.Mailbox.register(id)
+
+    monitor_ref =
+      case Gizmo.Mailbox.lookup(owner_mb) do
+        {:ok, pid} -> Process.monitor(pid)
+        {:error, _} -> nil
+      end
+
+    {:ok, %{
+      id: id,
+      lines: lines,
+      total: length(lines),
+      cursor: 0,
+      page_size: @default_page_size,
+      owner_mb: owner_mb,
+      monitor_ref: monitor_ref
+    }}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, cmd}}, state) when is_binary(cmd) do
+    trimmed = String.trim(cmd)
+
+    cond do
+      trimmed =~ ~r/^next$/i ->
+        {page_text, new_cursor} = get_page(state.lines, state.cursor, state.page_size, state.total)
+        header = "lines #{state.cursor + 1}-#{min(state.cursor + state.page_size, state.total)} of #{state.total}\n"
+        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+        {:noreply, %{state | cursor: new_cursor}}
+
+      trimmed =~ ~r/^prev$/i ->
+        new_cursor = max(state.cursor - state.page_size, 0)
+        {page_text, _} = get_page(state.lines, new_cursor, state.page_size, state.total)
+        header = "lines #{new_cursor + 1}-#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
+        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+        {:noreply, %{state | cursor: new_cursor}}
+
+      match = Regex.run(~r/^goto\s+(\d+)$/i, trimmed) ->
+        line_num = String.to_integer(Enum.at(match, 1))
+        new_cursor = min(max(line_num - 1, 0), state.total - 1)
+        {page_text, next_cursor} = get_page(state.lines, new_cursor, state.page_size, state.total)
+        header = "lines #{new_cursor + 1}-#{min(new_cursor + state.page_size, state.total)} of #{state.total}\n"
+        Gizmo.Mailbox.route(sender_mb, {state.id, header <> page_text})
+        {:noreply, %{state | cursor: next_cursor}}
+
+      match = Regex.run(~r/^search\s+(.+)$/i, trimmed) ->
+        pattern = Enum.at(match, 1)
+        matches = find_matches(state.lines, pattern)
+
+        case matches do
+          [] ->
+            Gizmo.Mailbox.route(sender_mb, {state.id, "no matches for: #{pattern}"})
+            {:noreply, state}
+
+          hits ->
+            {first_line, _} = hd(hits)
+            new_cursor = first_line
+            match_summary = Enum.map(hits, fn {ln, text} -> "#{ln + 1}: #{text}" end) |> Enum.take(20) |> Enum.join("\n")
+            header = "#{length(hits)} matches, showing at line #{first_line + 1}\n"
+            Gizmo.Mailbox.route(sender_mb, {state.id, header <> match_summary})
+            {:noreply, %{state | cursor: new_cursor}}
+        end
+
+      trimmed =~ ~r/^close$/i ->
+        Gizmo.Mailbox.route(sender_mb, {state.id, "closed"})
+        Gizmo.Mailbox.unregister(state.id)
+        {:stop, :normal, state}
+
+      true ->
+        Gizmo.Mailbox.route(sender_mb, {state.id, "error:unknown command: #{trimmed}"})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
+    Logger.info("[pager:#{state.id}] owner died, closing session")
+    Gizmo.Mailbox.unregister(state.id)
+    {:stop, :normal, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp get_page(lines, cursor, page_size, total) do
+    end_idx = min(cursor + page_size, total)
+    page_lines = Enum.slice(lines, cursor, end_idx - cursor)
+
+    numbered =
+      page_lines
+      |> Enum.with_index(cursor + 1)
+      |> Enum.map(fn {line, num} -> "#{num}: #{line}" end)
+      |> Enum.join("\n")
+
+    {numbered, end_idx}
+  end
+
+  defp find_matches(lines, pattern) do
+    lines
+    |> Enum.with_index()
+    |> Enum.filter(fn {line, _idx} -> String.contains?(line, pattern) end)
+    |> Enum.map(fn {line, idx} -> {idx, line} end)
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent.Wrapper — OTP-compatible wrapper for agent processes
 # -----------------------------------------------------------------------------
 
@@ -1691,6 +1860,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Exception, "exception"},
       {Gizmo.Services.Reaper, "reaper"},
       {Gizmo.Services.Watchdog, "watchdog"},
+      {Gizmo.Services.Pager, "pager"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -1874,6 +2044,12 @@ defmodule Gizmo.Agent do
       "after N" for a one-shot tick (N in milliseconds). Ticks arrive as
       "watchdog:tick" from source "watchdog". Send "cancel" to clear all
       your timers, or "list" to get a summary. Fire-and-forget except list.
+
+    - pager: Document pager for reading large files page by page.
+      Send "open <path>" to get a session ID. Then send commands to that
+      session ID: "next" for the next page, "prev" to go back,
+      "search <pattern>" to find text, "goto <N>" to jump to a line,
+      "close" to end. Sessions auto-close if your process dies.
 
     ## Message-driven model
 
@@ -4349,7 +4525,7 @@ defmodule Gizmo.CLI do
     # Test 1: All well-known services are registered
     failures =
       Enum.reduce(
-        ["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog"],
+        ["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog", "pager"],
         failures,
         fn svc, acc ->
           acc ++
@@ -5770,6 +5946,216 @@ defmodule Gizmo.CLI do
     # Reset persistent_term trace config
     :persistent_term.put({Gizmo.Trace, :service}, false)
     :persistent_term.put({Gizmo.Trace, :messages}, false)
+
+    IO.puts("")
+
+    # 16. Pager tests
+    IO.puts("--- Pager ---")
+
+    # Write a temp file with known content
+    pager_tmp = Path.join(System.tmp_dir!(), "gizmo_pager_test_#{System.unique_integer([:positive])}.txt")
+    pager_lines = Enum.map(1..100, fn i -> "line #{i}: content here" end)
+    File.write!(pager_tmp, Enum.join(pager_lines, "\n"))
+
+    pager_recv = Gizmo.Mailbox.generate_id("pager_recv")
+    Gizmo.Mailbox.register(pager_recv)
+
+    # Test 1: Open a file
+    Gizmo.Mailbox.route("pager", {pager_recv, "open #{pager_tmp}"})
+
+    pager_open_result =
+      receive do
+        {:mailbox_msg, ^pager_recv, {"pager", msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    # Parse "opened:pager_0:100 lines"
+    [_, session_id, line_info] =
+      case Regex.run(~r/^opened:([^:]+):(.+)$/, pager_open_result) do
+        m when is_list(m) -> m
+        nil -> [nil, "?", "?"]
+      end
+
+    failures = failures ++ assert_eq("pager open response", line_info, "100 lines")
+
+    # Test 2: Next page — first 40 lines
+    Gizmo.Mailbox.route(session_id, {pager_recv, "next"})
+
+    pager_next1 =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager next: header",
+      String.starts_with?(pager_next1, "lines 1-40 of 100\n"),
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "pager next: first line",
+      pager_next1 |> String.split("\n") |> Enum.at(1),
+      "1: line 1: content here"
+    )
+
+    # Test 3: Next again — lines 41-80
+    Gizmo.Mailbox.route(session_id, {pager_recv, "next"})
+
+    pager_next2 =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager next page 2: header",
+      String.starts_with?(pager_next2, "lines 41-80 of 100\n"),
+      true
+    )
+
+    # Test 4: Prev — back to lines 41-80 (cursor was at 80, prev goes to 40)
+    Gizmo.Mailbox.route(session_id, {pager_recv, "prev"})
+
+    pager_prev =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager prev: header",
+      String.starts_with?(pager_prev, "lines 41-80 of 100\n"),
+      true
+    )
+
+    # Test 5: Goto line 90
+    Gizmo.Mailbox.route(session_id, {pager_recv, "goto 90"})
+
+    pager_goto =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager goto 90: header",
+      String.starts_with?(pager_goto, "lines 90-100 of 100\n"),
+      true
+    )
+
+    # Test 6: Search
+    Gizmo.Mailbox.route(session_id, {pager_recv, "search line 50"})
+
+    pager_search =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager search: finds match",
+      String.starts_with?(pager_search, "1 match"),
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "pager search: shows line",
+      String.contains?(pager_search, "50: line 50: content here"),
+      true
+    )
+
+    # Test 7: Close
+    Gizmo.Mailbox.route(session_id, {pager_recv, "close"})
+
+    pager_close =
+      receive do
+        {:mailbox_msg, ^pager_recv, {^session_id, msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("pager close", pager_close, "closed")
+
+    # Verify session mailbox is gone
+    Process.sleep(50)
+
+    failures = failures ++ assert_eq(
+      "pager session unregistered after close",
+      elem(Gizmo.Mailbox.lookup(session_id), 0),
+      :error
+    )
+
+    # Test 8: Open nonexistent file
+    Gizmo.Mailbox.route("pager", {pager_recv, "open /nonexistent/path/xyz.txt"})
+
+    pager_err =
+      receive do
+        {:mailbox_msg, ^pager_recv, {"pager", msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "pager open nonexistent: error",
+      String.starts_with?(pager_err, "error:"),
+      true
+    )
+
+    # Test 9: Owner dies → session auto-closes
+    # Spawn a temporary process that opens a pager session, then kill it
+    test_pid = self()
+
+    owner_pid = spawn(fn ->
+      owner_mb = Gizmo.Mailbox.generate_id("pager_owner")
+      Gizmo.Mailbox.register(owner_mb)
+      Gizmo.Mailbox.route("pager", {owner_mb, "open #{pager_tmp}"})
+
+      sid =
+        receive do
+          {:mailbox_msg, _, {"pager", msg}} ->
+            [_, sid, _] = Regex.run(~r/^opened:([^:]+):(.+)$/, msg)
+            sid
+        after
+          2_000 -> nil
+        end
+
+      send(test_pid, {:owner_session, sid})
+      # Wait to be killed
+      Process.sleep(:infinity)
+    end)
+
+    orphan_session =
+      receive do
+        {:owner_session, sid} -> sid
+      after
+        3_000 -> nil
+      end
+
+    # Verify session exists before kill
+    failures = failures ++ assert_eq(
+      "pager session exists before owner death",
+      elem(Gizmo.Mailbox.lookup(orphan_session), 0),
+      :ok
+    )
+
+    Process.exit(owner_pid, :kill)
+    Process.sleep(200)
+
+    failures = failures ++ assert_eq(
+      "pager session cleaned up after owner death",
+      elem(Gizmo.Mailbox.lookup(orphan_session), 0),
+      :error
+    )
+
+    Gizmo.Mailbox.unregister(pager_recv)
+    File.rm(pager_tmp)
 
     IO.puts("")
 
