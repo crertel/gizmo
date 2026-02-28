@@ -146,27 +146,37 @@ elixir gizmo.exs --max-cycles 10 task.txt
 ## Project structure
 
 ```
-gizmo.exs          # The entire runtime (single-file script)
-flake.nix          # Nix dev shell
-test/              # Example boot frames
-  01_hello.txt     # One-shot greeter
-  02_bash.txt      # Shell command execution
-  03_blackboard.txt # Key-value store usage
-  04_fork.txt      # Process spawning
-  05_loop.txt      # Echo-bot loop
-  06_chat.txt      # Multi-turn chatbot
-  07_reaper.txt    # Reaper service (parent kills child)
-  08_lucky_number.txt # Grind child + reaper (dice game)
+gizmo.exs              # The entire runtime (single-file script)
+gizmo_minimal.exs      # Stripped-down runtime (see below)
+flake.nix              # Nix dev shell
+test/                  # Example boot frames
+  01_hello.txt         # One-shot greeter
+  02_bash.txt          # Shell command execution
+  03_blackboard.txt    # Key-value store usage
+  04_fork.txt          # Process spawning
+  05_loop.txt          # Echo-bot loop
+  06_chat.txt          # Multi-turn chatbot
+  07_reaper.txt        # Reaper service (parent kills child)
+  08_lucky_number.txt  # Grind child + reaper (dice game)
   09_lucky_number_idle.txt # Idle child + trap (dice game variant)
-  10_marketplace.txt # Disowned peers + blackboard discovery (marketplace)
-  11a_named_spawn.txt # Named child spawn (custom mailbox ID)
-  11b_each_hello.txt  # Per-file agent for --each mode
-ARCHITECTURE.md    # Runtime design and process model
-DEVELOPMENT.md     # Development stages and roadmap
-PROMPTING.md       # Guide for writing boot frames
-FUTURE_WORK.md     # Ideas for future development
-DEAD_ENDS.md       # Approaches tried and abandoned
+  10_marketplace.txt   # Disowned peers + blackboard discovery (marketplace)
+  11a_named_spawn.txt  # Named child spawn (custom mailbox ID)
+  11b_each_hello.txt   # Per-file agent for --each mode
+  12_pager.txt         # Interactive file pager (factory + session pattern)
+ARCHITECTURE.md        # Runtime design and process model
+DEVELOPMENT.md         # Development stages and roadmap
+PROMPTING.md           # Guide for writing boot frames
+FUTURE_WORK.md         # Ideas for future development
+DEAD_ENDS.md           # Approaches tried and abandoned
 ```
+
+### `gizmo_minimal.exs`
+
+`gizmo_minimal.exs` is a stripped-down copy of `gizmo.exs` with the inline test
+suite, OpenAI backend, and verbose logging removed. It is functionally equivalent
+(Anthropic-only, trace output preserved) but roughly half the size (~2,700 lines
+vs ~6,500). It may be easier to read when learning the codebase, but `gizmo.exs`
+is the canonical version — always develop against and run from that.
 
 ## Further reading
 
