@@ -95,7 +95,7 @@ The GenServer that runs the eval loop.
   - Push replacement frames
   - Loop
 - [x] `send` op: interpolate msg, route via mailbox router
-- [x] `receive` op: block until message arrives, store in bindings[dest] + messages queue
+- [x] `receive` op: block until message arrives, store in bindings[dest]
 - [x] Idle behavior: boot frame self-replaces, checks mailbox
 - [x] Error handling: retry on LLM failure (3x)
 - [x] Exception mailbox on retry exhaustion (routes to "exception" service and terminates)
@@ -205,7 +205,7 @@ Human-readable agent IDs and per-file agent spawning from the command line.
 
 - [x] `name` option on `spawn` op: custom mailbox ID for child agents
 - [x] `validate_spawn_string/4` helper for string spawn options
-- [x] Registration failure crashes the agent (name collision = hard crash)
+- [x] Registration failure triggers op error recovery (name collision binds `_op_error`)
 - [x] `--name <id>` CLI flag for root agent naming
 - [x] `--each` CLI flag: spawn one agent per positional file
 - [x] `--each` + `--boot`: each agent gets boot frame + its positional file
@@ -213,8 +213,31 @@ Human-readable agent IDs and per-file agent spawning from the command line.
 - [x] `setup_runtime/1` helper factored from `run/2` (shared by `run` and `run_each`)
 - [x] `wait_all/1` for monitoring multiple agent exits
 - [x] Runtime prompt updated with `name` option in spawn docs
-- [x] Tests: parse name string/error, named spawn behavior, name collision crash
+- [x] Tests: parse name string/error, named spawn behavior, name collision recovery
 - [x] Test frames: `test/11a_named_spawn.txt`, `test/11b_each_hello.txt`
+
+## Stage 15: Hardening Pass
+
+Runtime robustness improvements for LLM-generated payloads.
+
+- [x] Op execution error recovery: `execute_ops` catches per-op failures, binds `_op_error`/`_pending_ops`, increments retries
+- [x] `spawn` name collision recovered (was a hard crash, now binds error context)
+- [x] `trap` invalid regex recovered (was a match error, now raises with descriptive message)
+- [x] Bash service: validates `timeout` field (non-integer/negative falls back to default)
+- [x] Watchdog service: validates `ms` field (non-integer/negative returns error message)
+- [x] Pager service: validates `line` field in `goto` (unparseable strings fall back to line 1)
+- [x] `MessagesQueue.push` calls removed from runtime path (write-only scaffolding; module retained for tests)
+
+## Stage 16: Batch and Eval Services
+
+Two new well-known services for agent productivity.
+
+- [x] `Gizmo.Services.Batch` — fan-out parallel requests via `"batch"` mailbox
+- [x] `Gizmo.Services.BatchCoordinator` — bare module spawned per batch request, collects responses
+- [x] `Gizmo.Services.Eval` — evaluate Elixir expressions via `"eval"` mailbox with AST sandboxing
+- [x] Supervision: both services added to `Gizmo.Supervision` children
+- [x] Runtime prompt: `batch` and `eval` docs in well-known mailboxes section
+- [x] Smoke tests: batch (parallel, partial failure, invalid) and eval (arithmetic, string, enum, forbidden modules, syntax/runtime/timeout errors)
 
 ## Deferred / Future
 

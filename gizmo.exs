@@ -972,7 +972,8 @@ defmodule Gizmo.Services.Bash do
   end
 
   def handle_info({:mailbox_msg, _mailbox_id, {reply_to, %{"command" => command} = msg}}, state) do
-    timeout_ms = msg["timeout"] || state.default_timeout
+    raw_timeout = msg["timeout"]
+    timeout_ms = if is_integer(raw_timeout) and raw_timeout > 0, do: raw_timeout, else: state.default_timeout
     mode = case msg["mode"] do
       "notify" -> :notify
       _ -> :kill
@@ -1364,27 +1365,41 @@ defmodule Gizmo.Services.Watchdog do
       case action do
         "every" ->
           ms = msg["ms"]
-          Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "every", interval_ms: ms})
-          {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
-          add_timer(state, sender_mb, %{
-            type: :every,
-            interval: ms,
-            id: id,
-            cancel_ref: cancel_ref
-          })
+          if is_integer(ms) and ms > 0 do
+            Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "every", interval_ms: ms})
+            {id, cancel_ref} = schedule_fire(sender_mb, ms)
+
+            add_timer(state, sender_mb, %{
+              type: :every,
+              interval: ms,
+              id: id,
+              cancel_ref: cancel_ref
+            })
+          else
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+              %{"text" => "error: ms must be a positive integer, got #{inspect(ms)}"}})
+            state
+          end
 
         "after" ->
           ms = msg["ms"]
-          Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "after", interval_ms: ms})
-          {id, cancel_ref} = schedule_fire(sender_mb, ms)
 
-          add_timer(state, sender_mb, %{
-            type: :after,
-            interval: ms,
-            id: id,
-            cancel_ref: cancel_ref
-          })
+          if is_integer(ms) and ms > 0 do
+            Gizmo.Trace.emit_service(%{event: "watchdog:schedule", agent: sender_mb, type: "after", interval_ms: ms})
+            {id, cancel_ref} = schedule_fire(sender_mb, ms)
+
+            add_timer(state, sender_mb, %{
+              type: :after,
+              interval: ms,
+              id: id,
+              cancel_ref: cancel_ref
+            })
+          else
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+              %{"text" => "error: ms must be a positive integer, got #{inspect(ms)}"}})
+            state
+          end
 
         "cancel" ->
           Gizmo.Trace.emit_service(%{event: "watchdog:cancel", agent: sender_mb})
@@ -1615,7 +1630,16 @@ defmodule Gizmo.Services.PagerSession do
   end
 
   def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "goto", "line" => line_num}}}, state) do
-    line_num = if is_binary(line_num), do: String.to_integer(line_num), else: line_num
+    line_num =
+      cond do
+        is_integer(line_num) -> line_num
+        is_binary(line_num) ->
+          case Integer.parse(line_num) do
+            {n, _} -> n
+            :error -> 1
+          end
+        true -> 1
+      end
     new_cursor = min(max(line_num - 1, 0), state.total - 1)
     {page_text, next_cursor} = get_page(state.lines, new_cursor, state.page_size, state.total)
     from = new_cursor + 1
@@ -1685,6 +1709,302 @@ defmodule Gizmo.Services.PagerSession do
     |> Enum.filter(fn {line, _idx} -> String.contains?(line, pattern) end)
     |> Enum.map(fn {line, idx} -> {idx, line} end)
   end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Batch — Fan-out multiple service requests in parallel
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Batch do
+  use GenServer
+  require Logger
+
+  def start_link(mailbox_id \\ "batch") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, counter: 0}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"requests" => requests} = msg}}, state)
+      when is_list(requests) do
+    timeout_ms = validate_timeout(msg["timeout"], 30_000)
+    batch_id = "batch_#{state.counter}"
+
+    spawn(fn ->
+      Gizmo.Services.BatchCoordinator.run(batch_id, requests, sender_mb, state.mailbox_id, timeout_ms)
+    end)
+
+    {:noreply, %{state | counter: state.counter + 1}}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, _msg}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "error: missing or invalid 'requests' array", "error" => "invalid_request"}})
+    {:noreply, state}
+  end
+
+  defp validate_timeout(nil, default), do: default
+  defp validate_timeout(ms, _default) when is_integer(ms) and ms > 0, do: ms
+  defp validate_timeout(_, default), do: default
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.BatchCoordinator — Collects parallel sub-request responses
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.BatchCoordinator do
+  require Logger
+
+  def run(batch_id, requests, reply_to, batch_source, timeout_ms) do
+    try do
+      Gizmo.Mailbox.register(batch_id)
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+      # Fan out all requests, tracking which ones were successfully routed
+      {pending_targets, results} =
+        requests
+        |> Enum.with_index()
+        |> Enum.reduce({[], %{}}, fn {req, idx}, {pending, results} ->
+          target_mb = req["mailbox"]
+
+          case Gizmo.Mailbox.route(target_mb, {batch_id, req["msg"]}) do
+            :ok ->
+              {pending ++ [{idx, target_mb}], results}
+
+            {:error, reason} ->
+              {pending, Map.put(results, idx, %{
+                "mailbox" => target_mb,
+                "response" => %{"text" => "error: #{inspect(reason)}", "error" => inspect(reason)}
+              })}
+          end
+        end)
+
+      # Collect responses
+      results = collect_responses(pending_targets, results, deadline)
+
+      # Build ordered results list
+      total = length(requests)
+      ordered_results =
+        Enum.map(0..(total - 1), fn idx ->
+          case Map.get(results, idx) do
+            nil -> %{"mailbox" => get_in(Enum.at(requests, idx), ["mailbox"]), "response" => %{"text" => "error: timeout", "error" => "timeout"}}
+            result -> result
+          end
+        end)
+
+      succeeded = Enum.count(ordered_results, fn r -> !Map.has_key?(r["response"], "error") end)
+
+      Gizmo.Mailbox.route(reply_to, {batch_source,
+        %{"text" => "batch complete: #{succeeded}/#{total} succeeded", "results" => ordered_results}})
+    rescue
+      e ->
+        Logger.error("[batch:#{batch_id}] coordinator crashed: #{inspect(e)}")
+        Gizmo.Mailbox.route(reply_to, {batch_source,
+          %{"text" => "error: batch coordinator crashed", "error" => "coordinator_crash"}})
+    after
+      Gizmo.Mailbox.unregister(batch_id)
+    end
+  end
+
+  defp collect_responses([], results, _deadline), do: results
+
+  defp collect_responses(pending_targets, results, deadline) do
+    wait_ms = deadline - System.monotonic_time(:millisecond)
+
+    if wait_ms <= 0 do
+      # Timeout remaining pending requests
+      Enum.reduce(pending_targets, results, fn {idx, target_mb}, acc ->
+        Map.put(acc, idx, %{"mailbox" => target_mb, "response" => %{"text" => "error: timeout", "error" => "timeout"}})
+      end)
+    else
+      receive do
+        {:mailbox_msg, _, {from_mb, msg}} ->
+          case pop_first_match(pending_targets, from_mb) do
+            nil ->
+              # Unexpected message, ignore and continue
+              collect_responses(pending_targets, results, deadline)
+
+            {idx, remaining_targets} ->
+              new_results = Map.put(results, idx, %{"mailbox" => from_mb, "response" => msg})
+              collect_responses(remaining_targets, new_results, deadline)
+          end
+      after
+        wait_ms ->
+          Enum.reduce(pending_targets, results, fn {idx, target_mb}, acc ->
+            Map.put(acc, idx, %{"mailbox" => target_mb, "response" => %{"text" => "error: timeout", "error" => "timeout"}})
+          end)
+      end
+    end
+  end
+
+  defp pop_first_match(targets, from_mb) do
+    case Enum.find_index(targets, fn {_idx, mb} -> mb == from_mb end) do
+      nil -> nil
+      pos ->
+        {idx, _mb} = Enum.at(targets, pos)
+        {idx, List.delete_at(targets, pos)}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Eval — Evaluate Elixir expressions with sandboxing
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Eval do
+  use GenServer
+  require Logger
+
+  @allowed_elixir MapSet.new(~w[Kernel Enum Map List Keyword String Integer Float Tuple MapSet Range Stream Regex Date Time DateTime NaiveDateTime Calendar Access Base URI])
+  @allowed_erlang MapSet.new([:math, :lists, :maps, :string, :binary, :calendar, :rand, :unicode, :re])
+
+  def start_link(mailbox_id \\ "eval") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"code" => code} = msg}}, state) do
+    timeout_ms = validate_timeout(msg["timeout"], 5_000)
+
+    spawn(fn ->
+      result = evaluate(code, timeout_ms)
+      Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, result})
+    end)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, _msg}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "error: missing 'code' field", "error" => "missing_code"}})
+    {:noreply, state}
+  end
+
+  defp evaluate(code, timeout_ms) do
+    with {:ok, ast} <- parse(code),
+         :ok <- check_ast(ast) do
+      run_with_timeout(code, timeout_ms)
+    else
+      {:error, reason} ->
+        %{"text" => "error: #{reason}", "error" => reason}
+    end
+  end
+
+  defp parse(code) do
+    case Code.string_to_quoted(code) do
+      {:ok, ast} -> {:ok, ast}
+      {:error, {_meta, msg, token}} ->
+        {:error, "syntax error: #{msg}#{token}"}
+    end
+  end
+
+  defp check_ast(ast) do
+    case walk_ast(ast) do
+      :ok -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  # Elixir module references
+  defp walk_ast({:__aliases__, _, [first | _]}) when is_atom(first) do
+    if MapSet.member?(@allowed_elixir, Atom.to_string(first)),
+      do: :ok,
+      else: {:error, "module not allowed: #{Atom.to_string(first)}"}
+  end
+
+  # Erlang module dot-calls: :mod.func(args)
+  defp walk_ast({{:., _, [mod, _func]}, _, args}) when is_atom(mod) and is_list(args) do
+    if MapSet.member?(@allowed_erlang, mod),
+      do: check_list(args),
+      else: {:error, "module not allowed: #{inspect(mod)}"}
+  end
+
+  # General 3-tuple AST nodes (operators, function calls, etc.)
+  defp walk_ast({op, _meta, args}) when is_list(args) do
+    with :ok <- walk_ast(op), do: check_list(args)
+  end
+
+  # 2-tuples
+  defp walk_ast({left, right}) do
+    with :ok <- walk_ast(left), do: walk_ast(right)
+  end
+
+  # Lists
+  defp walk_ast(list) when is_list(list), do: check_list(list)
+
+  # Everything else (literals, bare atoms like :ok, true, nil)
+  defp walk_ast(_), do: :ok
+
+  defp check_list(items) do
+    Enum.reduce_while(items, :ok, fn item, :ok ->
+      case walk_ast(item) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp run_with_timeout(code, timeout_ms) do
+    parent = self()
+
+    {pid, ref} = spawn_monitor(fn ->
+      result =
+        try do
+          {val, _} = Code.eval_string(code)
+          {:ok, val}
+        rescue
+          e -> {:error, "runtime error: #{Exception.message(e)}"}
+        catch
+          :throw, v -> {:error, "runtime error: throw: #{inspect(v)}"}
+        end
+
+      send(parent, {:eval_done, self(), result})
+    end)
+
+    receive do
+      {:eval_done, ^pid, {:ok, result}} ->
+        Process.demonitor(ref, [:flush])
+        str = inspect(result)
+        %{"text" => str, "result" => str, "type" => type_name(result)}
+
+      {:eval_done, ^pid, {:error, reason}} ->
+        Process.demonitor(ref, [:flush])
+        %{"text" => "error: #{reason}", "error" => reason}
+
+      {:DOWN, ^ref, :process, ^pid, _reason} ->
+        %{"text" => "error: evaluation crashed", "error" => "crash"}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+        receive do: ({:DOWN, ^ref, :process, ^pid, _} -> :ok)
+        %{"text" => "error: evaluation timed out", "error" => "timeout"}
+    end
+  end
+
+  defp type_name(v) when is_boolean(v), do: "boolean"
+  defp type_name(v) when is_integer(v), do: "integer"
+  defp type_name(v) when is_float(v), do: "float"
+  defp type_name(v) when is_binary(v), do: "string"
+  defp type_name(v) when is_atom(v), do: "atom"
+  defp type_name(v) when is_list(v), do: "list"
+  defp type_name(v) when is_map(v), do: "map"
+  defp type_name(v) when is_tuple(v), do: "tuple"
+  defp type_name(_), do: "other"
+
+  defp validate_timeout(nil, default), do: default
+  defp validate_timeout(ms, _default) when is_integer(ms) and ms > 0, do: ms
+  defp validate_timeout(_, default), do: default
 end
 
 # -----------------------------------------------------------------------------
@@ -1790,6 +2110,8 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Reaper, "reaper"},
       {Gizmo.Services.Watchdog, "watchdog"},
       {Gizmo.Services.Pager, "pager"},
+      {Gizmo.Services.Batch, "batch"},
+      {Gizmo.Services.Eval, "eval"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -1885,7 +2207,7 @@ defmodule Gizmo.Agent do
         "grind": true/false — override child's loop mode (default: inherit).
         "idle": true/false — child restores boot frame on empty (default: inherit).
         "disown": true — detach child (no ${_parent}, no death monitor).
-        "name": "<id>" — custom mailbox ID (must be unique; spawn fails if taken).
+        "name": "<id>" — custom mailbox ID (must be unique; duplicate triggers op error).
         "model": "<model_id>" — LLM model for the child (default: inherit parent's model).
 
     - trap: Register an interrupt handler. When a message whose "text" field
@@ -1911,6 +2233,11 @@ defmodule Gizmo.Agent do
       field of the JSON message, or the full JSON encoding if no "text" key).
     - ${_msg_source}: The mailbox ID of the sender of the last message.
     - ${_payload}: Full JSON encoding of the last received message.
+    - ${_op_error}: Set when an op fails (e.g. bad regex in trap, name
+      collision in spawn). Contains a description of the failure. Remaining
+      ops are skipped. Check this binding to detect and recover from errors.
+    - ${_pending_ops}: Set alongside _op_error. Summarizes the ops that
+      were skipped due to the error.
 
     ## Bindings visibility
 
@@ -2005,6 +2332,32 @@ defmodule Gizmo.Agent do
         {"op": "send", "mailbox": "<session>", "msg": {"action": "search", "pattern": "<text>"}}
         {"op": "send", "mailbox": "<session>", "msg": {"action": "close"}}
       Page response: {"text": "<header+content>", "content": "<content>", "from": N, "to": N, "total": N}
+
+    - batch: Fan out multiple service requests in parallel. Send a single
+      message with a "requests" array; get all results back in one response.
+      {"op": "send", "mailbox": "batch", "msg": {"requests": [
+        {"mailbox": "bash", "msg": {"command": "uname -a"}},
+        {"mailbox": "bash", "msg": {"command": "whoami"}}
+      ]}}
+      Optional: "timeout": <ms> (default 30s).
+      Response: {"text": "batch complete: N/M succeeded", "results": [
+        {"mailbox": "bash", "response": {"text": "Linux...", ...}},
+        {"mailbox": "bash", "response": {"text": "root", ...}}
+      ]}
+      Results are ordered to match the original requests array.
+      Sub-requests that fail (unknown mailbox) or time out get error entries.
+
+    - eval: Evaluate Elixir expressions for math, string ops, and data
+      transformations. No shell overhead.
+      {"op": "send", "mailbox": "eval", "msg": {"code": "Enum.sum(1..100)"}}
+      Optional: "timeout": <ms> (default 5s).
+      Success: {"text": "5050", "result": "5050", "type": "integer"}
+      Error:   {"text": "error: ...", "error": "..."}
+      Allowed modules: Kernel, Enum, Map, List, Keyword, String, Integer,
+      Float, Tuple, MapSet, Range, Stream, Regex, Date, Time, DateTime,
+      NaiveDateTime, Calendar, Access, Base, URI, :math, :lists, :maps,
+      :string, :binary, :calendar, :rand, :unicode, :re.
+      All other modules are rejected at parse time.
 
     ## Message-driven model
 
@@ -2244,12 +2597,11 @@ defmodule Gizmo.Agent do
     {bindings, binding_notes, context_stack}
   end
 
-  defp maybe_wait_for_message(state, %{trap: trap}, bindings, binding_notes, context_stack) do
+  defp maybe_wait_for_message(_state, %{trap: trap}, bindings, binding_notes, context_stack) do
     # Message-driven: block until a message arrives
     {msg_content, msg_source} =
       receive do
         {:mailbox_msg, _to, {from_mb, message}} ->
-          Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
           {message, from_mb}
       end
 
@@ -2436,8 +2788,22 @@ defmodule Gizmo.Agent do
         new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
         # Execute ops — may modify context_stack via spawn, updates bindings and trap
-        {new_stack, new_bindings, new_trap} =
+        ops_result =
           execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
+
+        {new_stack, new_bindings, new_trap, new_retries, op_error} =
+          case ops_result do
+            {:ok, stack, b, t} ->
+              {stack, b, t, 0, nil}
+
+            {:op_error, error_desc, remaining_desc, stack, b, t} ->
+              Logger.error("#{Gizmo.Format.agent_tag(id)}   \e[31mop error:\e[0m #{error_desc} (#{remaining_desc})")
+              err_bindings =
+                b
+                |> Map.put("_op_error", error_desc)
+                |> Map.put("_pending_ops", remaining_desc)
+              {stack, err_bindings, t, retries + 1, error_desc}
+          end
 
         cycle_ms = System.monotonic_time(:millisecond) - cycle_start
 
@@ -2464,12 +2830,12 @@ defmodule Gizmo.Agent do
           bindings: new_bindings,
           notes: interpolated.notes,
           usage: interpolated.usage,
-          error: nil
+          error: op_error
         })
 
         eval_loop_inner(new_stack, state, %{
           loop
-          | retries: 0,
+          | retries: new_retries,
             cycles: cycles + 1,
             persisted_sections: sections,
             bindings: new_bindings,
@@ -2524,14 +2890,36 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_ops(ops, frames, state, bindings, trap) do
-    Enum.reduce(ops, {frames, bindings, trap}, fn op,
-                                                  {current_frames, current_bindings, current_trap} ->
-      {:cont, new_frames, new_bindings, new_trap} =
-        execute_op(op, current_frames, state, current_bindings, current_trap)
-
-      {new_frames, new_bindings, new_trap}
-    end)
+    execute_ops_loop(ops, frames, state, bindings, trap)
   end
+
+  defp execute_ops_loop([], frames, _state, bindings, trap) do
+    {:ok, frames, bindings, trap}
+  end
+
+  defp execute_ops_loop([op | rest], frames, state, bindings, trap) do
+    try do
+      {:cont, new_frames, new_bindings, new_trap} =
+        execute_op(op, frames, state, bindings, trap)
+
+      execute_ops_loop(rest, new_frames, state, new_bindings, new_trap)
+    rescue
+      e ->
+        error_desc = "#{op_name(op)} failed: #{Exception.message(e)}"
+        remaining_desc = "#{length(rest)} op(s) skipped: #{Enum.map_join(rest, ", ", &op_summary/1)}"
+        {:op_error, error_desc, remaining_desc, frames, bindings, trap}
+    end
+  end
+
+  defp op_name({:send, _, _}), do: "send"
+  defp op_name({:receive, _}), do: "receive"
+  defp op_name({:spawn, _, _, _}), do: "spawn"
+  defp op_name({:trap, _, _}), do: "trap"
+
+  defp op_summary({:send, mb, _}), do: "send(to='#{mb}')"
+  defp op_summary({:receive, dest}), do: "receive(dest='#{dest}')"
+  defp op_summary({:spawn, _, dest, _}), do: "spawn(dest='#{dest}')"
+  defp op_summary({:trap, pattern, _}), do: "trap(pattern='#{pattern}')"
 
   defp execute_op({:send, mailbox, msg}, frames, state, bindings, trap) do
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
@@ -2541,8 +2929,7 @@ defmodule Gizmo.Agent do
   defp execute_op({:receive, dest}, frames, state, bindings, trap) do
     message =
       receive do
-        {:mailbox_msg, _to, {from_mb, message}} ->
-          Gizmo.Services.MessagesQueue.push(state.msgs_queue, message, from_mb)
+        {:mailbox_msg, _to, {_from_mb, message}} ->
           message
       after
         state.receive_timeout ->
@@ -2604,7 +2991,14 @@ defmodule Gizmo.Agent do
 
     child_opts = if child_name, do: Keyword.put(child_opts, :name, child_name), else: child_opts
 
-    {:ok, child_mb, child_pid} = Gizmo.Agent.start(child_frames, child_opts)
+    {child_mb, child_pid} =
+      case Gizmo.Agent.start(child_frames, child_opts) do
+        {:ok, child_mb, child_pid} ->
+          {child_mb, child_pid}
+
+        {:error, reason} ->
+          raise "spawn failed: #{inspect(reason)}"
+      end
 
     # Monitor child: on abnormal exit, notify parent mailbox (skip for disowned children)
     unless disown do
@@ -2639,8 +3033,13 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_op({:trap, pattern, handler_frames}, frames, _state, bindings, _trap) do
-    {:ok, regex} = Regex.compile(pattern)
-    {:cont, frames, bindings, {regex, handler_frames}}
+    case Regex.compile(pattern) do
+      {:ok, regex} ->
+        {:cont, frames, bindings, {regex, handler_frames}}
+
+      {:error, {reason, _pos}} ->
+        raise "invalid regex pattern '#{pattern}': #{reason}"
+    end
   end
 end
 
@@ -4546,7 +4945,7 @@ defmodule Gizmo.CLI do
     # Test 1: All well-known services are registered
     failures =
       Enum.reduce(
-        ["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog", "pager"],
+        ["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog", "pager", "batch", "eval"],
         failures,
         fn svc, acc ->
           acc ++
@@ -5330,13 +5729,18 @@ defmodule Gizmo.CLI do
 
     Gizmo.Mailbox.unregister(name_test_mb)
 
-    # Test 5: Name collision — second spawn with same name fails
+    # Test 5: Name collision — second spawn with same name recovers with _op_error
     collision_test_mb = Gizmo.Mailbox.generate_id("collision_test")
     Gizmo.Mailbox.register(collision_test_mb)
     collision_parent_cycle = :counters.new(1, [:atomics])
+    collision_op_error = :atomics.new(1, [])
 
-    collision_chat_fn = fn system, _messages, _opts ->
+    collision_chat_fn = fn system, messages, _opts ->
       sys = flatten_system_for_test(system)
+      user_text = case messages do
+        [%{content: c} | _] when is_binary(c) -> c
+        _ -> ""
+      end
 
       if String.contains?(sys, "collide-child") do
         # Child: idle forever (stay alive to hold the name)
@@ -5356,10 +5760,23 @@ defmodule Gizmo.CLI do
              }}
 
           1 ->
-            # Spawn second child with same name — should fail (crash)
+            # Spawn second child with same name — should recover with _op_error
             {:ok,
              %{
                ops: [{:spawn, ["collide-child"], "kid2", %{name: "unique_name", grind: true}}],
+               frames: ["parent: check error"],
+               notes: %{}
+             }}
+
+          2 ->
+            # Check that _op_error is bound (shown in user message bindings)
+            if String.contains?(user_text, "_op_error") do
+              :atomics.put(collision_op_error, 1, 1)
+            end
+
+            {:ok,
+             %{
+               ops: [{:send, collision_test_mb, %{"text" => "done"}}],
                frames: [],
                notes: %{}
              }}
@@ -5379,7 +5796,7 @@ defmodule Gizmo.CLI do
 
     collision_ref = Process.monitor(collision_pid)
 
-    # Parent should crash because the second spawn fails (name already registered)
+    # Parent should survive and exit normally after reporting _op_error
     collision_exit =
       receive do
         {:DOWN, ^collision_ref, :process, ^collision_pid, reason} -> reason
@@ -5387,13 +5804,21 @@ defmodule Gizmo.CLI do
         10_000 -> :timeout
       end
 
-    # The parent should have died abnormally (match error from Agent.start)
+    # The parent should have exited normally (error was recovered)
     failures =
       failures ++
         assert_eq(
-          "spawn opts: name collision crashes parent",
-          collision_exit != :normal && collision_exit != :timeout,
-          true
+          "spawn opts: name collision recovers with _op_error",
+          collision_exit,
+          :normal
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "spawn opts: _op_error was bound after collision",
+          :atomics.get(collision_op_error, 1),
+          1
         )
 
     Gizmo.Mailbox.unregister(collision_test_mb)
@@ -6171,6 +6596,242 @@ defmodule Gizmo.CLI do
 
     Gizmo.Mailbox.unregister(pager_recv)
     File.rm(pager_tmp)
+
+    IO.puts("")
+
+    # 17. Batch tests
+    IO.puts("--- Batch ---")
+
+    batch_recv = Gizmo.Mailbox.generate_id("batch_recv")
+    Gizmo.Mailbox.register(batch_recv)
+
+    # Test 1: Two bash commands — both results returned, correct order
+    Gizmo.Mailbox.route("batch", {batch_recv, %{
+      "requests" => [
+        %{"mailbox" => "bash", "msg" => %{"command" => "echo hello_batch"}},
+        %{"mailbox" => "bash", "msg" => %{"command" => "echo world_batch"}}
+      ]
+    }})
+
+    batch_result1 =
+      receive do
+        {:mailbox_msg, ^batch_recv, {"batch", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "batch: two bash commands text",
+      String.starts_with?(batch_result1["text"], "batch complete: 2/2"),
+      true
+    )
+
+    batch_results = batch_result1["results"]
+    batch_texts = Enum.map(batch_results, fn r -> get_in(r, ["response", "text"]) || "" end)
+
+    failures = failures ++ assert_eq(
+      "batch: results contain hello_batch",
+      Enum.any?(batch_texts, &String.contains?(&1, "hello_batch")),
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "batch: results contain world_batch",
+      Enum.any?(batch_texts, &String.contains?(&1, "world_batch")),
+      true
+    )
+
+    # Test 2: One valid + one nonexistent mailbox → partial success
+    Gizmo.Mailbox.route("batch", {batch_recv, %{
+      "requests" => [
+        %{"mailbox" => "bash", "msg" => %{"command" => "echo partial_test"}},
+        %{"mailbox" => "nonexistent_service_xyz", "msg" => %{"command" => "nope"}}
+      ]
+    }})
+
+    batch_result2 =
+      receive do
+        {:mailbox_msg, ^batch_recv, {"batch", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "batch: partial success text",
+      String.starts_with?(batch_result2["text"], "batch complete: 1/2"),
+      true
+    )
+
+    failures = failures ++ assert_eq(
+      "batch: partial success - second has error",
+      batch_result2["results"] |> Enum.at(1) |> get_in(["response", "error"]) != nil,
+      true
+    )
+
+    # Test 3: Missing requests field → error response
+    Gizmo.Mailbox.route("batch", {batch_recv, %{"foo" => "bar"}})
+
+    batch_result3 =
+      receive do
+        {:mailbox_msg, ^batch_recv, {"batch", msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "batch: missing requests field",
+      String.starts_with?(batch_result3["text"], "error:"),
+      true
+    )
+
+    Gizmo.Mailbox.unregister(batch_recv)
+
+    IO.puts("")
+
+    # 18. Eval tests
+    IO.puts("--- Eval ---")
+
+    eval_recv = Gizmo.Mailbox.generate_id("eval_recv")
+    Gizmo.Mailbox.register(eval_recv)
+
+    # Test 1: Arithmetic
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "1 + 2 * 3"}})
+
+    eval_result1 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("eval: arithmetic result", eval_result1["result"], "7")
+    failures = failures ++ assert_eq("eval: arithmetic type", eval_result1["type"], "integer")
+
+    # Test 2: String op
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "String.upcase(\"hello\")"}})
+
+    eval_result2 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("eval: string upcase", eval_result2["result"], "\"HELLO\"")
+    failures = failures ++ assert_eq("eval: string type", eval_result2["type"], "string")
+
+    # Test 3: Enum
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "Enum.sum([1,2,3,4,5])"}})
+
+    eval_result3 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("eval: enum sum", eval_result3["result"], "15")
+
+    # Test 4: Forbidden module (System)
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "System.get_env(\"HOME\")"}})
+
+    eval_result4 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: forbidden System",
+      String.contains?(eval_result4["text"], "not allowed"),
+      true
+    )
+
+    # Test 5: Forbidden Erlang module (:os)
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => ":os.cmd(~c\"ls\")"}})
+
+    eval_result5 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: forbidden :os",
+      String.contains?(eval_result5["text"], "not allowed"),
+      true
+    )
+
+    # Test 6: Syntax error
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "def foo("}})
+
+    eval_result6 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: syntax error",
+      String.contains?(eval_result6["text"], "error"),
+      true
+    )
+
+    # Test 7: Runtime error (1/0)
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"code" => "1 / 0"}})
+
+    eval_result7 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: runtime error",
+      String.contains?(eval_result7["text"], "error"),
+      true
+    )
+
+    # Test 8: Timeout (infinite block with short timeout)
+    Gizmo.Mailbox.route("eval", {eval_recv, %{
+      "code" => "receive do :never -> :ok end",
+      "timeout" => 500
+    }})
+
+    eval_result8 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: timeout",
+      is_map(eval_result8) and is_binary(eval_result8["error"]) and eval_result8["error"] == "timeout",
+      true
+    )
+
+    # Test 9: Missing code field
+    Gizmo.Mailbox.route("eval", {eval_recv, %{"expression" => "1+1"}})
+
+    eval_result9 =
+      receive do
+        {:mailbox_msg, ^eval_recv, {"eval", msg}} -> msg
+      after
+        2_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq(
+      "eval: missing code field",
+      String.contains?(eval_result9["text"], "error"),
+      true
+    )
+
+    Gizmo.Mailbox.unregister(eval_recv)
 
     IO.puts("")
 

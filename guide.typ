@@ -379,7 +379,7 @@ Each agent process carries the following state through its eval loop:
   [`trap`], [A `{regex, handler_frames}` tuple, or `nil`. Single-slot interrupt handler.],
   [`grind`], [Boolean. If `true`, hot-loops without waiting for messages between cycles.],
   [`idle`], [Boolean. If `true`, restores boot frame (instead of terminating) when frames drain to `[]`.],
-  [`messages_queue`], [A per-agent GenServer holding a FIFO queue of `{content, source}` tuples.],
+  [`messages_queue`], [A per-agent `MessagesQueue` GenServer. Currently unused in the runtime path (retained for test assertions).],
 )
 
 The *runtime bindings* are always available:
@@ -899,6 +899,54 @@ The agent can open multiple documents---each gets its own session process, its o
 The agent doesn't know---and doesn't need to know---that these are GenServers. It interacts with the pager session exactly the way it interacts with `bash` or `human_input` or another LLM agent: send a message, get a message back. This is the Erlang principle that _on the network, nobody knows you're a C port_ applied to LLM agents. Any process that can hold state and respond to messages fits behind a mailbox. The four-op model isn't just sufficient for agent-to-agent coordination---it's sufficient for agent-to-_anything_ coordination, because anything stateful can present itself as a communicating peer.
 
 This is also how you extend an agent's effective memory beyond the context window. The agent's context is finite, but the pager's buffer is bounded only by system memory. The agent pages through a 10,000-line file 40 lines at a time, reasoning about each page and deciding what to look at next---all through the same `send`/`receive` protocol it uses for everything else.
+
+=== `batch` --- Parallel Fan-Out
+
+*Mailbox:* `"batch"`
+
+The batch service lets an agent fan out multiple service requests in parallel and collect all results in a single cycle. Instead of issuing N `send` ops and waiting N cycles for responses, the agent sends one batch message and gets everything back at once:
+
+```json
+{"op": "send", "mailbox": "batch", "msg": {"requests": [
+  {"mailbox": "bash", "msg": {"command": "uname -a"}},
+  {"mailbox": "bash", "msg": {"command": "whoami"}},
+  {"mailbox": "blackboard", "msg": {"action": "read", "key": "count"}}
+], "timeout": 30000}}
+```
+
+The response arrives on the next cycle with results ordered to match the original requests array:
+
+```json
+{"text": "batch complete: 3/3 succeeded", "results": [
+  {"mailbox": "bash", "response": {"text": "Linux ..."}},
+  {"mailbox": "bash", "response": {"text": "root"}},
+  {"mailbox": "blackboard", "response": {"text": "42"}}
+]}
+```
+
+Sub-requests that target unknown mailboxes get immediate error entries. Sub-requests that don't respond before the deadline get `{"error": "timeout"}` entries. The optional `"timeout"` field (default 30s) sets the deadline for the entire batch. Internally, the batch service spawns a short-lived coordinator process that registers a temporary mailbox, fans out the sub-requests, collects responses via `receive`, and bundles them back to the sender.
+
+=== `eval` --- Elixir Expression Evaluator
+
+*Mailbox:* `"eval"`
+
+The eval service evaluates Elixir expressions and returns the result. It's faster than shelling out to bash for math, string processing, and data transformations:
+
+```json
+{"op": "send", "mailbox": "eval", "msg": {"code": "Enum.sum(1..100)"}}
+```
+
+Success response:
+
+```json
+{"text": "5050", "result": "5050", "type": "integer"}
+```
+
+The `"type"` field reports the Elixir type of the result (`"integer"`, `"float"`, `"string"`, `"boolean"`, `"list"`, `"map"`, `"atom"`, `"tuple"`, `"other"`).
+
+Only allowlisted modules may be used. The allowed Elixir modules are `Kernel`, `Enum`, `Map`, `List`, `Keyword`, `String`, `Integer`, `Float`, `Tuple`, `MapSet`, `Range`, `Stream`, `Regex`, `Date`, `Time`, `DateTime`, `NaiveDateTime`, `Calendar`, `Access`, `Base`, and `URI`. The allowed Erlang modules are `:math`, `:lists`, `:maps`, `:string`, `:binary`, `:calendar`, `:rand`, `:unicode`, and `:re`. All other modules are rejected at parse time via AST scanning. Syntax errors, runtime exceptions, and timeouts all return error responses. The optional `"timeout"` field (default 5s) limits evaluation time.
+
+The sandbox is advisory---it can't catch `apply/3` with a variable module or `Module.concat` evasion. But since the agent already has access to `bash`, the eval service is a convenience for common operations, not a security boundary.
 
 == Worked Execution Cycle
 
@@ -2138,7 +2186,7 @@ This is the first cycle (${_msg} is "init"). Do all of these steps:
 === Extension Projects
 
 - *Named communication:* Spawn a named child, then have a _second_ child send a message to it by name (not by a binding from spawn).
-- *Name collision:* Intentionally spawn two children with the same name. Observe the crash behavior.
+- *Name collision:* Intentionally spawn two children with the same name. Observe the op error recovery behavior (`_op_error` binding).
 
 == 11b: Each Hello
 
@@ -2277,7 +2325,7 @@ Gizmo differs structurally:
 - *State representation.* ReAct keeps all state in the context window---the growing concatenation of thoughts, actions, and observations. Gizmo separates concerns: bindings for named values, the context stack for the prompt, and messages for inter-process communication.
 - *Control flow.* ReAct's control flow is emergent from token prediction. The LLM "decides" what to do by generating text that a harness parses. Gizmo's control flow is explicit: the LLM returns structured JSON with typed ops, and the runtime dispatches them deterministically.
 - *Composition.* ReAct has no native mechanism for agent-to-agent communication. Multi-agent setups require external orchestration. Gizmo's `spawn`/`send`/`receive` make multi-agent coordination a first-class concern.
-- *Error handling.* ReAct hopes the LLM notices when something goes wrong. Gizmo has supervision trees, death monitors, and the `trap` op for structured failure handling.
+- *Error handling.* ReAct hopes the LLM notices when something goes wrong. Gizmo has supervision trees, death monitors, the `trap` op for structured failure handling, and op error recovery (`_op_error`/`_pending_ops` bindings) for LLM-generated bad ops.
 
 ReAct is simple to implement and reason about for single-agent tasks. Gizmo is what you reach for when agents need to coordinate, fail gracefully, or run in parallel.
 
@@ -2307,7 +2355,7 @@ Gizmo is explicitly modeled on Erlang/OTP, and the resemblance is deliberate:
     [*Concept*], [*Erlang/OTP*], [*Gizmo*],
   ),
   [Process], [Erlang process (lightweight, preemptive)], [Agent process (`:proc_lib` wrapper)],
-  [Mailbox], [Per-process message queue], [Mailbox Registry + `MessagesQueue` GenServer],
+  [Mailbox], [Per-process message queue], [Mailbox Registry (process mailbox for delivery)],
   [Supervision], [`Supervisor` / `DynamicSupervisor`], [`Gizmo.Supervision` / `Gizmo.AgentSupervisor`],
   [Failure], [`link` / `monitor` / `EXIT` signals], [`Process.monitor` + `child_died:` messages],
   [State], [Tail-recursive loop with accumulator], [Context stack + bindings, rewritten each cycle],
@@ -2465,6 +2513,8 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   [`reaper`], [`{"target": "mb_id"}`], [_(none)_], [Force-kill descendant. Ancestor-only.],
   [`watchdog`], [`{"action": "every/after/cancel", ...}`], [`{"text": "tick"}`], [Periodic/one-shot tick delivery],
   [`pager`], [`{"action": "open", "path": "..."}`], [`{"text": "opened:sid:N lines", ...}`], [Spawns session: `next`/`prev`/`search`/`goto`/`close`],
+  [`batch`], [`{"requests": [...], "timeout": N}`], [`{"text": "batch complete: N/M", "results": [...]}`], [Fan-out parallel requests, collect all results],
+  [`eval`], [`{"code": "...", "timeout": N}`], [`{"text": "result", "type": "..."}`], [Evaluate Elixir expression with AST sandboxing],
 )
 
 == CLI Flags

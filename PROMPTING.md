@@ -362,8 +362,9 @@ each other through shared services like the blackboard.
 
 You can also give agents custom mailbox IDs with `"name": "worker"` on
 `spawn`. This makes the child addressable by a known name instead of an
-auto-generated `agent_N`. The name must be unique — spawn fails if the
-name is already registered.
+auto-generated `agent_N`. The name must be unique — a duplicate name
+triggers op error recovery (`${_op_error}` is bound with details and the
+remaining ops in the cycle are skipped).
 
 Since children can't inherit parent sections (see above), use the
 **binding-conditional single-frame** pattern: put the child's entire
@@ -806,6 +807,7 @@ The final result of a notify-mode job still arrives in the standard format
 
 **Default timeout** is set by the runtime (`--bash-timeout`, typically 60 s).
 Commands without a `"timeout"` field use the default timeout in kill mode.
+Non-integer or negative `"timeout"` values are ignored (the default is used).
 Use `0` for no timeout.
 
 ### blackboard
@@ -830,8 +832,9 @@ arrive as `"tick"` from source `"watchdog"`.
 | `{"action": "list"}` | List active timers (reply sent back) |
 
 All commands are fire-and-forget except `list`, which sends a reply.
-Multiple timers stack — an agent can have several `every` and `after`
-timers simultaneously.
+The `ms` field must be a positive integer; invalid values return an error
+message instead of scheduling. Multiple timers stack — an agent can have
+several `every` and `after` timers simultaneously.
 
 ```json
 {"op": "send", "mailbox": "watchdog", "msg": {"action": "every", "ms": 5000}}
@@ -848,6 +851,69 @@ To cancel all your timers:
 ```json
 {"op": "send", "mailbox": "watchdog", "msg": {"action": "cancel"}}
 ```
+
+### batch
+
+Fan out multiple service requests in parallel and collect all results in a
+single cycle. Instead of sending N requests and waiting N cycles for responses,
+send one batch request and get all results back at once.
+
+```json
+{"op": "send", "mailbox": "batch", "msg": {"requests": [
+  {"mailbox": "bash", "msg": {"command": "uname -a"}},
+  {"mailbox": "bash", "msg": {"command": "whoami"}},
+  {"mailbox": "blackboard", "msg": {"action": "read", "key": "foo"}}
+], "timeout": 30000}}
+```
+
+The response arrives as `${_msg}` on the next cycle:
+
+```json
+{
+  "text": "batch complete: 3/3 succeeded",
+  "results": [
+    {"mailbox": "bash", "response": {"text": "Linux...", ...}},
+    {"mailbox": "bash", "response": {"text": "root", ...}},
+    {"mailbox": "blackboard", "response": {"text": "bar", ...}}
+  ]
+}
+```
+
+Results are ordered to match the original requests array. Sub-requests that
+fail (unknown mailbox) or time out get error entries in their `"response"`.
+The optional `"timeout"` field (default 30s) applies to the entire batch.
+
+### eval
+
+Evaluate Elixir expressions for math, string processing, and data
+transformations without shelling out to bash.
+
+```json
+{"op": "send", "mailbox": "eval", "msg": {"code": "Enum.sum(1..100)"}}
+```
+
+Success response:
+
+```json
+{"text": "5050", "result": "5050", "type": "integer"}
+```
+
+Error response:
+
+```json
+{"text": "error: module not allowed: System", "error": "module not allowed: System"}
+```
+
+The optional `"timeout"` field (default 5s) limits evaluation time. Only
+allowlisted modules may be used: `Kernel`, `Enum`, `Map`, `List`, `Keyword`,
+`String`, `Integer`, `Float`, `Tuple`, `MapSet`, `Range`, `Stream`, `Regex`,
+`Date`, `Time`, `DateTime`, `NaiveDateTime`, `Calendar`, `Access`, `Base`,
+`URI`, `:math`, `:lists`, `:maps`, `:string`, `:binary`, `:calendar`, `:rand`,
+`:unicode`, `:re`. All other modules are rejected at parse time.
+
+Use `eval` for math (`1 + 2 * 3`), Enum/Map/String operations
+(`String.upcase("hello")`), and data transformations. For shell commands, use
+`bash` instead.
 
 ## CLI flags
 

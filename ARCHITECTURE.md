@@ -73,13 +73,16 @@ by `Gizmo.Supervision`. They are not syscalls.
 | **exception** | `"exception"` | Error notification sink. Receives agent retry/cycle exhaustion reports. |
 | **reaper** | `"reaper"` | Agent lifecycle. `{"target": "<mailbox_id>"}` to kill a descendant. |
 | **watchdog** | `"watchdog"` | Timer service. `{"action": "every/after/cancel/list", "ms": N}`. |
+| **pager** | `"pager"` | Document pager. `{"action": "open", "path": "..."}` spawns a per-document session. |
+| **batch** | `"batch"` | Fan-out parallel requests. `{"requests": [...], "timeout": N}` → collects all results. |
+| **eval** | `"eval"` | Evaluate Elixir expressions. `{"code": "...", "timeout": N}` with AST allowlist sandboxing. |
 
 Per-agent state (not well-known, created per agent instance):
 
 | Component | Scope | Purpose |
 |-----------|-------|---------|
-| **bindings** | in-process | Named bindings map. Values from `receive` (`dest` + `dest_payload`), `spawn` (`dest`), and runtime (`_self`, `_parent`, `_msg`, `_payload`, `_msg_source`). Threaded through eval loop. |
-| **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. |
+| **bindings** | in-process | Named bindings map. Values from `receive` (`dest` + `dest_payload`), `spawn` (`dest`), runtime (`_self`, `_parent`, `_msg`, `_payload`, `_msg_source`), and error recovery (`_op_error`, `_pending_ops`). Threaded through eval loop. |
+| **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. Currently unused in the runtime path (write-only scaffolding removed); the module is retained for test assertions. |
 
 ## Eval Loop Detail
 
@@ -94,7 +97,8 @@ Per-agent state (not well-known, created per agent instance):
 4. Call LLM with system prompt and user message
 5. LLM returns structured {ops, frames, notes} via eval_response tool
 6. Interpolate frames and op strings against bindings and sections
-7. Execute ops sequentially (may update bindings via receive/spawn, trap state)
+7. Execute ops sequentially (may update bindings via receive/spawn, trap state).
+   If an op fails, remaining ops are skipped and _op_error/_pending_ops are bound.
 8. Replace context stack with returned frames
 9. If stack is empty:
    a. Default → agent terminates
@@ -171,15 +175,28 @@ peers through the blackboard or other shared services.
 
 ```
 LLM error → retry (×3) → exception mailbox → agent terminates
+op error  → bind _op_error/_pending_ops → retry counter increments → LLM re-plans
 cycle limit exceeded → exception mailbox → agent terminates
 ```
 
 Three retries for LLM errors (schema violation, API error). After exhaustion,
 the error is reported to the `"exception"` mailbox and the agent terminates.
+
+Op execution errors (bad regex in `trap`, name collision in `spawn`) are
+caught and recovered: the remaining ops are skipped, `${_op_error}` and
+`${_pending_ops}` are bound with error details, and the retry counter
+increments (so max-retries still protects against infinite error loops).
+The LLM sees the error context on the next cycle and can re-plan.
+
 A configurable cycle limit (`--max-cycles`, default 50) catches infinite loops.
 Set to 0 for unlimited cycles. The limit is inherited by spawned children.
 Transient API errors (429, 5xx) are retried with exponential backoff at the
 HTTP layer before reaching the eval retry logic.
+
+Service input validation: bash, watchdog, and pager services validate
+LLM-generated payloads at their boundaries. Invalid inputs (non-integer
+timeouts, malformed line numbers) fall back to defaults or return error
+messages instead of crashing the service.
 
 ## Supervision Tree
 
@@ -193,6 +210,9 @@ Gizmo.Supervision (one_for_one)
 ├── Gizmo.Services.Exception ("exception")
 ├── Gizmo.Services.Reaper ("reaper")
 ├── Gizmo.Services.Watchdog ("watchdog")
+├── Gizmo.Services.Pager ("pager")
+├── Gizmo.Services.Batch ("batch")
+├── Gizmo.Services.Eval ("eval")
 └── Gizmo.AgentSupervisor (DynamicSupervisor)
     ├── Agent via Wrapper (:temporary)
     ├── Agent via Wrapper (:temporary)
@@ -268,8 +288,11 @@ preloaded services and instructions.
 By default, agents get auto-generated mailbox IDs like `agent_1`, `agent_2`.
 The `--name <id>` CLI flag sets a custom mailbox ID for the root agent. In
 spawn ops, `"name": "worker"` gives the child a custom ID. Names must be
-unique — registration fails (crashing the spawning agent) if the name is
-already taken.
+unique — a duplicate name triggers op error recovery (`_op_error` is bound
+and the LLM can retry with a different name).
+
+Name collisions are recovered via the op error mechanism: `_op_error` is
+bound with details and the LLM can re-plan on the next cycle.
 
 Named agents are easier to address in boot frames, debug in logs, and
 filter in traces.

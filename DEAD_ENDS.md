@@ -548,3 +548,35 @@ The `"text"` key convention provides the human-readable summary:
 This gives agents clean values for interpolation (`${roll}` = `"4"`) while
 preserving structured access when needed (`${roll_payload}` =
 `{"text":"4","output":"4","exit_code":0}`).
+
+## MessagesQueue as Runtime Message Log
+
+**Introduced:** Stage 5b (Well-known services)
+**Removed:** Stage 15 (Hardening pass — push calls removed from runtime path)
+
+Each agent got a per-agent `MessagesQueue` GenServer that recorded every
+received message as a `{content, source}` tuple. The `push` call ran on
+every `receive` op and every inter-cycle message wait. The queue was intended
+as a message history that agents could query for context or replay.
+
+### Why it didn't work
+
+- **Write-only.** `push` was called on every message, but `pop` was never
+  called in runtime code. The queue accumulated data that nothing read.
+- **Unbounded growth.** Long-lived agents (idle daemons, grind workers)
+  accumulated every message they ever received. No eviction, no cap.
+- **Redundant with bindings.** The binding system (`${_msg}`, `${dest}`,
+  `${_payload}`) already gives agents access to message content. The queue
+  duplicated this data in a less accessible form (GenServer state vs.
+  interpolation-ready bindings).
+- **No consumer path.** There was no op or service protocol for agents to
+  query their own message history. Building one would have required a new
+  op or a well-known service, both adding complexity for a feature no
+  prompt pattern needed.
+
+### What replaced it
+
+Nothing — the runtime path simply stopped writing to it. The
+`MessagesQueue` module and its GenServer lifecycle are retained because
+the smoke test suite uses `push`/`pop`/`to_list` for unit assertions
+about the module itself.
