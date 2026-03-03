@@ -1,5 +1,5 @@
 {
-  description = "Gizmo (stage 0 Gremlin)";
+  description = "Gizmo — minimal LLM agent runtime";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   outputs =
     { self, nixpkgs, ... }:
@@ -12,12 +12,6 @@
         };
       };
       beamPkgs = with pkgs.beam; packagesWith interpreters.erlang_28;
-      extraErlangDeps = with pkgs; [
-        wxGTK32
-        libpng
-        libGLU
-        libGL
-      ];
     in
     {
       devShells."${system}".default = pkgs.mkShell {
@@ -28,14 +22,10 @@
 
           pkgs.inotify-tools
 
-        ]
-        ++ extraErlangDeps; # Add GUI deps at runtime instead of rebuild
+        ];
 
         ERL_INCLUDE_PATH = "${beamPkgs.erlang}/lib/erlang/usr/include";
         ERL_AFLAGS = "-kernel shell_history enabled";
-
-        # Make GUI libraries available at runtime
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath extraErlangDeps;
 
         shellHook = ''
           # Allow mix to work on local directory
@@ -50,12 +40,7 @@
           export PATH=$MIX_HOME/escripts:$PATH
           export PATH=$HEX_HOME/bin:$PATH
 
-          # "Run: `mix archive.install hex phx_new` for phoenix."
-          mix do local.rebar --force + local.hex --force
-          if ! mix archive | grep -q "phx_new"; then
-            echo "Installing Phoenix generator..."
-            mix archive.install hex phx_new --force
-          fi
+          mix local.hex --force --if-missing
 
           export PS1="$(echo $PS1) gizmo $ "
         '';
