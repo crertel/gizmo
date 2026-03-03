@@ -163,6 +163,9 @@ test/                  # Example boot frames
   11a_named_spawn.txt  # Named child spawn (custom mailbox ID)
   11b_each_hello.txt   # Per-file agent for --each mode
   12_pager.txt         # Interactive file pager (factory + session pattern)
+  13_eval.txt          # Eval calculator (math assistant)
+  14_batch.txt         # Batch system profiler (parallel info gathering)
+  15_factory.txt       # Factory service demo (runtime counter)
 ARCHITECTURE.md        # Runtime design and process model
 DEVELOPMENT.md         # Development stages and roadmap
 PROMPTING.md           # Guide for writing boot frames

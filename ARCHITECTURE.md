@@ -76,6 +76,7 @@ by `Gizmo.Supervision`. They are not syscalls.
 | **pager** | `"pager"` | Document pager. `{"action": "open", "path": "..."}` spawns a per-document session. |
 | **batch** | `"batch"` | Fan-out parallel requests. `{"requests": [...], "timeout": N}` → collects all results. |
 | **eval** | `"eval"` | Evaluate Elixir expressions. `{"code": "...", "timeout": N}` with AST allowlist sandboxing. |
+| **factory** | `"factory"` | Create custom stateful services at runtime. `{"action": "create", "name": "...", "code": "fn msg, state -> ... end", "state": init}`. Workers register as their own mailbox. |
 
 Per-agent state (not well-known, created per agent instance):
 
@@ -213,6 +214,10 @@ Gizmo.Supervision (one_for_one)
 ├── Gizmo.Services.Pager ("pager")
 ├── Gizmo.Services.Batch ("batch")
 ├── Gizmo.Services.Eval ("eval")
+├── Gizmo.FactorySupervisor (DynamicSupervisor)
+│   ├── FactoryWorker (:temporary)
+│   └── ...
+├── Gizmo.Services.Factory ("factory")
 └── Gizmo.AgentSupervisor (DynamicSupervisor)
     ├── Agent via Wrapper (:temporary)
     ├── Agent via Wrapper (:temporary)

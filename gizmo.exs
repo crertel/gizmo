@@ -2008,6 +2008,196 @@ defmodule Gizmo.Services.Eval do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.FactoryWorker — Generic GenServer wrapper for user-defined handlers
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.FactoryWorker do
+  use GenServer
+  require Logger
+
+  def start_link({mailbox_id, handler, user_state}) do
+    GenServer.start_link(__MODULE__, {mailbox_id, handler, user_state})
+  end
+
+  @impl true
+  def init({mailbox_id, handler, user_state}) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, handler: handler, user_state: user_state}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    {reply, new_user_state} =
+      try do
+        case state.handler.(msg, state.user_state) do
+          {reply, new_state} -> {reply, new_state}
+          other ->
+            Logger.error("[factory:#{state.mailbox_id}] handler returned bad shape: #{inspect(other)}")
+            {%{"text" => "error: handler must return {reply, new_state}", "error" => "bad_return"}, state.user_state}
+        end
+      rescue
+        e ->
+          Logger.error("[factory:#{state.mailbox_id}] handler raised: #{Exception.message(e)}")
+          {%{"text" => "error: handler raised: #{Exception.message(e)}", "error" => "handler_error"}, state.user_state}
+      catch
+        kind, value ->
+          Logger.error("[factory:#{state.mailbox_id}] handler threw #{kind}: #{inspect(value)}")
+          {%{"text" => "error: handler threw #{kind}: #{inspect(value)}", "error" => "handler_error"}, state.user_state}
+      end
+
+    if reply != nil do
+      Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, reply})
+    end
+
+    {:noreply, %{state | user_state: new_user_state}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Services.Factory — Create custom stateful services at runtime
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Factory do
+  use GenServer
+  require Logger
+
+  @compile_timeout 5_000
+
+  def start_link(mailbox_id \\ "factory") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, services: %{}}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "create", "name" => name, "code" => code} = msg}}, state) do
+    init_state = msg["state"] || %{}
+
+    cond do
+      Map.has_key?(state.services, name) ->
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "error: service '#{name}' already exists", "error" => "already_exists"}})
+        {:noreply, state}
+
+      true ->
+        case compile_handler(code) do
+          {:ok, handler} ->
+            case DynamicSupervisor.start_child(
+              Gizmo.FactorySupervisor,
+              {Gizmo.Services.FactoryWorker, {name, handler, init_state}}
+            ) do
+              {:ok, pid} ->
+                ref = Process.monitor(pid)
+                new_services = Map.put(state.services, name, {pid, ref})
+                Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+                  %{"text" => "ok", "name" => name}})
+                {:noreply, %{state | services: new_services}}
+
+              {:error, reason} ->
+                Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+                  %{"text" => "error: failed to start worker: #{inspect(reason)}", "error" => "start_failed"}})
+                {:noreply, state}
+            end
+
+          {:error, reason} ->
+            Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+              %{"text" => "error: #{reason}", "error" => "compile_error"}})
+            {:noreply, state}
+        end
+    end
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "destroy", "name" => name}}}, state) do
+    case Map.get(state.services, name) do
+      {pid, ref} ->
+        Process.demonitor(ref, [:flush])
+        DynamicSupervisor.terminate_child(Gizmo.FactorySupervisor, pid)
+        new_services = Map.delete(state.services, name)
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "ok", "name" => name}})
+        {:noreply, %{state | services: new_services}}
+
+      nil ->
+        Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+          %{"text" => "error: service '#{name}' not found", "error" => "not_found"}})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "list"}}}, state) do
+    names = Map.keys(state.services) |> Enum.sort()
+    text = case names do
+      [] -> "services: (none)"
+      _ -> "services: #{Enum.join(names, ", ")}"
+    end
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => text, "services" => names}})
+    {:noreply, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "error: unknown action: #{inspect(msg["action"])}", "error" => "unknown_action"}})
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    case Enum.find(state.services, fn {_name, {p, r}} -> p == pid and r == ref end) do
+      {name, _} ->
+        Logger.info("[factory] worker '#{name}' died, removing from registry")
+        {:noreply, %{state | services: Map.delete(state.services, name)}}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp compile_handler(code) do
+    parent = self()
+
+    {pid, ref} = spawn_monitor(fn ->
+      result =
+        try do
+          {val, _} = Code.eval_string(code)
+          if is_function(val, 2) do
+            {:ok, val}
+          else
+            {:error, "code must evaluate to an arity-2 function, got: #{inspect(val)}"}
+          end
+        rescue
+          e -> {:error, "compile error: #{Exception.message(e)}"}
+        catch
+          :throw, v -> {:error, "compile error: throw: #{inspect(v)}"}
+        end
+
+      send(parent, {:compile_done, self(), result})
+    end)
+
+    receive do
+      {:compile_done, ^pid, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ^ref, :process, ^pid, _reason} ->
+        {:error, "compilation crashed"}
+    after
+      @compile_timeout ->
+        Process.exit(pid, :kill)
+        receive do: ({:DOWN, ^ref, :process, ^pid, _} -> :ok)
+        {:error, "compilation timed out"}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent.Wrapper — OTP-compatible wrapper for agent processes
 # -----------------------------------------------------------------------------
 
@@ -2112,6 +2302,8 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Pager, "pager"},
       {Gizmo.Services.Batch, "batch"},
       {Gizmo.Services.Eval, "eval"},
+      {DynamicSupervisor, name: Gizmo.FactorySupervisor, strategy: :one_for_one},
+      {Gizmo.Services.Factory, "factory"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -2358,6 +2550,23 @@ defmodule Gizmo.Agent do
       NaiveDateTime, Calendar, Access, Base, URI, :math, :lists, :maps,
       :string, :binary, :calendar, :rand, :unicode, :re.
       All other modules are rejected at parse time.
+
+    - factory: Create custom stateful services at runtime. Provide an arity-2
+      handler function as a code string plus optional initial state, and the
+      factory compiles it and wraps it in a GenServer with its own mailbox.
+      Handler contract: fn(msg :: map, state :: any) -> {reply :: map | nil, new_state :: any}
+      - msg: decoded JSON map from sender
+      - state: service's current state (initialized from "state" field, default %{})
+      - Returns {reply, new_state}; reply is routed to sender; nil = no reply
+      Create:  {"op": "send", "mailbox": "factory", "msg": {"action": "create", "name": "<name>", "code": "fn msg, state -> ... end", "state": <init>}}
+      Response: {"text": "ok", "name": "<name>"}
+      Destroy: {"op": "send", "mailbox": "factory", "msg": {"action": "destroy", "name": "<name>"}}
+      Response: {"text": "ok", "name": "<name>"}
+      List:    {"op": "send", "mailbox": "factory", "msg": {"action": "list"}}
+      Response: {"text": "services: a, b", "services": ["a", "b"]}
+      The created service registers directly as mailbox "<name>". Send to it
+      like any other service. Handler exceptions are caught — the worker
+      sends an error reply without crashing.
 
     ## Message-driven model
 
@@ -6832,6 +7041,193 @@ defmodule Gizmo.CLI do
     )
 
     Gizmo.Mailbox.unregister(eval_recv)
+
+    IO.puts("")
+
+    # 19. Factory tests
+    IO.puts("--- Factory ---")
+
+    factory_recv = Gizmo.Mailbox.generate_id("factory_recv")
+    Gizmo.Mailbox.register(factory_recv)
+
+    # Test 1: Create counter service
+    Gizmo.Mailbox.route("factory", {factory_recv, %{
+      "action" => "create",
+      "name" => "counter",
+      "code" => "fn msg, state -> case msg[\"action\"] do \"inc\" -> {%{\"text\" => \"ok\", \"count\" => state + 1}, state + 1}; \"get\" -> {%{\"text\" => \"count: \#{state}\", \"count\" => state}, state}; _ -> {%{\"text\" => \"error: unknown\", \"error\" => \"unknown\"}, state} end end",
+      "state" => 0
+    }})
+
+    factory_r1 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: create counter", factory_r1["text"], "ok")
+    failures = failures ++ assert_eq("factory: create counter name", factory_r1["name"], "counter")
+
+    # Test 2: Send inc to counter
+    Gizmo.Mailbox.route("counter", {factory_recv, %{"action" => "inc"}})
+
+    factory_r2 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"counter", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: inc count", factory_r2["count"], 1)
+
+    # Test 3: Send get to counter
+    Gizmo.Mailbox.route("counter", {factory_recv, %{"action" => "get"}})
+
+    factory_r3 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"counter", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: get count", factory_r3["count"], 1)
+
+    # Test 4: List services
+    Gizmo.Mailbox.route("factory", {factory_recv, %{"action" => "list"}})
+
+    factory_r4 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: list has counter", Enum.member?(factory_r4["services"], "counter"), true)
+
+    # Test 5: Destroy counter
+    Gizmo.Mailbox.route("factory", {factory_recv, %{"action" => "destroy", "name" => "counter"}})
+
+    factory_r5 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: destroy ok", factory_r5["text"], "ok")
+
+    # Test 6: List after destroy — should be empty
+    Gizmo.Mailbox.route("factory", {factory_recv, %{"action" => "list"}})
+
+    factory_r6 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: list empty after destroy", factory_r6["services"], [])
+
+    # Test 7: Bad code — not a function
+    Gizmo.Mailbox.route("factory", {factory_recv, %{
+      "action" => "create",
+      "name" => "bad1",
+      "code" => "42"
+    }})
+
+    factory_r7 =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: bad code error", factory_r7["error"], "compile_error")
+
+    # Test 8: Duplicate name
+    Gizmo.Mailbox.route("factory", {factory_recv, %{
+      "action" => "create",
+      "name" => "dup_test",
+      "code" => "fn _msg, state -> {%{\"text\" => \"ok\"}, state} end"
+    }})
+
+    _factory_r8a =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    Gizmo.Mailbox.route("factory", {factory_recv, %{
+      "action" => "create",
+      "name" => "dup_test",
+      "code" => "fn _msg, state -> {%{\"text\" => \"ok\"}, state} end"
+    }})
+
+    factory_r8b =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: duplicate name error", factory_r8b["error"], "already_exists")
+
+    # Clean up dup_test
+    Gizmo.Mailbox.route("factory", {factory_recv, %{"action" => "destroy", "name" => "dup_test"}})
+    receive do
+      {:mailbox_msg, ^factory_recv, {"factory", _msg}} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    # Test 9: Handler that raises — worker survives
+    Gizmo.Mailbox.route("factory", {factory_recv, %{
+      "action" => "create",
+      "name" => "raiser",
+      "code" => "fn msg, state -> if msg[\"action\"] == \"raise\", do: raise(\"boom\"), else: {%{\"text\" => \"ok\", \"state\" => state}, state} end"
+    }})
+
+    _factory_r9a =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"factory", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    # Send a message that triggers the raise
+    Gizmo.Mailbox.route("raiser", {factory_recv, %{"action" => "raise"}})
+
+    factory_r9b =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"raiser", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: handler raise returns error", factory_r9b["error"], "handler_error")
+
+    # Worker should still be alive — send a normal message
+    Gizmo.Mailbox.route("raiser", {factory_recv, %{"action" => "ping"}})
+
+    factory_r9c =
+      receive do
+        {:mailbox_msg, ^factory_recv, {"raiser", msg}} -> msg
+      after
+        10_000 -> :timeout
+      end
+
+    failures = failures ++ assert_eq("factory: worker survived raise", factory_r9c["text"], "ok")
+
+    # Clean up raiser
+    Gizmo.Mailbox.route("factory", {factory_recv, %{"action" => "destroy", "name" => "raiser"}})
+    receive do
+      {:mailbox_msg, ^factory_recv, {"factory", _msg}} -> :ok
+    after
+      10_000 -> :timeout
+    end
+
+    Gizmo.Mailbox.unregister(factory_recv)
 
     IO.puts("")
 

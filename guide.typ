@@ -948,6 +948,39 @@ Only allowlisted modules may be used. The allowed Elixir modules are `Kernel`, `
 
 The sandbox is advisory---it can't catch `apply/3` with a variable module or `Module.concat` evasion. But since the agent already has access to `bash`, the eval service is a convenience for common operations, not a security boundary.
 
+=== `factory` --- Custom Service Factory
+
+*Mailbox:* `"factory"`
+
+The factory service lets agents create custom stateful services at runtime. You provide an arity-2 handler function as a code string plus optional initial state, and the factory compiles it and wraps it in a GenServer with its own mailbox.
+
+*Handler contract:* `fn(msg :: map, state :: any) -> {reply :: map | nil, new_state :: any}`
+
+- `msg`: decoded JSON map from the sender
+- `state`: service's current state (initialized from the `"state"` field, default `%{}`)
+- Returns `{reply, new_state}` --- reply is routed to sender; `nil` means no reply
+
+Create a service:
+
+```json
+{"op": "send", "mailbox": "factory", "msg": {"action": "create", "name": "counter", "code": "fn msg, state -> case msg[\"action\"] do \"inc\" -> {%{\"text\" => \"ok\", \"count\" => state + 1}, state + 1} _ -> {nil, state} end end", "state": 0}}
+```
+
+The created service registers directly as mailbox `"counter"` --- send to it like any other service:
+
+```json
+{"op": "send", "mailbox": "counter", "msg": {"action": "inc"}}
+```
+
+Destroy and list:
+
+```json
+{"op": "send", "mailbox": "factory", "msg": {"action": "destroy", "name": "counter"}}
+{"op": "send", "mailbox": "factory", "msg": {"action": "list"}}
+```
+
+Handler exceptions are caught --- the worker sends an error reply without crashing, so subsequent messages still work. No AST sandboxing is applied (agents already have bash access). The handler code is compiled in an isolated process with a 5-second timeout.
+
 == Worked Execution Cycle
 
 Let's trace through a concrete two-cycle agent that runs `uname -a` and reports the result. The boot frame is:
@@ -2515,6 +2548,7 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   [`pager`], [`{"action": "open", "path": "..."}`], [`{"text": "opened:sid:N lines", ...}`], [Spawns session: `next`/`prev`/`search`/`goto`/`close`],
   [`batch`], [`{"requests": [...], "timeout": N}`], [`{"text": "batch complete: N/M", "results": [...]}`], [Fan-out parallel requests, collect all results],
   [`eval`], [`{"code": "...", "timeout": N}`], [`{"text": "result", "type": "..."}`], [Evaluate Elixir expression with AST sandboxing],
+  [`factory`], [`{"action": "create/destroy/list", ...}`], [`{"text": "ok", "name": "..."}`], [Create custom stateful services. Workers get own mailbox.],
 )
 
 == CLI Flags

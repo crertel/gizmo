@@ -239,6 +239,20 @@ Two new well-known services for agent productivity.
 - [x] Runtime prompt: `batch` and `eval` docs in well-known mailboxes section
 - [x] Smoke tests: batch (parallel, partial failure, invalid) and eval (arithmetic, string, enum, forbidden modules, syntax/runtime/timeout errors)
 
+## Stage 17: Factory Service
+
+User-defined stateful services created at runtime via the `"factory"` mailbox.
+
+- [x] `Gizmo.Services.Factory` — well-known service on `"factory"` mailbox; accepts create/destroy/list commands
+- [x] `Gizmo.Services.FactoryWorker` — generic GenServer wrapper for user-defined arity-2 handler functions
+- [x] `Gizmo.FactorySupervisor` — `DynamicSupervisor` for factory-spawned workers (`:one_for_one`)
+- [x] Supervision tree: `FactorySupervisor` + `Factory` added to `Gizmo.Supervision` children
+- [x] Worker lifecycle: create compiles handler code, registers mailbox; destroy terminates child, deregisters
+- [x] Worker death monitoring: factory watches workers, cleans up on unexpected exit
+- [x] Runtime prompt: `factory` docs in well-known mailboxes section (create/destroy/list protocol)
+- [x] Smoke tests: create worker, send message, destroy, list, duplicate name rejection, destroy nonexistent
+- [x] Test frame: `test/15_factory.txt` — counter service demo (create, increment, read, destroy)
+
 ## Deferred / Future
 
 These are explicitly out of scope for the initial build but noted for later:

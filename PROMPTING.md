@@ -915,6 +915,45 @@ Use `eval` for math (`1 + 2 * 3`), Enum/Map/String operations
 (`String.upcase("hello")`), and data transformations. For shell commands, use
 `bash` instead.
 
+### factory
+
+Create custom stateful services at runtime. Provide an arity-2 handler
+function as a code string plus optional initial state. The factory compiles
+it and wraps it in a GenServer with its own mailbox.
+
+**Handler contract:** `fn(msg :: map, state :: any) -> {reply :: map | nil, new_state :: any}`
+
+- `msg`: decoded JSON map from the sender
+- `state`: service's current state (initialized from `"state"` field, default `%{}`)
+- Returns `{reply, new_state}` — reply is routed to sender; `nil` = no reply
+
+Create a service:
+
+```json
+{"op": "send", "mailbox": "factory", "msg": {"action": "create", "name": "counter", "code": "fn msg, state -> case msg[\"action\"] do \"inc\" -> {%{\"text\" => \"ok\", \"count\" => state + 1}, state + 1} _ -> {nil, state} end end", "state": 0}}
+```
+
+Response: `{"text": "ok", "name": "counter"}`. The created service registers
+directly as mailbox `"counter"` — send to it like any other service.
+
+Destroy a service:
+
+```json
+{"op": "send", "mailbox": "factory", "msg": {"action": "destroy", "name": "counter"}}
+```
+
+List active services:
+
+```json
+{"op": "send", "mailbox": "factory", "msg": {"action": "list"}}
+```
+
+Response: `{"text": "services: counter, cache", "services": ["cache", "counter"]}`
+
+Handler exceptions are caught — the worker sends an error reply without
+crashing, so subsequent messages still work. No AST sandboxing is applied
+(agents already have bash access).
+
 ## CLI flags
 
 | Flag | Effect |
