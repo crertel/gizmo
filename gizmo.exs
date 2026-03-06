@@ -492,7 +492,7 @@ defmodule Gizmo.LLM.Anthropic do
     api_key = System.get_env("ANTHROPIC_API_KEY") || raise "ANTHROPIC_API_KEY not set"
     model = Keyword.get(opts, :model, System.get_env("ANTHROPIC_MODEL") || @default_model)
     thinking = Keyword.get(opts, :thinking, false)
-    max_tokens = Keyword.get(opts, :max_tokens, if(thinking, do: 16_000, else: 4096))
+    max_tokens = Keyword.get(opts, :max_tokens, if(thinking, do: 16_000, else: 16_384))
 
     body = %{
       model: model,
@@ -597,7 +597,7 @@ defmodule Gizmo.LLM.OpenAI do
     api_key = System.get_env("OPENAI_API_KEY") || raise "OPENAI_API_KEY not set"
     base_url = System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1"
     model = Keyword.get(opts, :model, System.get_env("OPENAI_MODEL") || @default_model)
-    max_tokens = Keyword.get(opts, :max_tokens, 4096)
+    max_tokens = Keyword.get(opts, :max_tokens, 16_384)
 
     eval_schema = Gizmo.LLM.eval_tool().input_schema
 

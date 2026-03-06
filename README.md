@@ -166,6 +166,7 @@ test/                  # Example boot frames
   13_eval.txt          # Eval calculator (math assistant)
   14_batch.txt         # Batch system profiler (parallel info gathering)
   15_factory.txt       # Factory service demo (runtime counter)
+  16_toolmaker.txt     # Chatbot with memory and runtime tool creation
 ARCHITECTURE.md        # Runtime design and process model
 DEVELOPMENT.md         # Development stages and roadmap
 PROMPTING.md           # Guide for writing boot frames
