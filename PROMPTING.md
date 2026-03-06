@@ -579,6 +579,129 @@ section.
 The idle+trap pattern is simpler when you want tight parent control
 over the child's pacing and don't want to handle stale messages.
 
+### Batch recon (parallel information gathering)
+
+When an agent needs multiple pieces of information before it can reason about
+its next step, use the `batch` service to fire all requests in a single cycle
+instead of one-per-cycle. This is especially valuable for initial orientation
+where the agent doesn't know what it's working with yet.
+
+```
+@@init
+Greet the human. Send a batch of recon commands to get your bearings:
+  Send to 'batch': {"requests": [
+    {"mailbox": "bash", "msg": {"command": "uname -a"}},
+    {"mailbox": "bash", "msg": {"command": "cat /etc/os-release"}},
+    {"mailbox": "bash", "msg": {"command": "ls /"}},
+    {"mailbox": "bash", "msg": {"command": "df -h /"}},
+    {"mailbox": "bash", "msg": {"command": "whoami"}}
+  ]}
+Return frames: ["@orient"].
+Do NOT issue a receive op.
+@@end
+
+@@orient
+STEP: Recon results arrived. ${_msg} from ${_msg_source}.
+Full results in ${_payload} as JSON with a "results" array.
+Parse the results. Share discoveries with human. Decide next steps.
+...
+@@end
+```
+
+Five bash commands, one cycle. Without batch this would cost 5 cycles
+(~10-15s of LLM latency). With batch it's 1 cycle plus the wall-clock
+time of the slowest bash command.
+
+### Factory retry loop (deploy section)
+
+When creating factory tools, compilation errors are common — missing `end`
+keywords, wrong map syntax (`{"k", v}` instead of `%{"k" => v}`), or
+missing semicolons between case clauses. Use a self-referencing deploy
+section that retries on error and proceeds on success.
+
+```
+@@deploy
+STEP: Factory replied: ${_msg} from ${_msg_source}.
+
+If ${_msg} starts with "error:" — read the error, fix the code, send a
+corrected create to 'factory' with name "<tool_name>".
+Return frames: ["@deploy"].
+
+If ${_msg} does NOT start with "error:" — tool is ready! Proceed to use it.
+Return frames: ["@next-step"].
+Do NOT issue a receive op.
+@@end
+```
+
+The `@deploy` frame loops on itself until the factory accepts the code.
+On success, it transitions forward. This pattern is proven across tests
+15, 18, 19, and 20 — LLMs reliably fix their own compilation errors
+within 1-2 retries when they can see the error message in `${_msg}`.
+
+### "STEP:" prefix for multi-section orientation
+
+In boot frames with many sections, the LLM sees the full boot text (with
+all `@@section` definitions) plus the current frame on every cycle. The
+`STEP:` prefix at the start of each section helps the LLM quickly identify
+which phase it's in and what context is available.
+
+```
+@@orient
+STEP: Orientation. Recon results arrived. ${_msg} from ${_msg_source}.
+...
+@@end
+
+@@deploy
+STEP: Tool deployment. Factory replied: ${_msg} from ${_msg_source}.
+...
+@@end
+
+@@explore
+STEP: Exploration. Results arrived: ${_msg} from ${_msg_source}.
+...
+@@end
+```
+
+The pattern is: `STEP: <phase name>. <what just happened>. <key bindings>.`
+This gives the LLM three orientation cues in the first line: where it is,
+what triggered this cycle, and where to find the data.
+
+### Autonomous infinite loop (explore/deploy cycle)
+
+For agents that run indefinitely — exploring, building tools, following
+curiosity — use a two-section loop between an exploration phase and a
+deployment phase. The agent never returns empty frames and never terminates.
+
+```
+@@deploy
+STEP: Factory replied: ${_msg} from ${_msg_source}.
+Error → fix code, resend, return ["@deploy"].
+Success → test the tool, return ["@explore"].
+@@end
+
+@@explore
+STEP: Results arrived: ${_msg} from ${_msg_source}.
+Parse results. Share discoveries. Choose one:
+  - Explore more → send batch/bash, return ["@explore"]
+  - Build new tool → send factory create, return ["@deploy"]
+  - Replace tool → send destroy + create, return ["@deploy"]
+You must ALWAYS send at least one request. You NEVER terminate.
+@@end
+```
+
+The key design constraint: **every section must send at least one request
+before transitioning**. In message-driven mode, the agent sleeps until a
+message arrives. If a section transitions without sending anything, no
+response will arrive and the agent hangs forever.
+
+The `@explore` section gives the LLM full creative autonomy over what to
+investigate next. The `@deploy` section is mechanical (retry or proceed).
+This separation keeps the creative decisions in one place and the error
+handling in another.
+
+Use `--max-cycles 0` to disable the cycle limit for infinite agents.
+See `test/20_curious_explorer.txt` for a complete example.
+
 ## Common pitfalls
 
 ### 1. Using `${_msg}` to reference a response that hasn't arrived yet

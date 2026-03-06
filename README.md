@@ -167,6 +167,10 @@ test/                  # Example boot frames
   14_batch.txt         # Batch system profiler (parallel info gathering)
   15_factory.txt       # Factory service demo (runtime counter)
   16_toolmaker.txt     # Chatbot with memory and runtime tool creation
+  17_animal_research.txt # Single-agent Wikipedia animal research
+  18_animal_expedition.txt # Multi-child expedition with factory wiki tool
+  19_contemplative_agent.txt # 7-cycle lifecycle: create, explore, reflect, exit
+  20_curious_explorer.txt # Autonomous infinite explorer (VM, runs until killed)
 ARCHITECTURE.md        # Runtime design and process model
 DEVELOPMENT.md         # Development stages and roadmap
 PROMPTING.md           # Guide for writing boot frames
