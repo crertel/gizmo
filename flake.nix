@@ -1,6 +1,10 @@
 {
   description = "Gizmo — minimal LLM agent runtime";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
   outputs =
     { self, nixpkgs, ... }:
     let
@@ -48,5 +52,25 @@
         shellExitHook = ''
         '';
       };
+
+      # ── QEMU VM for sandboxed agent execution ──────────────────────────
+      nixosConfigurations.gizmo-vm = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+          ./vm/configuration.nix
+        ];
+      };
+
+      packages."${system}".gizmo-vm =
+        let
+          vm = self.nixosConfigurations.gizmo-vm.config.system.build.vm;
+          wrapperSrc = builtins.readFile ./vm/gizmo-vm;
+          substituted = builtins.replaceStrings
+            [ "@VM_PATH@" ]
+            [ "${vm}" ]
+            wrapperSrc;
+        in
+        pkgs.writeShellScriptBin "gizmo-vm" substituted;
     };
 }

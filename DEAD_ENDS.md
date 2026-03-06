@@ -2,6 +2,57 @@
 
 Things we tried that didn't work, and why we moved away from them.
 
+## Firecracker microVM for Agent Sandboxing
+
+**Introduced:** `eed56b7` (VM isolation spike)
+**Replaced:** QEMU via NixOS `qemu-vm.nix`
+
+The first attempt at VM isolation used Firecracker microVMs via the
+`microvm.nix` flake. The VM config used `storeDiskType = "erofs"` for
+a read-only Nix store, an ext4 data volume for boot frames and Mix
+cache, a TAP interface with host-side NAT for outbound networking, and
+Firecracker's serial console for output.
+
+### Why it didn't work
+
+- **Required `sudo` for everything.** TAP interface creation (`ip tuntap add`),
+  NAT rules (`iptables -t nat`), IP forwarding (`sysctl`), and the ext4 data
+  volume (`mount -o loop`) all required root. The wrapper script was ~138 lines,
+  most of it privilege escalation and cleanup.
+- **ext4 image lifecycle was fragile.** The host had to `truncate`, `mkfs.ext4`,
+  `mount -o loop`, populate with `sudo cp`/`sudo tee`, `umount`, then pass the
+  image path to Firecracker. Any failure in this chain (stale mount, missing
+  cleanup) left the host in a dirty state.
+- **TAP interface cleanup was unreliable.** The EXIT trap had to check whether
+  the TAP device existed, delete it with `sudo ip link delete`, and handle cases
+  where it was already gone. Ctrl-C during setup could leave orphaned interfaces
+  and iptables rules.
+- **No ACPI poweroff.** Firecracker doesn't support ACPI. The guest had to use
+  `reboot -f` (hard reboot) to signal exit, which Firecracker translates to VM
+  termination. This is a non-graceful shutdown — no opportunity to flush buffers
+  or sync filesystems.
+- **Serial console issues.** Firecracker's serial console handling required
+  `2>/dev/null` on the runner to suppress binary noise, and output interleaving
+  between the guest's systemd and the agent's stdout was hard to control.
+- **SIGINT handling was awkward.** The wrapper had to background the VM process,
+  trap INT/TERM to kill it, then wait — but Firecracker's signal propagation to
+  the guest was inconsistent, sometimes leaving zombie processes.
+
+### What replaced it
+
+QEMU via NixOS's built-in `qemu-vm.nix` module, which eliminates every issue:
+
+- **No sudo.** SLiRP user-mode networking provides outbound NAT without TAP
+  interfaces or iptables rules. 9p virtfs shares directories without ext4 images
+  or mount commands.
+- **ACPI poweroff works.** The guest runs `poweroff` and QEMU exits cleanly.
+  Combined with `-no-reboot`, the host gets a clean exit code.
+- **Battle-tested serial console.** `-nographic` with `console=ttyS0` just works.
+- **~30 line wrapper** (down from ~138). Create tmpdir, copy frames, write .env,
+  set `SHARED_DIR`, run `run-gizmo-vm-vm`. No cleanup beyond `rm -rf $tmpdir`.
+- **Trade-off: boot time.** QEMU boots in ~2-8s vs Firecracker's ~125ms. This is
+  acceptable because LLM API calls dominate runtime (2-5s per cycle).
+
 ## Positional Args Stack (`$1`, `$2`, ...)
 
 **Introduced:** `ccf67f0` (Stage 5: Well-known services)

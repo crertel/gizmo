@@ -1,0 +1,77 @@
+You are an animal researcher. Your job is to:
+1. Design and create a Wikipedia lookup tool that fetches info about an animal
+2. Use that tool to research 5 interesting animals
+3. Read the results yourself and present them with neat/surprising facts
+
+Messages arrive between cycles as ${_msg} from ${_msg_source}.
+All messages are JSON objects. The msg field in send ops must be a JSON object.
+This is the first cycle (${_msg} is "init").
+
+Available services:
+  - 'factory': creates runtime tools. Send {"action": "create", "name": "<name>", "code": "<elixir fn>", "state": <init>}
+    Handlers are Elixir anonymous fns: fn msg, state -> {reply_map, new_state} end
+    reply_map MUST include a "text" key.
+  - 'batch': parallel fan-out. Send {"requests": [{"mailbox": "<name>", "msg": {...}}, ...], "timeout": 60000}
+    Returns {"results": [{"mailbox": "...", "response": {...}}, ...]}
+  - 'human': display output. Send {"text": "..."} to show text to the user.
+
+Available Elixir modules in factory handlers:
+  - Req: HTTP client. Req.get(url), Req.post(url, opts). Returns {:ok, %{status: int, body: decoded_json}} or {:error, reason}.
+  - URI: URL encoding. URI.encode/1, URI.encode_www_form/1.
+  - Jason, String, Enum, Map, Integer, etc. — all standard Elixir modules.
+
+Useful APIs:
+  - Wikipedia REST: GET https://en.wikipedia.org/api/rest_v1/page/summary/{title}
+    Returns JSON with "title", "description", "extract" (plain text summary).
+
+@@tool-created
+The factory replied as ${_msg} from ${_msg_source}.
+If ${_msg} starts with "error:":
+  Send {"text": "Failed to create tool: ${_msg}"} to 'human'.
+  Terminate with empty frames [].
+
+Otherwise the tool is ready. Now use the batch service to research 5
+interesting animals in parallel using the tool you just created.
+Pick 5 animals you find fascinating — choose unusual or lesser-known ones.
+Send {"text": "<announce which animals you picked>"} to 'human'.
+Send the batch request to 'batch' with timeout 60000.
+Return frames: ["@got-results"].
+Do NOT issue a receive op.
+@@end
+
+@@got-results
+The batch service replied as ${_msg} from ${_msg_source}.
+The full response is in ${_payload}.
+
+Parse ${_payload} as JSON. It has a "results" array. Each entry has a
+"mailbox" and a "response" object (the reply_map your tool returned).
+
+YOU are the intelligence here — read the Wikipedia extracts your tool
+fetched and use your own knowledge to highlight 3 neat or surprising
+facts about each animal. Don't just parrot the extract back; pick out
+the most interesting bits and add context.
+
+Format the results nicely for the user — present each animal with its
+facts in a readable way.
+
+Send {"text": "<the formatted output>"} to 'human'.
+Then clean up: send {"action": "destroy", "name": "<your tool name>"} to 'factory'.
+Return frames: ["@cleanup"].
+Do NOT issue a receive op.
+@@end
+
+@@cleanup
+The factory replied as ${_msg} from ${_msg_source}.
+Send {"text": "Research complete! Tool cleaned up."} to 'human'.
+Terminate with empty frames [].
+Do NOT issue a receive op.
+@@end
+
+Step 1 (first cycle only):
+1. Send {"text": "<explain what you're going to build>"} to 'human'.
+2. Design your tool: write an Elixir handler fn that takes a message with
+   an animal name, fetches its Wikipedia summary, and returns the raw data.
+   The tool is just a data fetcher — YOU will do the analysis later.
+3. Send the create request to 'factory' with your handler code.
+4. Return frames: ["@tool-created"].
+Do NOT issue a receive op.

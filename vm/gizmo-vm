@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# gizmo-vm — launch a Gizmo agent inside a QEMU VM
+#
+# Usage: gizmo-vm [gizmo-flags] <frame.txt> [more.txt ...]
+#
+# No sudo required. Uses QEMU user-mode networking (SLiRP) and 9p shared dirs.
+
+set -euo pipefail
+
+VM_PATH="@VM_PATH@"
+
+# ── Preflight checks ─────────────────────────────────────────────────────────
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "ERROR: ANTHROPIC_API_KEY environment variable is not set." >&2
+  exit 1
+fi
+
+if [ $# -eq 0 ]; then
+  echo "Usage: gizmo-vm [gizmo-flags] <frame.txt> [more.txt ...]" >&2
+  exit 1
+fi
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+
+gizmo_flags=()
+frame_files=()
+
+for arg in "$@"; do
+  if [[ "$arg" == -* ]]; then
+    gizmo_flags+=("$arg")
+  else
+    if [ ! -f "$arg" ]; then
+      echo "ERROR: frame file not found: $arg" >&2
+      exit 1
+    fi
+    frame_files+=("$(realpath "$arg")")
+  fi
+done
+
+if [ ${#frame_files[@]} -eq 0 ]; then
+  echo "ERROR: no frame files specified." >&2
+  exit 1
+fi
+
+# ── Create tmpdir + cleanup trap ─────────────────────────────────────────────
+
+TMPDIR=$(mktemp -d /tmp/gizmo-vm.XXXXXX)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+mkdir -p "$TMPDIR/frames"
+
+# Copy boot frame files
+for f in "${frame_files[@]}"; do
+  cp "$f" "$TMPDIR/frames/"
+done
+
+# Write env file
+{
+  echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+  if [ ${#gizmo_flags[@]} -gt 0 ]; then
+    echo "GIZMO_FLAGS=${gizmo_flags[*]}"
+  fi
+} > "$TMPDIR/.env"
+chmod 600 "$TMPDIR/.env"
+
+# ── Launch the VM ─────────────────────────────────────────────────────────────
+
+export SHARED_DIR="$TMPDIR"
+
+# Persist the disk image so Mix.install deps survive across runs
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gizmo-vm"
+mkdir -p "$CACHE_DIR"
+export NIX_DISK_IMAGE="$CACHE_DIR/gizmo-vm.qcow2"
+
+"$VM_PATH/bin/run-gizmo-vm-vm"
