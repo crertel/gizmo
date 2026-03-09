@@ -120,6 +120,11 @@ in
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
   # ── Misc ──────────────────────────────────────────────────────────────────
+  # The agent runs as root inside the VM. This is intentional — the VM is the
+  # security boundary (SLiRP networking, no host FS beyond 9p tmpdir). Root
+  # inside the VM lets agents nixos-rebuild, install packages, bind ports, etc.
+  # without privilege escalation surprises. The worst case is a trashed VM
+  # that gets rm -rf'd on exit.
   users.users.root.password = "";
   system.stateVersion = "24.11";
 }
