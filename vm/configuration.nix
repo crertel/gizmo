@@ -24,6 +24,11 @@ let
     cp /etc/gizmo/gizmo.exs ${gizmoScript}
     chmod 644 ${gizmoScript}
 
+    # Set up source tree if shared by host (for nix-shell / nix build inside VM)
+    if [ -d /tmp/shared/src ]; then
+      ln -sfn /tmp/shared/src /var/lib/gizmo/src
+    fi
+
     # Start EPMD (needed for Erlang distribution / migration)
     ${beamPkgs.erlang}/bin/epmd -daemon || true
 
@@ -58,8 +63,8 @@ in
   # ── QEMU virtualisation settings ──────────────────────────────────────────
   virtualisation.graphics = false;
   virtualisation.cores = 2;
-  virtualisation.memorySize = 1024;
-  virtualisation.diskSize = 512;
+  virtualisation.memorySize = 2048;
+  virtualisation.diskSize = 4096;
   virtualisation.qemu.options = [ "-no-reboot" ];
 
   # ── Networking (SLiRP user-mode, no sudo/TAP needed) ──────────────────────
@@ -110,6 +115,9 @@ in
       WorkingDirectory = "/tmp/shared";
     };
   };
+
+  # ── Nix tooling inside the VM ────────────────────────────────────────────
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
   # ── Misc ──────────────────────────────────────────────────────────────────
   users.users.root.password = "";

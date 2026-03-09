@@ -75,6 +75,21 @@ for f in "${frame_files[@]}"; do
   cp "$f" "$TMPDIR/frames/"
 done
 
+# Copy gizmo source tree (for nix builds inside the VM)
+# Look for flake.nix in cwd or GIZMO_SRC env var
+GIZMO_SRC="${GIZMO_SRC:-$PWD}"
+if [ -f "$GIZMO_SRC/flake.nix" ]; then
+  mkdir -p "$TMPDIR/src/vm"
+  cp "$GIZMO_SRC/flake.nix" "$TMPDIR/src/"
+  [ -f "$GIZMO_SRC/flake.lock" ] && cp "$GIZMO_SRC/flake.lock" "$TMPDIR/src/"
+  cp "$GIZMO_SRC/gizmo.exs" "$TMPDIR/src/"
+  cp "$GIZMO_SRC/vm/configuration.nix" "$TMPDIR/src/vm/"
+  # Copy test frames if present
+  if [ -d "$GIZMO_SRC/test" ]; then
+    cp -r "$GIZMO_SRC/test" "$TMPDIR/src/test"
+  fi
+fi
+
 # Write env file
 {
   echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
