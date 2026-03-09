@@ -12,6 +12,9 @@ let
   runAgentScript = pkgs.writeShellScript "run-agent.sh" ''
     set -euo pipefail
 
+    # Add system packages to PATH (systemd services get a minimal PATH by default)
+    export PATH="/run/current-system/sw/bin:$PATH"
+
     # Source API key + optional flags from shared directory
     if [ -f /tmp/shared/.env ]; then
       set -a
@@ -66,10 +69,15 @@ in
   virtualisation.memorySize = 2048;
   virtualisation.diskSize = 4096;
   virtualisation.qemu.options = [ "-no-reboot" ];
+  virtualisation.forwardPorts = [
+    { from = "host"; host.port = 8080; guest.port = 8080; }
+    { from = "host"; host.port = 2525; guest.port = 25; }
+  ];
 
   # ── Networking (SLiRP user-mode, no sudo/TAP needed) ──────────────────────
   networking.hostName = "gizmo-vm";
   networking.useDHCP = true;
+  networking.firewall.allowedTCPPorts = [ 25 8080 ];
 
   # Suppress boot noise — only gizmo output on serial console
   boot.kernelParams = [ "quiet" "loglevel=3" ];
@@ -85,6 +93,7 @@ in
     vim
     git
     tmux
+    python3
   ];
 
   # Bake gizmo.exs into the store image
@@ -118,6 +127,24 @@ in
 
   # ── Nix tooling inside the VM ────────────────────────────────────────────
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
+
+  # Seed /etc/nixos/configuration.nix so agents can nixos-rebuild switch.
+  # The copy is mutable — agents can edit it and rebuild the system.
+  system.activationScripts.seed-nixos-config = let
+    seedConfig = pkgs.writeText "seed-configuration.nix" (
+      builtins.replaceStrings
+        [ "../gizmo.exs" ]
+        [ "/etc/gizmo/gizmo.exs" ]
+        (builtins.readFile ./configuration.nix)
+    );
+  in ''
+    mkdir -p /etc/nixos
+    if [ ! -f /etc/nixos/configuration.nix ]; then
+      cp ${seedConfig} /etc/nixos/configuration.nix
+      chmod 644 /etc/nixos/configuration.nix
+    fi
+  '';
 
   # ── Misc ──────────────────────────────────────────────────────────────────
   # The agent runs as root inside the VM. This is intentional — the VM is the
