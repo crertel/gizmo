@@ -253,6 +253,26 @@ User-defined stateful services created at runtime via the `"factory"` mailbox.
 - [x] Smoke tests: create worker, send message, destroy, list, duplicate name rejection, destroy nonexistent
 - [x] Test frame: `test/15_factory.txt` — counter service demo (create, increment, read, destroy)
 
+## Stage 18: Live Runtime Migration
+
+Blue-green deployment via Erlang distribution. An agent can snapshot all
+runtime state, spawn a new BEAM, transfer state, and shut down the old node.
+
+- [x] `--node` and `--cookie` CLI flags for Erlang distribution
+- [x] `Node.start/2` in `setup_runtime/1` (short names or long names based on presence of `.`)
+- [x] `chat_config` stored in agent state (backend, model, thinking) for serialization
+- [x] `Gizmo.Migration.Snapshot` module — serialize/deserialize agents and services
+- [x] Service snapshot callbacks: Blackboard (`:snapshot` / `{:restore, data}`), Watchdog, Factory (worker code + user_state), Bash (counter only — ports aren't migratable), MessagesQueue
+- [x] Agent pause protocol: `{:migration_pause, reply_to, ref}` checked at top of `eval_loop_inner` and in `maybe_wait_for_message`
+- [x] `Gizmo.Services.Migration` — `"migration"` mailbox, orchestrates outbound migration via `:peer`
+- [x] `--accept-migration` CLI flag for inbound migration (starts supervision tree, waits for snapshot)
+- [x] Blackboard restore: `handle_call({:restore, %{store: new_store}}, ...)`
+- [x] Agent restore-mode startup: `eval_loop_restored/3` entry point, re-inject drained messages
+- [x] Post-migration "migration complete" message to restored agents
+- [x] Context stack frame labeling: `>>> CURRENT FRAME <<<` / `--- QUEUED FRAME N ---` (needed for reliable multi-frame prompts discovered during migration testing)
+- [x] Test frame: `test/21_migration.txt` — writes to blackboard, triggers migration, verifies data survived on new node
+- [x] QEMU VM integration: test runs via `gizmo-vm` wrapper with `--node` and `--cookie`
+
 ## Deferred / Future
 
 These are explicitly out of scope for the initial build but noted for later:

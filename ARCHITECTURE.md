@@ -77,6 +77,7 @@ by `Gizmo.Supervision`. They are not syscalls.
 | **batch** | `"batch"` | Fan-out parallel requests. `{"requests": [...], "timeout": N}` → collects all results. |
 | **eval** | `"eval"` | Evaluate Elixir expressions. `{"code": "...", "timeout": N}` with AST allowlist sandboxing. |
 | **factory** | `"factory"` | Create custom stateful services at runtime. `{"action": "create", "name": "...", "code": "fn msg, state -> ... end", "state": init}`. Workers register as their own mailbox. |
+| **migration** | `"migration"` | Live runtime migration. `{"action": "migrate", "script": "/path/to/gizmo.exs"}` snapshots all agents and services, spawns a new BEAM via `:peer`, transfers state, and shuts down the old node. Requires `--node` and `--cookie`. |
 
 Per-agent state (not well-known, created per agent instance):
 
@@ -218,6 +219,7 @@ Gizmo.Supervision (one_for_one)
 │   ├── FactoryWorker (:temporary)
 │   └── ...
 ├── Gizmo.Services.Factory ("factory")
+├── Gizmo.Services.Migration ("migration")
 └── Gizmo.AgentSupervisor (DynamicSupervisor)
     ├── Agent via Wrapper (:temporary)
     ├── Agent via Wrapper (:temporary)

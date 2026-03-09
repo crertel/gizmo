@@ -579,6 +579,81 @@ section.
 The idle+trap pattern is simpler when you want tight parent control
 over the child's pacing and don't want to handle stale messages.
 
+### Context stack (multi-frame peeling)
+
+When a task has a known sequence of steps, return the entire plan as a
+multi-frame context stack. The LLM follows frame 0, drops it, and the
+remaining frames become the new stack. Each frame peels off one step.
+
+```
+@@step-a
+STEP: step-a. Bash result arrived: ${_msg}.
+Save the result to blackboard.
+1. Send {"action": "write", "key": "result", "value": "${_msg}"} to 'blackboard'.
+2. Return the remaining context stack (drop this frame, keep the rest).
+Do NOT issue a receive op.
+@@end
+
+@@step-b
+STEP: step-b. Blackboard confirmed: ${_msg}.
+Read back the result.
+1. Send {"action": "read", "key": "result"} to 'blackboard'.
+2. Return the remaining context stack (drop this frame, keep the rest).
+Do NOT issue a receive op.
+@@end
+
+@@first-cycle
+STEP: first-cycle. This is cycle 1.
+1. Send {"command": "uname -a"} to 'bash'.
+2. Return frames: ["@step-a", "@step-b"].
+Do NOT issue a receive op.
+@@end
+
+On the FIRST cycle only (${_msg} is "init"), follow @@first-cycle above.
+```
+
+Cycle 1: Run bash command, return `["@step-a", "@step-b"]`.
+Cycle 2 (2 frames): `@step-a` is the current frame — write to blackboard,
+drop `@step-a`, return `["@step-b"]`.
+Cycle 3 (1 frame): `@step-b` is the current frame — read from blackboard,
+return `[]`, terminate.
+
+The runtime labels frame 0 as `>>> CURRENT FRAME <<<` and subsequent frames
+as `--- QUEUED FRAME N ---` so the LLM reliably follows only the top frame.
+Without this labeling, the LLM may skip visually similar frames (see
+DEAD_ENDS.md "Unlabeled Multi-Frame Context Stacks").
+
+**Key rules:**
+- Wrap first-cycle-only instructions in a `@@section` so they don't
+  re-execute on subsequent cycles (the boot frame is always visible).
+- Each frame should say "Return the remaining context stack (drop this
+  frame, keep the rest)" — this instruction is more reliable than "drop
+  frame 0 and return frames 1-N."
+- Use `STEP:` prefixes for orientation.
+
+### Fire-and-forget children (wall, logging)
+
+When an agent needs to run a side-effect (like `wall` for terminal
+broadcasts) without polluting its own message flow, spawn a disowned child
+to handle it:
+
+```json
+{"op": "spawn",
+ "frames": ["Send {\"command\": \"wall 'status update'\"} to 'bash'. Terminate with empty frames []."],
+ "dest": "_w", "disown": true, "idle": false}
+```
+
+The child sends the bash command, receives the response in its own mailbox,
+and terminates. The parent never sees the bash response — its `${_msg}` on
+the next cycle is whatever it was actually waiting for (e.g., a blackboard
+response).
+
+**Critical:** Always set `"idle": false` on fire-and-forget children. Without
+it, children inherit the parent's idle mode. If the parent is `--idle`, the
+child's `frames: []` restores its boot frame instead of terminating, causing
+an infinite loop (see DEAD_ENDS.md "Spawned Children Inheriting Parent Idle
+Mode").
+
 ### Batch recon (parallel information gathering)
 
 When an agent needs multiple pieces of information before it can reason about
@@ -1106,6 +1181,9 @@ crashing, so subsequent messages still work. No AST sandboxing is applied
 | `--trace-service` | Include service events in trace (bash, blackboard, watchdog, reaper) |
 | `--trace-messages` | Include message routing events in trace |
 | `--bash-timeout N` | Default bash command timeout in ms (default: 60000, 0 = none) |
+| `--node <name>` | Start Erlang distribution with given node name (e.g., `gizmo@localhost`) |
+| `--cookie <cookie>` | Set Erlang distribution cookie (requires `--node`) |
+| `--accept-migration` | Start in migration-accept mode (wait for incoming state transfer, requires `--node`) |
 
 Extended thinking (`--thinking`) gives the LLM a reasoning budget before
 responding. This can help with complex multi-step tasks where the LLM needs
@@ -1324,3 +1402,29 @@ jq -s '
 ' trace.jsonl
 ```
 across different task files.
+
+### migration
+
+Live runtime migration. Requires `--node` and `--cookie` CLI flags to enable
+Erlang distribution. Send a JSON object with `"action": "migrate"` and the
+path to the gizmo script:
+
+```json
+{"op": "send", "mailbox": "migration", "msg": {"action": "migrate", "script": "/path/to/gizmo.exs"}}
+```
+
+The migration service:
+1. Pauses all running agents (snapshots their state at cycle boundaries)
+2. Snapshots all stateful services (blackboard, watchdog, factory)
+3. Spawns a new BEAM via `:peer` with `--accept-migration`
+4. Transfers the serialized snapshot to the new node
+5. The new node restores all state and sends "migration complete" to agents
+6. The old node shuts down
+
+After migration, the agent continues on the new node. `${_msg}` will
+contain `{"text": "migration complete", "migrated_to": "<new_node>"}`.
+
+**Limitations:**
+- In-flight bash commands are lost (agents waiting on bash get a timeout)
+- Factory workers with closure-based handlers can't migrate (code-string handlers work)
+- Trace file handles are reopened on the new node

@@ -631,3 +631,191 @@ Nothing — the runtime path simply stopped writing to it. The
 `MessagesQueue` module and its GenServer lifecycle are retained because
 the smoke test suite uses `push`/`pop`/`to_list` for unit assertions
 about the module itself.
+
+## Unlabeled Multi-Frame Context Stacks
+
+**Discovered:** Live migration test (`test/21_migration.txt`)
+
+The migration test used a context stack pattern — return multiple frames like
+`["@save-path", "@write-test", "@read-path", "@do-migrate", "@post-migrate"]`
+where the LLM follows frame 0 and drops it each cycle, peeling through the
+stack. Without labeling, the LLM consistently skipped `@write-test` and
+jumped to `@read-path`.
+
+### Why it didn't work
+
+- **Frames were joined with identical `---` separators.** All frames in the
+  context stack were joined with `\n\n---\n\n`. The LLM saw 4-5 resolved
+  frame texts separated by `---` with no indication of which was "current"
+  vs "queued for later."
+- **Visually similar frames confused the LLM.** `@save-path` and
+  `@write-test` both started with `STEP:` and both sent blackboard writes.
+  The LLM read frame 0 (`@write-test`), decided it "already did a
+  blackboard write" based on the previous cycle's context, and jumped to
+  frame 1 (`@read-path`) instead.
+- **Adding `CRITICAL: follow ONLY the first frame` wasn't enough.** Plain
+  text instructions in the boot frame were less salient than the structural
+  ambiguity of identical separators.
+
+### What replaced it
+
+Explicit frame labeling in the runtime. When the context stack has >1 frame,
+frame 0 is prefixed with `>>> CURRENT FRAME (follow ONLY these instructions) <<<`
+and subsequent frames get `--- QUEUED FRAME N of M (do NOT follow yet) ---`.
+This structural marker is unambiguous and the LLM reliably follows frame 0
+without skipping ahead.
+
+## Dual-Send Response Interleaving
+
+**Discovered:** Live migration test (`test/21_migration.txt`)
+
+The migration test agent sent messages to two different services in the same
+cycle — a `wall` command to `bash` and a write to `blackboard`. On the next
+cycle, `${_msg}` would contain whichever response arrived first.
+
+### Why it didn't work
+
+- **Message-driven mode binds `${_msg}` from the first mailbox message.**
+  If the agent sent to both `bash` and `blackboard`, two responses queue up.
+  `maybe_wait_for_message` picks up the first one. If bash responds before
+  blackboard (or vice versa), the next cycle gets the "wrong" `${_msg}`.
+- **The continuation frame assumed a specific sender.** The `@write-test`
+  frame said "Blackboard confirmed path save: ${_msg}" but sometimes
+  `${_msg}` was the bash response (wall output) instead.
+- **Ordering between GenServers is non-deterministic.** Even though `send`
+  ops execute sequentially within the agent, the GenServers process messages
+  independently. The blackboard (a simple map lookup) is faster than bash
+  (Port + shell subprocess), but this depends on system load.
+
+### What replaced it
+
+Spawn a disowned child to handle fire-and-forget operations. Instead of
+sending `wall` to `bash` directly, the agent spawns a one-shot child:
+```json
+{"op": "spawn", "frames": ["Send ... to 'bash'. Terminate with []."],
+ "dest": "_w", "disown": true, "idle": false}
+```
+The child handles the bash response in its own mailbox. The parent only
+receives the blackboard response as `${_msg}`.
+
+## Spawned Children Inheriting Parent Idle Mode
+
+**Discovered:** Live migration test (`test/21_migration.txt`)
+
+Wall-broadcasting children were spawned with `"disown": true` but no
+explicit `"idle"` field. The parent ran with `--idle`. The children returned
+`frames: []` to terminate, but instead of terminating, they restored their
+boot frame and looped forever — flooding every terminal with repeated wall
+messages.
+
+### Why it didn't work
+
+- **Children inherit the parent's `idle` flag by default.** When `idle` is
+  not specified in the spawn op, the child gets the parent's value. The
+  parent had `--idle` (needed for migration wait loops), so children also
+  got idle mode.
+- **`frames: []` in idle mode restores the boot frame.** Instead of
+  terminating, the child's empty frames triggered idle restore. The boot
+  frame said "send wall command to bash, then terminate" — so the child
+  ran the wall command again, returned `[]`, restored, repeated.
+- **Infinite loop at LLM speed.** Each iteration was a full LLM call,
+  producing a new wall broadcast. With 3+ children looping, every terminal
+  in the VM was flooded with repeated messages.
+
+### What replaced it
+
+Explicitly set `"idle": false` on all fire-and-forget children:
+```json
+{"op": "spawn", ..., "disown": true, "idle": false}
+```
+This overrides the parent's idle mode and ensures `frames: []` terminates
+the child. Rule of thumb: one-shot children should always set `idle: false`.
+
+## ERL_FLAGS `+stbt L` for Line-Buffered Stdout
+
+**Discovered:** QEMU VM debugging (`vm/configuration.nix`)
+
+Gizmo output was invisible in `journalctl` because Elixir stdout is fully
+buffered when not connected to a terminal. Attempted to force line-buffered
+output by setting `ERL_FLAGS="+stbt L"` in the NixOS configuration.
+
+### Why it didn't work
+
+- **`+stbt` is a scheduler bind type flag**, not a stdout buffering flag.
+  The `L` value means "bind schedulers to logical processors." It has
+  nothing to do with I/O buffering.
+- **The BEAM crashed on boot.** The flag was technically invalid for its
+  intended purpose and caused a startup error, preventing the VM from
+  booting entirely.
+- **Erlang doesn't have a built-in line-buffered stdout flag.** The BEAM's
+  stdout buffering is determined by the OS (pty = line-buffered, pipe/file
+  = fully buffered). There's no runtime flag to override this.
+
+### What replaced it
+
+Writing important output to stderr (`IO.puts(:stderr, text)`) during
+debugging, since stderr is line-buffered regardless of terminal attachment.
+For production use, the Human service writes to stdout which is fine when
+running interactively. In the VM, running the agent manually in a shell
+(instead of via systemd) gives a proper pty with line-buffered output.
+
+## `.env` Source Without `set -a`
+
+**Discovered:** QEMU VM debugging (`vm/configuration.nix`)
+
+The VM's `run-agent.sh` script sourced the `.env` file to load
+`ANTHROPIC_API_KEY` and `GIZMO_FLAGS`, but the elixir child process
+couldn't see the API key.
+
+### Why it didn't work
+
+- **`source .env` sets shell variables, not environment variables.** In
+  bash, `source` executes the file in the current shell. Lines like
+  `ANTHROPIC_API_KEY=sk-...` create shell variables, which are NOT
+  automatically exported to child processes.
+- **The elixir process is a child process.** `elixir gizmo.exs` is invoked
+  by the shell script. It only sees exported environment variables, not
+  shell-local variables.
+- **`cat .env` showed the key was there.** This was confusing because
+  `cat` reads the file, not the environment. The key was in the file but
+  not in the child process's environment.
+
+### What replaced it
+
+Wrap the source in `set -a` / `set +a`:
+```bash
+set -a          # auto-export all subsequent assignments
+source .env
+set +a          # stop auto-exporting
+```
+`set -a` causes all variable assignments (including those from `source`) to
+be automatically exported to child processes.
+
+## GIZMO_FLAGS Unquoted in `.env` File
+
+**Discovered:** QEMU VM debugging (`vm/gizmo-vm`)
+
+The host wrapper wrote `GIZMO_FLAGS` to the `.env` file without quoting the
+value:
+```bash
+echo "GIZMO_FLAGS=${gizmo_flags[*]}"
+```
+When the guest sourced this file, bash interpreted the flags as commands.
+
+### Why it didn't work
+
+- **The `.env` line expanded to `GIZMO_FLAGS=--node gizmo_src@localhost --cookie test`.**
+  Without quotes around the value, bash treated this as: set `GIZMO_FLAGS`
+  to `--node`, then execute `gizmo_src@localhost` as a command (with
+  `--cookie test` as arguments).
+- **Error message was misleading.** The error `gizmo_src@localhost: command
+  not found` didn't obviously point to the `.env` file or quoting.
+
+### What replaced it
+
+Properly escape quotes in the echo:
+```bash
+echo "GIZMO_FLAGS=\"${gizmo_flags[*]}\""
+```
+This produces `GIZMO_FLAGS="--node gizmo_src@localhost --cookie test"` in
+the `.env` file, which bash sources correctly.

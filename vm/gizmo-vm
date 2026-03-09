@@ -22,13 +22,26 @@ if [ $# -eq 0 ]; then
 fi
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
+# Flags that take a value argument (not a file path)
+flags_with_value="--node --cookie --model --max-cycles --watchdog --boot --runtime --dump-runtime --trace-file --bash-timeout --name --init"
 
 gizmo_flags=()
 frame_files=()
+expect_value=false
 
 for arg in "$@"; do
-  if [[ "$arg" == -* ]]; then
+  if $expect_value; then
     gizmo_flags+=("$arg")
+    expect_value=false
+  elif [[ "$arg" == -* ]]; then
+    gizmo_flags+=("$arg")
+    # Check if this flag expects a value argument
+    for fv in $flags_with_value; do
+      if [[ "$arg" == "$fv" ]]; then
+        expect_value=true
+        break
+      fi
+    done
   else
     if [ ! -f "$arg" ]; then
       echo "ERROR: frame file not found: $arg" >&2
@@ -46,7 +59,14 @@ fi
 # ── Create tmpdir + cleanup trap ─────────────────────────────────────────────
 
 TMPDIR=$(mktemp -d /tmp/gizmo-vm.XXXXXX)
-trap 'rm -rf "$TMPDIR"' EXIT
+cleanup() {
+  # Show output log if it exists
+  if [ -f "$TMPDIR/output.log" ]; then
+    cat "$TMPDIR/output.log"
+  fi
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
 
 mkdir -p "$TMPDIR/frames"
 
@@ -59,7 +79,7 @@ done
 {
   echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
   if [ ${#gizmo_flags[@]} -gt 0 ]; then
-    echo "GIZMO_FLAGS=${gizmo_flags[*]}"
+    echo "GIZMO_FLAGS=\"${gizmo_flags[*]}\""
   fi
 } > "$TMPDIR/.env"
 chmod 600 "$TMPDIR/.env"

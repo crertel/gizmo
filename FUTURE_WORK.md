@@ -111,33 +111,34 @@ reliable structured output.
 
 ## Session Persistence and Snapshotting
 
+**Status:** In-memory snapshotting implemented for migration (Stage 18).
+Disk persistence is not yet implemented.
+
 Agent state is currently ephemeral — when the BEAM shuts down, all agent
 context stacks, bindings, mailbox contents, and trap registrations are lost.
 Session persistence would serialize agent state to durable storage so agents
 can be suspended and resumed across VM restarts.
 
-The simplest backend is SQLite or DETS (Erlang's built-in disk-based term
-storage). Either works for single-machine use: snapshot an agent's state
-(context stack, bindings, trap, message queue, cycle count, sections cache)
-as a single record keyed by mailbox ID. DETS is zero-dependency on the BEAM
-but limited to 2 GB and single-node; SQLite is more robust and inspectable
-from outside Elixir.
+The migration system (Stage 18) answered several of the original open
+questions:
 
-Eventually the storage backend could be a remote database or filesystem —
-Postgres, S3, or a networked KV store — enabling agents that migrate between
-machines or survive host failures. The serialization format should be
-backend-agnostic so swapping storage is a configuration change, not a
-rewrite.
+- **Agent state** = context stack, bindings, binding notes, trap (pattern +
+  frames), cycle count, persisted sections, drained mailbox messages,
+  chat_config, run_opts (grind, idle, max_cycles, etc.).
+- **Service state** = Blackboard KV map, Watchdog timer configs, Factory
+  worker code strings + user state, Bash handle counter.
+- **Snapshot granularity** = on-demand (triggered by migration service).
+  Agents are paused at cycle boundaries via a process mailbox message.
+- **In-flight messages** = drained from the process mailbox during pause
+  and re-injected on restore.
+- **Stale references** = not yet handled. Restored agents have the same
+  mailbox IDs, so `_parent` references survive within a single migration.
+  Cross-session resume would need to handle missing parents.
 
-This is also a prerequisite for the self-modifying runtime (below): agents
-need to survive VM transitions for blue-green deploys to work.
-
-### Open questions
-
-- What exactly constitutes "agent state" vs "runtime state"?
-- Snapshot granularity — per-cycle, on-demand, or on idle?
-- Do snapshots include in-flight message queue contents?
-- How to handle stale references (a resumed agent's `_parent` may no longer exist)?
+The remaining work is adding a durable backend (SQLite or DETS) so
+snapshots survive BEAM crashes. The serialization format from
+`Gizmo.Migration.Snapshot` can be reused directly — it already produces
+`:erlang.term_to_binary`-compatible terms.
 
 ## Debug Visualization
 
@@ -171,6 +172,9 @@ Possible directions:
 
 ## Self-Modifying Runtime (Blue-Green Gizmo)
 
+**Status:** Core migration implemented (Stage 18). Steps 1-3 below are done.
+Steps 4-5 are future work.
+
 Agents can already rewrite their own context stacks — that's the core eval
 loop. But the runtime itself (`gizmo.exs`) is immutable once the BEAM loads
 it. Except: the BEAM loads scripts once at startup, so the file on disk is
@@ -179,20 +183,24 @@ execution environment.
 
 ### The chain
 
-1. **Agent persistence.** Prerequisite. Agents need to survive VM transitions.
-   Sqlite or equivalent — serialize agent state (context stack, bindings, trap,
-   mailbox contents) to disk. Not a hard problem, just needs doing.
+1. ~~**Agent persistence.**~~ **Done (Stage 18).** Agent state (context stack,
+   bindings, trap, cycle count, sections cache, drained messages) is
+   serialized via `:erlang.term_to_binary` and transferred between nodes.
+   The `chat_fn` closure is reconstructed from a stored `chat_config` map
+   (`%{backend, model, thinking}`). No disk persistence yet — state is
+   transferred in-memory between BEAM nodes.
 
-2. **BEAM clustering.** A running gizmo instance spawns a *new* BEAM process
-   running a modified `gizmo.exs`. The two VMs connect via Erlang distribution
-   (cookies). This is standard BEAM — `Node.connect/1`, named processes,
-   message passing across nodes. The new VM is disowned by the spawning OS
-   process so the parent can die independently.
+2. ~~**BEAM clustering.**~~ **Done (Stage 18).** `--node` and `--cookie` CLI
+   flags start Erlang distribution. The migration service uses `:peer` to
+   spawn a new BEAM running `gizmo.exs --accept-migration`. The two nodes
+   connect automatically via `:peer`'s built-in distribution setup.
 
-3. **Blue-green deploy.** The new VM starts, runs health checks (smoke tests,
-   agent hello-world). If it passes, the old VM serializes agent state,
-   transfers it to the new VM, and shuts down. If it fails, the new VM dies
-   and the old one continues unchanged. Zero-downtime runtime evolution.
+3. ~~**Blue-green deploy.**~~ **Done (Stage 18).** The migration service
+   pauses all agents, snapshots all stateful services, transfers state to the
+   new node, and shuts down. Agents continue on the new node from their exact
+   cycle state. Rollback on timeout (agents resume on old node if the new
+   node fails to signal readiness within 60s). Tested end-to-end in QEMU VM
+   via `test/21_migration.txt`.
 
 4. **Git-backed runtime mutation.** Agents use the bash service (or a
    dedicated git service) to modify `gizmo.exs` on a branch, commit, spawn
@@ -225,25 +233,29 @@ catastrophic to the host (rm -rf, network exfil, etc.). Increasing isolation:
   its own filesystem, network namespace, and resource limits. The host
   observes the VM's behavior (did tests pass? did it try to phone home?) and
   decides whether to promote. The agent literally cannot damage the host even
-  if the modified runtime is adversarial.
+  if the modified runtime is adversarial. **This is the tested path** — all
+  migration testing was done inside the QEMU VM.
 
 Each level trades speed for safety. The Nix VM path is slow but lets you
 hand an agent the keys to its own runtime with confidence that the worst
 case is a wasted VM boot, not a wrecked host.
 
-### Open questions
+### Known limitations (current implementation)
 
-- **State serialization format.** What exactly gets persisted? Context stack
-  and bindings are obvious. Trap state, message queue contents, cycle count,
-  sections cache — less clear. Need a clean boundary between "agent state"
-  and "runtime state."
-- **Migration protocol.** How do agents in flight handle the transition?
-  Drain to a quiescent state first? Or hot-migrate mid-cycle? BEAM
-  distribution supports message forwarding, but the eval loop has assumptions
-  about local process state.
-- **Multi-agent coordination during migration.** If agents A and B are
-  mid-conversation and the runtime migrates, their mailbox routing must
-  survive the transition. Registry entries need to transfer atomically.
+- **In-flight bash commands are lost.** Agents waiting on bash responses
+  receive a timeout after migration.
+- **Factory workers with closure-based handlers can't migrate.** Only
+  workers created via code strings (the factory "create" API) are
+  serializable.
+- **Watchdog timer precision.** First tick after migration fires at full
+  interval, not the remaining time from before migration.
+- **Trace file handles.** Reopened on new node if trace config is stored;
+  otherwise trace is lost.
+- **No disk persistence.** State is transferred in-memory between nodes.
+  If both nodes crash, state is lost.
+
+### Remaining open questions
+
 - **Convergence.** What stops a self-modifying loop from oscillating? The
   test suite is the obvious fitness function, but "passes tests" doesn't
   mean "is better." May need a human-in-the-loop approval gate, at least

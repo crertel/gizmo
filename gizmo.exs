@@ -170,6 +170,10 @@ defmodule Gizmo.Trace do
       emit(:persistent_term.get({__MODULE__, :outputs}, nil), event)
     end
   end
+
+  def get_outputs do
+    :persistent_term.get({__MODULE__, :outputs}, nil)
+  end
 end
 
 # -----------------------------------------------------------------------------
@@ -852,6 +856,7 @@ defmodule Gizmo.Services.MessagesQueue do
   end
 
   def push(pid, content, source), do: GenServer.call(pid, {:push, content, source})
+  def enqueue(pid, {content, source}), do: push(pid, content, source)
   def pop(pid), do: GenServer.call(pid, :pop)
   def to_list(pid), do: GenServer.call(pid, :to_list)
 
@@ -875,6 +880,10 @@ defmodule Gizmo.Services.MessagesQueue do
 
   def handle_call(:to_list, _from, %{queue: q} = state) do
     {:reply, :queue.to_list(q), state}
+  end
+
+  def handle_call(:snapshot, _from, %{queue: q} = state) do
+    {:reply, %{contents: :queue.to_list(q)}, state}
   end
 end
 
@@ -910,6 +919,14 @@ defmodule Gizmo.Services.Blackboard do
 
   def handle_call(:keys, _from, %{store: store} = state) do
     {:reply, Map.keys(store), state}
+  end
+
+  def handle_call(:snapshot, _from, %{store: store} = state) do
+    {:reply, %{store: store}, state}
+  end
+
+  def handle_call({:restore, %{store: new_store}}, _from, state) do
+    {:reply, :ok, %{state | store: new_store}}
   end
 
   @impl true
@@ -956,6 +973,13 @@ defmodule Gizmo.Services.Bash do
        jobs: %{},
        port_to_handle: %{}
      }}
+  end
+
+  @impl true
+  def handle_call(:snapshot, _from, state) do
+    # Ports aren't migratable — report lost job handles
+    lost_jobs = Map.keys(state.jobs)
+    {:reply, %{handle_counter: state.handle_counter, lost_jobs: lost_jobs}, state}
   end
 
   # --- Mailbox message (agent → bash) ---
@@ -1347,6 +1371,28 @@ defmodule Gizmo.Services.Watchdog do
   def init(mailbox_id) do
     Gizmo.Mailbox.register(mailbox_id)
     {:ok, %{mailbox_id: mailbox_id, agents: %{}}}
+  end
+
+  @impl true
+  def handle_call(:snapshot, _from, state) do
+    timers = Enum.map(state.agents, fn {agent_mb, entry} ->
+      timer_data = Enum.map(entry.timers, fn timer ->
+        remaining = case Process.read_timer(timer.cancel_ref) do
+          false -> 0
+          ms -> ms
+        end
+        %{type: timer.type, interval: timer.interval, remaining_ms: remaining}
+      end)
+      {agent_mb, timer_data}
+    end) |> Map.new()
+    {:reply, %{timers: timers}, state}
+  end
+
+  def handle_call(:cancel_all, _from, state) do
+    state = Enum.reduce(Map.keys(state.agents), state, fn mb, acc ->
+      cancel_all_timers(acc, mb)
+    end)
+    {:reply, :ok, state}
   end
 
   # State shape:
@@ -2016,13 +2062,22 @@ defmodule Gizmo.Services.FactoryWorker do
   require Logger
 
   def start_link({mailbox_id, handler, user_state}) do
-    GenServer.start_link(__MODULE__, {mailbox_id, handler, user_state})
+    start_link({mailbox_id, handler, user_state, nil})
+  end
+
+  def start_link({mailbox_id, handler, user_state, code}) do
+    GenServer.start_link(__MODULE__, {mailbox_id, handler, user_state, code})
   end
 
   @impl true
-  def init({mailbox_id, handler, user_state}) do
+  def init({mailbox_id, handler, user_state, code}) do
     Gizmo.Mailbox.register(mailbox_id)
-    {:ok, %{mailbox_id: mailbox_id, handler: handler, user_state: user_state}}
+    {:ok, %{mailbox_id: mailbox_id, handler: handler, user_state: user_state, code: code}}
+  end
+
+  @impl true
+  def handle_call(:snapshot_user_state, _from, state) do
+    {:reply, %{user_state: state.user_state, code: state.code}, state}
   end
 
   @impl true
@@ -2076,6 +2131,15 @@ defmodule Gizmo.Services.Factory do
   end
 
   @impl true
+  def handle_call(:snapshot, _from, state) do
+    workers = Enum.reduce(state.services, %{}, fn {name, {pid, _ref}}, acc ->
+      worker_snap = GenServer.call(pid, :snapshot_user_state)
+      Map.put(acc, name, worker_snap)
+    end)
+    {:reply, %{workers: workers}, state}
+  end
+
+  @impl true
   def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "create", "name" => name, "code" => code} = msg}}, state) do
     init_state = msg["state"] || %{}
 
@@ -2090,7 +2154,7 @@ defmodule Gizmo.Services.Factory do
           {:ok, handler} ->
             case DynamicSupervisor.start_child(
               Gizmo.FactorySupervisor,
-              {Gizmo.Services.FactoryWorker, {name, handler, init_state}}
+              {Gizmo.Services.FactoryWorker, {name, handler, init_state, code}}
             ) do
               {:ok, pid} ->
                 ref = Process.monitor(pid)
@@ -2198,6 +2262,474 @@ defmodule Gizmo.Services.Factory do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Migration — orchestrates live runtime migration
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Migration do
+  use GenServer
+  require Logger
+
+  @pause_timeout 10_000
+  @migration_ready_timeout 60_000
+
+  def start_link(mailbox_id \\ "migration") do
+    GenServer.start_link(__MODULE__, mailbox_id, name: __MODULE__)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, status: :idle}}
+  end
+
+  @impl true
+  def handle_call({:receive_snapshot, binary}, _from, state) do
+    result = do_receive_snapshot(binary)
+    {:reply, result, %{state | status: :idle}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "migrate", "script" => script_path}}}, state) do
+    if state.status != :idle do
+      Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+        %{"text" => "error: migration already in progress", "error" => "busy"}})
+      {:noreply, state}
+    else
+      spawn(fn -> do_migrate(script_path, sender_mb, state.mailbox_id) end)
+      {:noreply, %{state | status: :migrating}}
+    end
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "status"}}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "#{state.status}", "status" => "#{state.status}"}})
+    {:noreply, state}
+  end
+
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id,
+      %{"text" => "error: unknown action: #{inspect(msg["action"])}", "error" => "unknown_action"}})
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # --- Outbound migration (source node) ---
+
+  defp do_migrate(script_path, sender_mb, my_mb) do
+    Logger.warning("[migration] Starting migration to #{script_path}")
+
+    try do
+      # 1. Cancel all watchdog timers and snapshot remaining times
+      watchdog_snapshot = case Gizmo.Mailbox.lookup("watchdog") do
+        {:ok, pid} ->
+          snap = GenServer.call(pid, :snapshot)
+          GenServer.call(pid, :cancel_all)
+          snap
+        _ -> %{timers: %{}}
+      end
+
+      # 2. Brief grace period for in-flight port completions
+      Process.sleep(100)
+
+      # 3. Pause all agents and collect snapshots
+      agent_pids = list_agent_pids()
+      Logger.warning("[migration] Pausing #{length(agent_pids)} agent(s)...")
+
+      agent_snapshots = Enum.reduce(agent_pids, [], fn pid, acc ->
+        ref = make_ref()
+        send(pid, {:migration_pause, self(), ref})
+        receive do
+          {:migration_snapshot, ^ref, snapshot} -> [snapshot | acc]
+        after
+          @pause_timeout ->
+            Logger.error("[migration] Timeout pausing agent #{inspect(pid)}")
+            acc
+        end
+      end)
+
+      # 4. Snapshot all services
+      service_snapshots = Gizmo.Migration.Snapshot.snapshot_services()
+      service_snapshots = Map.put(service_snapshots, :watchdog, watchdog_snapshot)
+
+      # 5. Build runtime snapshot
+      runtime_snapshot = %{
+        version: 1,
+        timestamp: System.monotonic_time(:millisecond),
+        source_node: Node.self(),
+        services: service_snapshots,
+        agents: agent_snapshots
+      }
+
+      binary = :erlang.term_to_binary(runtime_snapshot)
+      Logger.warning("[migration] Snapshot built: #{byte_size(binary)} bytes, #{length(agent_snapshots)} agent(s)")
+
+      # 6. Start new BEAM via Port and connect
+      peer_id = System.unique_integer([:positive])
+      peer_node_str = "gizmo_new_#{peer_id}@localhost"
+      peer_node = String.to_atom(peer_node_str)
+      cookie_str = Atom.to_string(Node.get_cookie())
+      elixir_path = System.find_executable("elixir")
+
+      peer_args = [
+        script_path,
+        "--accept-migration",
+        "--node", peer_node_str,
+        "--cookie", cookie_str
+      ]
+
+      Logger.warning("[migration] Starting peer node #{peer_node_str}...")
+
+      _port = Port.open({:spawn_executable, elixir_path}, [
+        :binary,
+        :exit_status,
+        args: peer_args
+      ])
+
+      # Wait for the new node to come up and connect
+      case wait_for_node(peer_node, 30) do
+        :ok ->
+          # Poll until migration service is up on the new node
+          wait_for_migration_service(peer_node, 30)
+
+          # 7. Send snapshot to new node
+          Logger.warning("[migration] Sending snapshot to #{peer_node}...")
+          case :rpc.call(peer_node, GenServer, :call, [Gizmo.Services.Migration, {:receive_snapshot, binary}], @migration_ready_timeout) do
+            {:ok, :restored} ->
+              Logger.warning("[migration] New node restored successfully!")
+              # 8. Signal the CLI process on the new node that migration is complete
+              waiter_pid = :rpc.call(peer_node, Process, :whereis, [Gizmo.CLI.MigrationWaiter])
+              if is_pid(waiter_pid) do
+                :rpc.call(peer_node, Kernel, :send, [waiter_pid, {:migration_complete}])
+              end
+
+              # 9. Stop all agents on source
+              Enum.each(agent_pids, fn pid ->
+                send(pid, {:migration_stop})
+              end)
+
+              Gizmo.Mailbox.route(sender_mb, {my_mb,
+                %{"text" => "migration complete, shutting down", "migrated_to" => "#{peer_node}"}})
+
+              # Give messages time to deliver
+              Process.sleep(500)
+              System.halt(0)
+
+            {:badrpc, reason} ->
+              Logger.error("[migration] RPC to new node failed: #{inspect(reason)}")
+              rollback_agents(agent_pids)
+              Gizmo.Mailbox.route(sender_mb, {my_mb,
+                %{"text" => "error: migration failed: #{inspect(reason)}", "error" => "rpc_failed"}})
+
+            {:error, reason} ->
+              Logger.error("[migration] Restore on new node failed: #{inspect(reason)}")
+              rollback_agents(agent_pids)
+              Gizmo.Mailbox.route(sender_mb, {my_mb,
+                %{"text" => "error: restore failed: #{inspect(reason)}", "error" => "restore_failed"}})
+          end
+
+        :timeout ->
+          Logger.error("[migration] Timed out waiting for peer node to connect")
+          rollback_agents(agent_pids)
+          Gizmo.Mailbox.route(sender_mb, {my_mb,
+            %{"text" => "error: peer node did not start in time", "error" => "peer_timeout"}})
+      end
+    rescue
+      e ->
+        Logger.error("[migration] Migration error: #{Exception.message(e)}")
+        Gizmo.Mailbox.route(sender_mb, {my_mb,
+          %{"text" => "error: #{Exception.message(e)}", "error" => "migration_error"}})
+    end
+  end
+
+  defp wait_for_node(_node, 0), do: :timeout
+
+  defp wait_for_node(node, retries) do
+    if Node.connect(node) do
+      :ok
+    else
+      Process.sleep(1_000)
+      wait_for_node(node, retries - 1)
+    end
+  end
+
+  defp wait_for_migration_service(_node, 0), do: :timeout
+
+  defp wait_for_migration_service(node, retries) do
+    case :rpc.call(node, GenServer, :whereis, [Gizmo.Services.Migration]) do
+      pid when is_pid(pid) -> :ok
+      _ ->
+        Process.sleep(1_000)
+        wait_for_migration_service(node, retries - 1)
+    end
+  end
+
+  defp rollback_agents(agent_pids) do
+    Logger.warning("[migration] Rolling back — resuming all agents")
+    Enum.each(agent_pids, fn pid ->
+      send(pid, {:migration_resume})
+    end)
+  end
+
+  defp list_agent_pids do
+    DynamicSupervisor.which_children(Gizmo.AgentSupervisor)
+    |> Enum.map(fn {_, pid, _, _} -> pid end)
+    |> Enum.filter(&is_pid/1)
+  end
+
+  # --- Inbound migration (destination node) ---
+
+  defp do_receive_snapshot(binary) do
+    Logger.warning("[migration] Receiving snapshot (#{byte_size(binary)} bytes)...")
+
+    snapshot = :erlang.binary_to_term(binary)
+    restore_time = System.monotonic_time(:millisecond)
+
+    # 1. Restore Blackboard
+    if snapshot.services[:blackboard] do
+      case Gizmo.Mailbox.lookup("blackboard") do
+        {:ok, pid} -> GenServer.call(pid, {:restore, snapshot.services[:blackboard]})
+        _ -> :ok
+      end
+    end
+
+    # 2. Restore Factory workers from code strings
+    if snapshot.services[:factory] do
+      restore_factory_workers(snapshot.services[:factory])
+    end
+
+    # 3. Restore agents
+    trace_outputs = Gizmo.Trace.get_outputs()
+
+    Enum.each(snapshot.agents, fn agent_snap ->
+      opts = Gizmo.Migration.Snapshot.restore_agent_opts(agent_snap, restore_time, trace_outputs)
+      boot_frames = agent_snap.boot_frames
+      Gizmo.Agent.start(boot_frames, opts)
+    end)
+
+    # 4. Restore watchdog timers
+    if snapshot.services[:watchdog] do
+      restore_watchdog_timers(snapshot.services[:watchdog])
+    end
+
+    # 5. Send "migration complete" to each restored agent so they wake up
+    Process.sleep(500)  # brief delay for agents to enter maybe_wait_for_message
+    Enum.each(snapshot.agents, fn agent_snap ->
+      Gizmo.Mailbox.route(agent_snap.mailbox_id, {"migration",
+        %{"text" => "migration complete", "migrated_to" => Atom.to_string(Node.self())}})
+    end)
+
+    Logger.warning("[migration] Restore complete: #{length(snapshot.agents)} agent(s)")
+    {:ok, :restored}
+  end
+
+  defp restore_factory_workers(%{workers: workers}) do
+    Enum.each(workers, fn {name, %{code: code, user_state: user_state}} ->
+      if code do
+        # Re-compile and start the worker
+        Gizmo.Mailbox.route("factory", {"migration",
+          %{"action" => "create", "name" => name, "code" => code, "state" => user_state}})
+        # Wait briefly for it to start
+        Process.sleep(100)
+      end
+    end)
+  end
+
+  defp restore_factory_workers(_), do: :ok
+
+  defp restore_watchdog_timers(%{timers: timers}) do
+    Enum.each(timers, fn {agent_mb, timer_list} ->
+      Enum.each(timer_list, fn timer ->
+        action = Atom.to_string(timer.type)
+        ms = timer.interval
+        Gizmo.Mailbox.route("watchdog", {agent_mb,
+          %{"action" => action, "ms" => ms}})
+      end)
+    end)
+  end
+
+  defp restore_watchdog_timers(_), do: :ok
+end
+
+# -----------------------------------------------------------------------------
+# Gizmo.Migration.Snapshot — serialize/deserialize runtime state for migration
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Migration.Snapshot do
+  @moduledoc """
+  Provides functions to snapshot and restore agent and service state
+  for live runtime migration (blue-green gizmo).
+  """
+
+  @doc """
+  Rebuild a chat_fn closure from a serializable chat_config map.
+  """
+  def reconstruct_chat_fn(%{backend: backend, model: model, thinking: thinking}) do
+    base_fn = case backend do
+      :openai -> &Gizmo.LLM.OpenAI.chat/3
+      _ -> &Gizmo.LLM.Anthropic.chat/3
+    end
+
+    chat_fn = if thinking do
+      fn system, messages, chat_opts ->
+        base_fn.(system, messages, Keyword.put(chat_opts, :thinking, true))
+      end
+    else
+      base_fn
+    end
+
+    if model do
+      fn system, messages, chat_opts ->
+        chat_fn.(system, messages, Keyword.put(chat_opts, :model, model))
+      end
+    else
+      chat_fn
+    end
+  end
+
+  @doc """
+  Produce a serializable map from a paused agent's state, loop, context_stack,
+  and any drained mailbox messages.
+  """
+  def snapshot_agent(state, loop, context_stack, drained_messages \\ []) do
+    %{
+      mailbox_id: state.mailbox_id,
+      parent: state.parent,
+      chat_config: state.chat_config,
+      receive_timeout: state.receive_timeout,
+      max_cycles: state.max_cycles,
+      quit_on_exhaust: state.quit_on_exhaust,
+      grind: state.grind,
+      log_timings: state.log_timings,
+      log_full_prompts: state.log_full_prompts,
+      run_start: state.run_start,
+      boot_frames: state.boot_frames,
+      runtime_preamble: state.runtime_preamble,
+      # Loop state
+      context_stack: context_stack,
+      retries: loop.retries,
+      cycles: loop.cycles,
+      persisted_sections: loop.persisted_sections,
+      bindings: loop.bindings,
+      binding_notes: loop.binding_notes,
+      trap: serialize_trap(loop.trap),
+      init_bindings: loop.init_bindings,
+      init_notes: loop.init_notes,
+      # Drained messages from process mailbox
+      drained_messages: drained_messages,
+      # MessagesQueue contents
+      msgs_queue_contents: GenServer.call(state.msgs_queue, :to_list)
+    }
+  end
+
+  @doc """
+  Snapshot all stateful services. Returns a map of service snapshots.
+  """
+  def snapshot_services do
+    %{
+      blackboard: snapshot_service("blackboard", :snapshot),
+      watchdog: snapshot_service("watchdog", :snapshot),
+      factory: snapshot_service("factory", :snapshot),
+      bash: snapshot_service("bash", :snapshot)
+    }
+  end
+
+  defp snapshot_service(mailbox_id, call_msg) do
+    case Gizmo.Mailbox.lookup(mailbox_id) do
+      {:ok, pid} -> GenServer.call(pid, call_msg)
+      {:error, _} -> nil
+    end
+  end
+
+  @doc """
+  Convert a trap (regex + frames) to a serializable form.
+  """
+  def serialize_trap(nil), do: nil
+  def serialize_trap({%Regex{source: source}, frames}), do: {source, frames}
+
+  @doc """
+  Restore a trap from its serialized form.
+  """
+  def deserialize_trap(nil), do: nil
+  def deserialize_trap({pattern_string, frames}) do
+    {:ok, regex} = Regex.compile(pattern_string)
+    {regex, frames}
+  end
+
+  @doc """
+  Adjust monotonic run_start for the new node's time base.
+  old_start is the original run_start. snapshot_time is when the snapshot was taken
+  (both in old-node monotonic ms). restore_time is the current monotonic ms on new node.
+  The offset preserves elapsed time.
+  """
+  def rebase_run_start(old_start, snapshot_time, restore_time) do
+    elapsed = snapshot_time - old_start
+    restore_time - elapsed
+  end
+
+  @doc """
+  Build the full runtime snapshot for migration.
+  """
+  def build_runtime_snapshot(agent_snapshots, service_snapshots, cli_opts) do
+    %{
+      version: 1,
+      timestamp: System.monotonic_time(:millisecond),
+      source_node: Node.self(),
+      cli_opts: cli_opts,
+      services: service_snapshots,
+      agents: agent_snapshots
+    }
+  end
+
+  @doc """
+  Restore agent from snapshot data. Returns opts suitable for Gizmo.Agent.start
+  plus restore data for the agent wrapper.
+  """
+  def restore_agent_opts(agent_snap, restore_time, trace_outputs) do
+    chat_config = agent_snap.chat_config
+    chat_fn = reconstruct_chat_fn(chat_config)
+    new_run_start = rebase_run_start(
+      agent_snap.run_start,
+      agent_snap[:snapshot_time] || restore_time,
+      restore_time
+    )
+
+    opts = [
+      name: agent_snap.mailbox_id,
+      parent: agent_snap.parent,
+      chat_fn: chat_fn,
+      chat_config: chat_config,
+      receive_timeout: agent_snap.receive_timeout,
+      max_cycles: agent_snap.max_cycles,
+      quit_on_exhaust: agent_snap.quit_on_exhaust,
+      grind: agent_snap.grind,
+      log_timings: agent_snap.log_timings,
+      log_full_prompts: agent_snap.log_full_prompts,
+      run_start: new_run_start,
+      trace_outputs: trace_outputs,
+      runtime_preamble: agent_snap.runtime_preamble,
+      restore: %{
+        context_stack: agent_snap.context_stack,
+        loop: %{
+          retries: agent_snap.retries,
+          cycles: agent_snap.cycles,
+          persisted_sections: agent_snap.persisted_sections,
+          bindings: agent_snap.bindings,
+          binding_notes: agent_snap.binding_notes,
+          trap: deserialize_trap(agent_snap.trap),
+          init_bindings: agent_snap.init_bindings,
+          init_notes: agent_snap.init_notes
+        },
+        drained_messages: agent_snap.drained_messages,
+        msgs_queue_contents: agent_snap.msgs_queue_contents
+      }
+    ]
+
+    opts
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Agent.Wrapper — OTP-compatible wrapper for agent processes
 # -----------------------------------------------------------------------------
 
@@ -2211,6 +2743,7 @@ defmodule Gizmo.Agent.Wrapper do
 
   def init_agent({frames, opts, caller}) do
     chat_fn = Keyword.get(opts, :chat_fn, &Gizmo.LLM.Anthropic.chat/3)
+    chat_config = Keyword.get(opts, :chat_config, %{backend: :anthropic, model: nil, thinking: false})
     parent = Keyword.get(opts, :parent, nil)
     receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
@@ -2238,6 +2771,7 @@ defmodule Gizmo.Agent.Wrapper do
       mailbox_id: mailbox_id,
       parent: parent,
       chat_fn: chat_fn,
+      chat_config: chat_config,
       receive_timeout: receive_timeout,
       max_cycles: max_cycles,
       quit_on_exhaust: quit_on_exhaust,
@@ -2258,15 +2792,28 @@ defmodule Gizmo.Agent.Wrapper do
       t_ms: System.monotonic_time(:millisecond) - run_start
     })
 
-    # Runtime-provided bindings: _self always, _parent if spawned by another agent
-    init_bindings = %{"_self" => mailbox_id}
-    init_bindings = if parent, do: Map.put(init_bindings, "_parent", parent), else: init_bindings
-    init_notes = %{"_self" => "this agent's mailbox ID"}
+    restore = Keyword.get(opts, :restore, nil)
 
-    init_notes =
-      if parent, do: Map.put(init_notes, "_parent", "parent agent's mailbox ID"), else: init_notes
+    if restore do
+      # Restore mode: re-inject drained messages and resume eval loop
+      Enum.each(restore.drained_messages, fn msg -> send(self(), msg) end)
+      # Re-enqueue messages that were in the MessagesQueue
+      Enum.each(restore.msgs_queue_contents, fn item ->
+        Gizmo.Services.MessagesQueue.enqueue(msgs_queue, item)
+      end)
+      Gizmo.Agent.eval_loop_restored(restore.context_stack, state, restore.loop)
+    else
+      # Normal startup
+      # Runtime-provided bindings: _self always, _parent if spawned by another agent
+      init_bindings = %{"_self" => mailbox_id}
+      init_bindings = if parent, do: Map.put(init_bindings, "_parent", parent), else: init_bindings
+      init_notes = %{"_self" => "this agent's mailbox ID"}
 
-    Gizmo.Agent.eval_loop(frames, state, init_bindings, init_notes)
+      init_notes =
+        if parent, do: Map.put(init_notes, "_parent", "parent agent's mailbox ID"), else: init_notes
+
+      Gizmo.Agent.eval_loop(frames, state, init_bindings, init_notes)
+    end
 
     Logger.warning(Gizmo.Format.agent_stop(mailbox_id))
 
@@ -2304,6 +2851,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Eval, "eval"},
       {DynamicSupervisor, name: Gizmo.FactorySupervisor, strategy: :one_for_one},
       {Gizmo.Services.Factory, "factory"},
+      {Gizmo.Services.Migration, "migration"},
       {DynamicSupervisor, name: Gizmo.AgentSupervisor, strategy: :one_for_one}
     ]
 
@@ -2568,6 +3116,18 @@ defmodule Gizmo.Agent do
       like any other service. Handler exceptions are caught — the worker
       sends an error reply without crashing.
 
+    - migration: Live runtime migration. Transfers all agents and state to a
+      new BEAM instance running a (possibly patched) copy of gizmo.exs.
+      Requires --node flag.
+      Migrate: {"op": "send", "mailbox": "migration", "msg": {"action": "migrate", "script": "/absolute/path/to/gizmo.exs"}}
+      Status: {"op": "send", "mailbox": "migration", "msg": {"action": "status"}}
+      On success, the old BEAM shuts down and all agents resume on the new node.
+      On failure, agents are rolled back and continue on the old node.
+      Response: {"text": "migration complete, shutting down", "migrated_to": "<node>"}
+      Note: agents are paused during migration and resume from the exact cycle
+      they were at. The agent cannot observe that a migration happened — all
+      state (bindings, blackboard, watchdog timers, etc.) carries over.
+
     ## Message-driven model
 
     By default, your process sleeps between eval cycles and only wakes when
@@ -2780,6 +3340,14 @@ defmodule Gizmo.Agent do
     eval_loop_inner(context_stack, state, loop)
   end
 
+  @doc """
+  Resume an agent from a migration snapshot. Enters eval_loop_inner directly
+  with the restored context_stack, state, and loop map.
+  """
+  def eval_loop_restored(context_stack, state, loop) do
+    eval_loop_inner(context_stack, state, loop)
+  end
+
   # Inter-cycle message wait: determines whether to block for a mailbox message.
   # First cycle: no wait, bind _msg="init", _msg_source="runtime".
   # Grind mode: no wait, loop immediately.
@@ -2806,12 +3374,27 @@ defmodule Gizmo.Agent do
     {bindings, binding_notes, context_stack}
   end
 
-  defp maybe_wait_for_message(_state, %{trap: trap}, bindings, binding_notes, context_stack) do
-    # Message-driven: block until a message arrives
+  defp maybe_wait_for_message(state, %{trap: trap} = loop, bindings, binding_notes, context_stack) do
+    # Message-driven: block until a message arrives (or migration pause)
     {msg_content, msg_source} =
       receive do
         {:mailbox_msg, _to, {from_mb, message}} ->
           {message, from_mb}
+
+        {:migration_pause, reply_to, ref} ->
+          drained = drain_mailbox_messages()
+          snapshot = Gizmo.Migration.Snapshot.snapshot_agent(state, loop, context_stack, drained)
+          send(reply_to, {:migration_snapshot, ref, snapshot})
+          receive do
+            {:migration_resume} ->
+              Enum.each(drained, fn msg -> send(self(), msg) end)
+            {:migration_stop} ->
+              exit(:migration_stopped)
+          end
+          # After resume, re-enter the wait
+          receive do
+            {:mailbox_msg, _to, {from_mb, message}} -> {message, from_mb}
+          end
       end
 
     # Extract _msg (summary text) and _payload (full JSON) from message content
@@ -2912,13 +3495,44 @@ defmodule Gizmo.Agent do
            binding_notes: binding_notes
          } = loop
        ) do
+    # Non-blocking check for migration pause request
+    receive do
+      {:migration_pause, reply_to, ref} ->
+        drained = drain_mailbox_messages()
+        snapshot = Gizmo.Migration.Snapshot.snapshot_agent(state, loop, context_stack, drained)
+        send(reply_to, {:migration_snapshot, ref, snapshot})
+        # Block until told to resume or stop
+        receive do
+          {:migration_resume} ->
+            # Re-inject drained messages
+            Enum.each(drained, fn msg -> send(self(), msg) end)
+          {:migration_stop} ->
+            exit(:migration_stopped)
+        end
+    after
+      0 -> :ok
+    end
+
     # Inter-cycle message wait: block until a message arrives (unless grind or first cycle)
     {bindings, binding_notes, context_stack} =
       maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
 
     # Build structured system prompt for caching
     boot_text = Enum.join(state.boot_frames, "\n\n---\n\n")
-    frames_text = Enum.join(context_stack, "\n\n---\n\n")
+    frames_text =
+      if length(context_stack) > 1 do
+        context_stack
+        |> Enum.with_index()
+        |> Enum.map_join("\n\n---\n\n", fn {frame, idx} ->
+          if idx == 0 do
+            ">>> CURRENT FRAME (follow ONLY these instructions) <<<\n#{frame}"
+          else
+            "--- QUEUED FRAME #{idx + 1} of #{length(context_stack)} (do NOT follow yet) ---\n#{frame}"
+          end
+        end)
+      else
+        Enum.join(context_stack, "\n\n---\n\n")
+      end
 
     system_parts =
       if context_stack == state.boot_frames do
@@ -2966,7 +3580,8 @@ defmodule Gizmo.Agent do
     cycle_start = System.monotonic_time(:millisecond)
     llm_start = System.monotonic_time(:millisecond)
 
-    case state.chat_fn.(system_parts, [%{role: "user", content: user_content}], []) do
+    llm_result = state.chat_fn.(system_parts, [%{role: "user", content: user_content}], [])
+    case llm_result do
       {:ok, response} ->
         llm_ms = System.monotonic_time(:millisecond) - llm_start
 
@@ -3120,6 +3735,18 @@ defmodule Gizmo.Agent do
     end
   end
 
+  defp drain_mailbox_messages do
+    drain_mailbox_messages([])
+  end
+
+  defp drain_mailbox_messages(acc) do
+    receive do
+      {:mailbox_msg, _, _} = msg -> drain_mailbox_messages([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   defp op_name({:send, _, _}), do: "send"
   defp op_name({:receive, _}), do: "receive"
   defp op_name({:spawn, _, _, _}), do: "spawn"
@@ -3184,9 +3811,17 @@ defmodule Gizmo.Agent do
         state.chat_fn
       end
 
+    child_chat_config =
+      if child_model do
+        %{state.chat_config | model: child_model}
+      else
+        state.chat_config
+      end
+
     child_opts = [
       parent: parent_arg,
       chat_fn: child_chat_fn,
+      chat_config: child_chat_config,
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: child_quit_on_exhaust,
@@ -3287,7 +3922,11 @@ defmodule Gizmo.CLI do
           name: :string,
           model: :string,
           each: :boolean,
-          list_models: :boolean
+          list_models: :boolean,
+          node: :string,
+          cookie: :string,
+          accept_migration: :boolean,
+          console: :boolean
         ],
         aliases: [v: :verbose]
       )
@@ -3308,6 +3947,19 @@ defmodule Gizmo.CLI do
 
       opts[:dry_run] && args != [] ->
         dry_run(args, opts)
+
+      opts[:accept_migration] ->
+        if !opts[:node] do
+          IO.puts(:stderr, "Error: --accept-migration requires --node")
+          System.halt(1)
+        end
+        accept_migration(opts)
+
+      opts[:console] && args != [] ->
+        run_console(args, opts)
+
+      opts[:console] ->
+        run_console([], opts)
 
       opts[:each] && opts[:name] ->
         IO.puts(:stderr, "Error: --each and --name cannot be combined.")
@@ -3376,6 +4028,10 @@ defmodule Gizmo.CLI do
       --trace-messages    Include message routing events in trace
       --bash-timeout N    Default bash command timeout in ms (default: 60000, 0 = none)
       --list-models       List available models from configured backend(s)
+      --node <name>       Start Erlang distribution (e.g. gizmo@localhost)
+      --cookie <cookie>   Set Erlang distribution cookie
+      --accept-migration  Start in migration-accept mode (requires --node)
+      --console           Start with services running and stay alive for remote IEx
 
     Positional arguments:
       Without --boot: first file is the boot frame, rest are stacked on top.
@@ -7279,6 +7935,14 @@ defmodule Gizmo.CLI do
 
     IO.puts("")
 
+    # Migration integration test
+    IO.puts("--- Migration ---")
+
+    migration_failures = test_migration()
+    failures = failures ++ migration_failures
+
+    IO.puts("")
+
     # Summary
     if failures == [] do
       IO.puts("=== All tests passed ===")
@@ -7324,6 +7988,161 @@ defmodule Gizmo.CLI do
     end
   end
 
+  defp test_migration do
+    # 1. Start distribution on this node (needed for cross-BEAM test)
+    dist_ok = if Node.alive?() do
+      true
+    else
+      # Ensure EPMD is running
+      :os.cmd(~c"epmd -daemon")
+      Process.sleep(500)
+
+      test_node_name = :"gizmo_test_src_#{System.unique_integer([:positive])}@localhost"
+      case Node.start(test_node_name, :shortnames) do
+        {:ok, _} -> true
+        {:error, _reason} -> false
+      end
+    end
+
+    if dist_ok do
+      Node.set_cookie(:gizmo_test)
+      do_test_migration()
+    else
+      IO.puts("  migration: SKIP (could not start distribution — EPMD may not be available)")
+      []
+    end
+  end
+
+  defp do_test_migration do
+    failures = []
+
+    # 2. Write test data to blackboard
+    {:ok, bb_pid} = Gizmo.Mailbox.lookup("blackboard")
+    Gizmo.Services.Blackboard.write(bb_pid, "migration_key", "migration_value_42")
+    Gizmo.Services.Blackboard.write(bb_pid, "another_key", "another_value")
+
+    # 3. Snapshot services
+    service_snapshots = Gizmo.Migration.Snapshot.snapshot_services()
+    failures = failures ++ assert_eq(
+      "migration: blackboard snapshot has data",
+      service_snapshots.blackboard.store["migration_key"],
+      "migration_value_42"
+    )
+
+    # 4. Build a runtime snapshot (services only, no agents — avoids needing LLM)
+    runtime_snapshot = %{
+      version: 1,
+      timestamp: System.monotonic_time(:millisecond),
+      source_node: Node.self(),
+      services: service_snapshots,
+      agents: []
+    }
+
+    binary = :erlang.term_to_binary(runtime_snapshot)
+    failures = failures ++ assert_eq(
+      "migration: snapshot serializes",
+      is_binary(binary) and byte_size(binary) > 0,
+      true
+    )
+
+    # 5. Spawn a second BEAM with --accept-migration
+    dest_node_name = "gizmo_test_dest_#{System.unique_integer([:positive])}@localhost"
+    dest_node = String.to_atom(dest_node_name)
+    script_path = Path.absname("gizmo.exs")
+    elixir_path = System.find_executable("elixir")
+
+    port = Port.open({:spawn_executable, elixir_path}, [
+      :binary,
+      :exit_status,
+      args: [
+        script_path,
+        "--accept-migration",
+        "--node", dest_node_name,
+        "--cookie", "gizmo_test"
+      ]
+    ])
+
+    # 6. Wait for the new node to come up
+    connected = wait_for_test_node(dest_node, 30)
+    failures = failures ++ assert_eq("migration: peer node connected", connected, true)
+
+    failures = failures ++ if connected do
+      svc_ready = wait_for_test_service(dest_node, Gizmo.Services.Migration, 15)
+      f_svc = assert_eq("migration: peer migration service ready", svc_ready, true)
+
+      f_rest = if svc_ready do
+        # 8. Send snapshot to the new node
+        result = :rpc.call(dest_node, GenServer, :call,
+          [Gizmo.Services.Migration, {:receive_snapshot, binary}], 30_000)
+        f_restore = assert_eq("migration: restore succeeded", result, {:ok, :restored})
+
+        # 9. Verify blackboard state on the new node
+        f_bb = case :rpc.call(dest_node, Gizmo.Mailbox, :lookup, ["blackboard"]) do
+          {:ok, remote_bb_pid} ->
+            remote_val = :rpc.call(dest_node, Gizmo.Services.Blackboard, :read, [remote_bb_pid, "migration_key"])
+            fa = assert_eq("migration: blackboard survived migration", remote_val, "migration_value_42")
+
+            remote_val2 = :rpc.call(dest_node, Gizmo.Services.Blackboard, :read, [remote_bb_pid, "another_key"])
+            fb = assert_eq("migration: second key survived", remote_val2, "another_value")
+            fa ++ fb
+
+          _ ->
+            IO.puts("  migration: blackboard lookup on peer: FAIL")
+            ["migration: could not lookup blackboard on peer"]
+        end
+
+        # 10. Signal the peer to shut down
+        waiter_pid = :rpc.call(dest_node, Process, :whereis, [Gizmo.CLI.MigrationWaiter])
+        if is_pid(waiter_pid) do
+          :rpc.call(dest_node, Kernel, :send, [waiter_pid, {:migration_complete}])
+        end
+
+        f_restore ++ f_bb
+      else
+        []
+      end
+
+      f_svc ++ f_rest
+    else
+      []
+    end
+
+    # Clean up
+    try do
+      Port.close(port)
+    catch
+      _, _ -> :ok
+    end
+
+    Process.sleep(500)
+    Gizmo.Services.Blackboard.write(bb_pid, "migration_key", "")
+    Gizmo.Services.Blackboard.write(bb_pid, "another_key", "")
+
+    failures
+  end
+
+  defp wait_for_test_node(_node, 0), do: false
+
+  defp wait_for_test_node(node, retries) do
+    if Node.connect(node) do
+      true
+    else
+      Process.sleep(1_000)
+      wait_for_test_node(node, retries - 1)
+    end
+  end
+
+  defp wait_for_test_service(_node, _module, 0), do: false
+
+  defp wait_for_test_service(node, module, retries) do
+    case :rpc.call(node, GenServer, :whereis, [module]) do
+      pid when is_pid(pid) -> true
+      _ ->
+        Process.sleep(1_000)
+        wait_for_test_service(node, module, retries - 1)
+    end
+  end
+
   defp read_file!(path) do
     case File.read(path) do
       {:ok, content} -> content
@@ -7335,6 +8154,21 @@ defmodule Gizmo.CLI do
 
   defp setup_runtime(opts) do
     configure_logger(opts[:verbose])
+
+    # Start Erlang distribution if --node is given
+    if opts[:node] do
+      node_name = String.to_atom(opts[:node])
+      mode = if String.contains?(opts[:node], "."), do: :longnames, else: :shortnames
+
+      case Node.start(node_name, mode) do
+        {:ok, _} -> :ok
+        {:error, reason} ->
+          IO.puts(:stderr, "[gizmo] Failed to start distribution: #{inspect(reason)}")
+          System.halt(1)
+      end
+
+      if opts[:cookie], do: Node.set_cookie(String.to_atom(opts[:cookie]))
+    end
 
     thinking = opts[:thinking] || false
     max_cycles = opts[:max_cycles]
@@ -7369,6 +8203,10 @@ defmodule Gizmo.CLI do
 
     run_opts = [run_start: System.monotonic_time(:millisecond)]
 
+    # Detect backend
+    backend = if System.get_env("OPENAI_API_KEY") && !System.get_env("ANTHROPIC_API_KEY"),
+      do: :openai, else: :anthropic
+
     run_opts =
       if thinking do
         chat_fn = fn system, messages, chat_opts ->
@@ -7392,6 +8230,9 @@ defmodule Gizmo.CLI do
       else
         run_opts
       end
+
+    chat_config = %{backend: backend, model: model, thinking: thinking}
+    run_opts = Keyword.put(run_opts, :chat_config, chat_config)
 
     run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
     run_opts = if idle, do: Keyword.put(run_opts, :quit_on_exhaust, false), else: run_opts
@@ -7495,6 +8336,83 @@ defmodule Gizmo.CLI do
       end)
 
     refs = Enum.map(agents, fn {_mb, pid} -> {Process.monitor(pid), pid} end)
+    wait_all(refs)
+
+    if trace_file, do: File.close(trace_file)
+    Logger.flush()
+  end
+
+  def run_console(paths, opts) do
+    # Auto-start distribution if --node not provided
+    opts = if !opts[:node] do
+      name = "gizmo_#{System.unique_integer([:positive])}@localhost"
+      Keyword.put(opts, :node, name)
+    else
+      opts
+    end
+
+    opts = if !opts[:cookie], do: Keyword.put(opts, :cookie, "gizmo"), else: opts
+
+    %{run_opts: run_opts, watchdog_ms: watchdog_ms, trace_file: _trace_file, boot_path: boot_path} =
+      setup_runtime(opts)
+
+    # Start agents if files were provided
+    if paths != [] do
+      run_opts = if opts[:name], do: Keyword.put(run_opts, :name, opts[:name]), else: run_opts
+      task_frames = Enum.map(paths, &read_file!/1)
+
+      {frames, _boot_frame} =
+        if boot_path do
+          boot_content = read_file!(boot_path)
+          {[boot_content | task_frames], boot_content}
+        else
+          {task_frames, List.first(task_frames)}
+        end
+
+      {:ok, agent_mb, _agent_pid} = Gizmo.Agent.start(frames, run_opts)
+
+      if watchdog_ms do
+        Gizmo.Mailbox.route("watchdog", {agent_mb, %{"action" => "every", "ms" => watchdog_ms}})
+      end
+    end
+
+    node = Node.self()
+    cookie = Node.get_cookie()
+
+    IO.puts(:stderr, """
+    [gizmo] Console mode on #{node}
+    [gizmo] Services running. #{if paths != [], do: "Agent started.", else: "No agents (no files given)."}
+
+    To connect a remote IEx session from another terminal:
+
+      iex --sname console --cookie #{cookie} --remsh #{node}
+
+    This process will stay alive. Press Ctrl+C twice to exit.
+    """)
+
+    # Block forever — agents and services run in the supervision tree
+    Process.sleep(:infinity)
+  end
+
+  def accept_migration(opts) do
+    %{trace_file: trace_file} = setup_runtime(opts)
+
+    # Register this process so the migration service can signal us
+    Process.register(self(), Gizmo.CLI.MigrationWaiter)
+
+    IO.puts(:stderr, "[gizmo] Accepting migration on #{Node.self()}...")
+
+    # Block until migration service receives and restores state
+    receive do
+      {:migration_complete} -> :ok
+    end
+
+    # Now wait for all restored agents to finish
+    agent_pids = DynamicSupervisor.which_children(Gizmo.AgentSupervisor)
+    |> Enum.map(fn {_, pid, _, _} -> pid end)
+    |> Enum.filter(&is_pid/1)
+
+    refs = Enum.map(agent_pids, fn pid -> {Process.monitor(pid), pid} end)
     wait_all(refs)
 
     if trace_file, do: File.close(trace_file)

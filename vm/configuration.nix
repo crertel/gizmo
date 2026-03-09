@@ -7,6 +7,8 @@
 let
   beamPkgs = with pkgs.beam; packagesWith interpreters.erlang_28;
 
+  gizmoScript = "/var/lib/gizmo/gizmo.exs";
+
   runAgentScript = pkgs.writeShellScript "run-agent.sh" ''
     set -euo pipefail
 
@@ -16,6 +18,14 @@ let
       source /tmp/shared/.env
       set +a
     fi
+
+    # Copy gizmo.exs to a mutable location (migration + self-modification need this)
+    mkdir -p /var/lib/gizmo
+    cp /etc/gizmo/gizmo.exs ${gizmoScript}
+    chmod 644 ${gizmoScript}
+
+    # Start EPMD (needed for Erlang distribution / migration)
+    ${beamPkgs.erlang}/bin/epmd -daemon || true
 
     # Collect boot frame files
     frames=()
@@ -36,7 +46,9 @@ let
     fi
 
     # Run gizmo agent
-    ${beamPkgs.elixir_1_19}/bin/elixir /etc/gizmo/gizmo.exs "''${flags[@]}" "''${frames[@]}" || true
+    ${beamPkgs.elixir_1_19}/bin/elixir ${gizmoScript} \
+      --trace-file /tmp/shared/trace.log \
+      "''${flags[@]}" "''${frames[@]}" || true
 
     # Clean shutdown via ACPI
     poweroff
@@ -64,6 +76,10 @@ in
     cacert
     curl
     jq
+    htop
+    vim
+    git
+    tmux
   ];
 
   # Bake gizmo.exs into the store image
