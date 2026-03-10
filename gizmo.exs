@@ -1758,6 +1758,301 @@ defmodule Gizmo.Services.PagerSession do
 end
 
 # -----------------------------------------------------------------------------
+# Gizmo.Services.Editor — Stateless file editing via mailbox
+# -----------------------------------------------------------------------------
+
+defmodule Gizmo.Services.Editor do
+  use GenServer
+  require Logger
+
+  def start_link(mailbox_id \\ "editor") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  # --- read ---
+  @impl true
+  def handle_info(
+        {:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "read", "path" => path} = msg}},
+        state
+      ) do
+    path = String.trim(path)
+
+    case File.read(path) do
+      {:ok, content} ->
+        lines = String.split(content, "\n")
+        from = Map.get(msg, "from", 1)
+        to = Map.get(msg, "to", length(lines))
+        from = max(from, 1)
+        to = min(to, length(lines))
+
+        numbered =
+          lines
+          |> Stream.with_index(1)
+          |> Stream.drop(from - 1)
+          |> Stream.take(to - from + 1)
+          |> Stream.map(fn {line, idx} -> "#{idx}: #{line}" end)
+          |> Enum.join("\n")
+
+        Gizmo.Trace.emit_service(%{event: "editor:read", path: path, from: from, to: to})
+        reply(sender_mb, state, %{"text" => numbered, "lines" => length(lines)})
+
+      {:error, reason} ->
+        reply_error(sender_mb, state, reason)
+    end
+
+    {:noreply, state}
+  end
+
+  # --- write ---
+  def handle_info(
+        {:mailbox_msg, _mailbox_id,
+         {sender_mb, %{"action" => "write", "path" => path, "content" => content}}},
+        state
+      ) do
+    path = String.trim(path)
+    dir = Path.dirname(path)
+    File.mkdir_p(dir)
+
+    case File.write(path, content) do
+      :ok ->
+        bytes = byte_size(content)
+        Gizmo.Trace.emit_service(%{event: "editor:write", path: path, bytes: bytes})
+        reply(sender_mb, state, %{"text" => "wrote #{bytes} bytes to #{path}"})
+
+      {:error, reason} ->
+        reply_error(sender_mb, state, reason)
+    end
+
+    {:noreply, state}
+  end
+
+  # --- insert ---
+  def handle_info(
+        {:mailbox_msg, _mailbox_id,
+         {sender_mb, %{"action" => "insert", "path" => path, "text" => text} = msg}},
+        state
+      ) do
+    path = String.trim(path)
+
+    case File.read(path) do
+      {:ok, content} ->
+        lines = String.split(content, "\n")
+        new_lines = String.split(text, "\n")
+        {result_lines, insert_at} = do_insert(lines, new_lines, msg)
+        File.write!(path, Enum.join(result_lines, "\n"))
+
+        Gizmo.Trace.emit_service(%{
+          event: "editor:insert",
+          path: path,
+          count: length(new_lines),
+          at: insert_at
+        })
+
+        reply(sender_mb, state, %{
+          "text" => "inserted #{length(new_lines)} lines at line #{insert_at}"
+        })
+
+      {:error, :enoent} ->
+        # File doesn't exist — create it with the text
+        File.mkdir_p(Path.dirname(path))
+        File.write!(path, text)
+        new_lines = String.split(text, "\n")
+
+        Gizmo.Trace.emit_service(%{
+          event: "editor:insert",
+          path: path,
+          count: length(new_lines),
+          at: 1
+        })
+
+        reply(sender_mb, state, %{"text" => "inserted #{length(new_lines)} lines at line 1"})
+
+      {:error, reason} ->
+        reply_error(sender_mb, state, reason)
+    end
+
+    {:noreply, state}
+  end
+
+  # --- replace ---
+  def handle_info(
+        {:mailbox_msg, _mailbox_id,
+         {sender_mb,
+          %{"action" => "replace", "path" => path, "find" => find, "replace" => replacement} = msg}},
+        state
+      ) do
+    path = String.trim(path)
+    use_regex = Map.get(msg, "regex", false)
+    replace_all = Map.get(msg, "all", false)
+
+    case File.read(path) do
+      {:ok, content} ->
+        {new_content, count} = do_replace(content, find, replacement, use_regex, replace_all)
+        File.write!(path, new_content)
+        Gizmo.Trace.emit_service(%{event: "editor:replace", path: path, count: count})
+        reply(sender_mb, state, %{"text" => "replaced #{count} occurrences"})
+
+      {:error, reason} ->
+        reply_error(sender_mb, state, reason)
+    end
+
+    {:noreply, state}
+  end
+
+  # --- delete ---
+  def handle_info(
+        {:mailbox_msg, _mailbox_id, {sender_mb, %{"action" => "delete", "path" => path} = msg}},
+        state
+      ) do
+    path = String.trim(path)
+
+    case File.read(path) do
+      {:ok, content} ->
+        lines = String.split(content, "\n")
+        {remaining, deleted_count} = do_delete(lines, msg)
+        File.write!(path, Enum.join(remaining, "\n"))
+        Gizmo.Trace.emit_service(%{event: "editor:delete", path: path, count: deleted_count})
+        reply(sender_mb, state, %{"text" => "deleted #{deleted_count} lines"})
+
+      {:error, reason} ->
+        reply_error(sender_mb, state, reason)
+    end
+
+    {:noreply, state}
+  end
+
+  # --- catch-all ---
+  def handle_info({:mailbox_msg, _mailbox_id, {sender_mb, msg}}, state) do
+    Logger.error("[editor] unknown message from #{sender_mb}: #{inspect(msg)}")
+    reply(sender_mb, state, %{"text" => "error:unknown command", "error" => "unknown_command"})
+    {:noreply, state}
+  end
+
+  # -- helpers --
+
+  defp reply(sender_mb, state, response) do
+    Gizmo.Mailbox.route(sender_mb, {state.mailbox_id, response})
+  end
+
+  defp reply_error(sender_mb, state, reason) do
+    Gizmo.Mailbox.route(
+      sender_mb,
+      {state.mailbox_id, %{"text" => "error:#{reason}", "error" => to_string(reason)}}
+    )
+  end
+
+  defp do_insert(lines, new_lines, msg) do
+    cond do
+      Map.has_key?(msg, "after_line") ->
+        idx = msg["after_line"]
+        {List.insert_at(lines, idx, new_lines) |> List.flatten(), idx + 1}
+
+      Map.has_key?(msg, "before_line") ->
+        idx = msg["before_line"] - 1
+        {List.insert_at(lines, idx, new_lines) |> List.flatten(), msg["before_line"]}
+
+      Map.has_key?(msg, "after_pattern") ->
+        case find_pattern(lines, msg["after_pattern"], Map.get(msg, "last", false)) do
+          nil -> {lines ++ new_lines, length(lines) + 1}
+          idx -> {List.insert_at(lines, idx + 1, new_lines) |> List.flatten(), idx + 2}
+        end
+
+      Map.has_key?(msg, "before_pattern") ->
+        case find_pattern(lines, msg["before_pattern"], Map.get(msg, "last", false)) do
+          nil -> {lines ++ new_lines, length(lines) + 1}
+          idx -> {List.insert_at(lines, idx, new_lines) |> List.flatten(), idx + 1}
+        end
+
+      true ->
+        # Default: append at end
+        {lines ++ new_lines, length(lines) + 1}
+    end
+  end
+
+  defp find_pattern(lines, pattern, last?) do
+    if last? do
+      case lines |> Enum.reverse() |> Enum.find_index(&String.contains?(&1, pattern)) do
+        nil -> nil
+        ridx -> length(lines) - 1 - ridx
+      end
+    else
+      Enum.find_index(lines, &String.contains?(&1, pattern))
+    end
+  end
+
+  defp do_replace(content, find, replacement, use_regex, replace_all) do
+    if use_regex do
+      {:ok, regex} = Regex.compile(find)
+      count = length(Regex.scan(regex, content))
+      count = if replace_all, do: count, else: min(count, 1)
+      opts = if replace_all, do: [:global], else: []
+      new_content = Regex.replace(regex, content, replacement, opts)
+      {new_content, count}
+    else
+      count = count_occurrences(content, find)
+      count = if replace_all, do: count, else: min(count, 1)
+
+      new_content =
+        if replace_all do
+          String.replace(content, find, replacement)
+        else
+          String.replace(content, find, replacement, global: false)
+        end
+
+      {new_content, count}
+    end
+  end
+
+  defp count_occurrences(string, pattern) do
+    case String.split(string, pattern) do
+      parts -> length(parts) - 1
+    end
+  end
+
+  defp do_delete(lines, msg) do
+    cond do
+      Map.has_key?(msg, "from_line") && Map.has_key?(msg, "to_line") ->
+        from = msg["from_line"]
+        to = msg["to_line"]
+        from_idx = max(from - 1, 0)
+        to_idx = min(to - 1, length(lines) - 1)
+        deleted_count = to_idx - from_idx + 1
+
+        remaining =
+          lines
+          |> Stream.with_index()
+          |> Stream.reject(fn {_l, i} -> i >= from_idx && i <= to_idx end)
+          |> Enum.map(&elem(&1, 0))
+
+        {remaining, deleted_count}
+
+      Map.has_key?(msg, "pattern") ->
+        pattern = msg["pattern"]
+
+        {remaining, deleted} =
+          Enum.reduce(lines, {[], 0}, fn line, {acc, count} ->
+            if String.contains?(line, pattern) do
+              {acc, count + 1}
+            else
+              {[line | acc], count}
+            end
+          end)
+
+        {Enum.reverse(remaining), deleted}
+
+      true ->
+        {lines, 0}
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
 # Gizmo.Services.Batch — Fan-out multiple service requests in parallel
 # -----------------------------------------------------------------------------
 
@@ -2847,6 +3142,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Reaper, "reaper"},
       {Gizmo.Services.Watchdog, "watchdog"},
       {Gizmo.Services.Pager, "pager"},
+      {Gizmo.Services.Editor, "editor"},
       {Gizmo.Services.Batch, "batch"},
       {Gizmo.Services.Eval, "eval"},
       {DynamicSupervisor, name: Gizmo.FactorySupervisor, strategy: :one_for_one},
@@ -3072,6 +3368,24 @@ defmodule Gizmo.Agent do
         {"op": "send", "mailbox": "<session>", "msg": {"action": "search", "pattern": "<text>"}}
         {"op": "send", "mailbox": "<session>", "msg": {"action": "close"}}
       Page response: {"text": "<header+content>", "content": "<content>", "from": N, "to": N, "total": N}
+
+    - editor: Stateless file editor. Each message is a self-contained operation.
+      Read:    {"op": "send", "mailbox": "editor", "msg": {"action": "read", "path": "/path"}}
+               Optional: "from": N, "to": N (1-indexed line range).
+               Response: {"text": "1: line...\\n2: line...", "lines": N}
+      Write:   {"op": "send", "mailbox": "editor", "msg": {"action": "write", "path": "/path", "content": "..."}}
+               Creates parent directories. Response: {"text": "wrote N bytes to /path"}
+      Insert:  {"op": "send", "mailbox": "editor", "msg": {"action": "insert", "path": "/path", "text": "new lines"}}
+               Position (pick one): "after_line": N, "before_line": N, "after_pattern": "...", "before_pattern": "..."
+               Optional: "last": true — match the last occurrence of the pattern instead of the first.
+               Omit position to append at end. Creates file if missing.
+               Response: {"text": "inserted N lines at line M"}
+      Replace: {"op": "send", "mailbox": "editor", "msg": {"action": "replace", "path": "/path", "find": "old", "replace": "new"}}
+               Optional: "regex": true, "all": true. Default: first literal match.
+               Response: {"text": "replaced N occurrences"}
+      Delete:  {"op": "send", "mailbox": "editor", "msg": {"action": "delete", "path": "/path", "from_line": N, "to_line": M}}
+               Or: "pattern": "..." to delete all matching lines. Range is inclusive.
+               Response: {"text": "deleted N lines"}
 
     - batch: Fan out multiple service requests in parallel. Send a single
       message with a "requests" array; get all results back in one response.
@@ -7461,6 +7775,355 @@ defmodule Gizmo.CLI do
 
     Gizmo.Mailbox.unregister(pager_recv)
     File.rm(pager_tmp)
+
+    IO.puts("")
+
+    # 16b. Editor tests
+    IO.puts("--- Editor ---")
+
+    editor_tmp_dir =
+      Path.join(System.tmp_dir!(), "gizmo_editor_test_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(editor_tmp_dir)
+    editor_tmp = Path.join(editor_tmp_dir, "test.txt")
+    editor_lines = Enum.map(1..10, fn i -> "line #{i}" end)
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    editor_recv = Gizmo.Mailbox.generate_id("editor_recv")
+    Gizmo.Mailbox.register(editor_recv)
+
+    # Helper to send to editor and receive response
+    editor_roundtrip = fn msg ->
+      Gizmo.Mailbox.route("editor", {editor_recv, msg})
+
+      receive do
+        {:mailbox_msg, ^editor_recv, {"editor", resp}} -> resp
+      after
+        2_000 -> :timeout
+      end
+    end
+
+    # Test 1: Read entire file
+    r = editor_roundtrip.(%{"action" => "read", "path" => editor_tmp})
+    failures = failures ++ assert_eq("editor read: lines count", r["lines"], 10)
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor read: first line numbered",
+          r["text"] |> String.split("\n") |> hd(),
+          "1: line 1"
+        )
+
+    # Test 2: Read with line range
+    r = editor_roundtrip.(%{"action" => "read", "path" => editor_tmp, "from" => 3, "to" => 5})
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor read range: starts at line 3",
+          r["text"] |> String.split("\n") |> hd(),
+          "3: line 3"
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor read range: 3 lines",
+          r["text"] |> String.split("\n") |> length(),
+          3
+        )
+
+    # Test 3: Read nonexistent file
+    r = editor_roundtrip.(%{"action" => "read", "path" => "/nonexistent/xyz.txt"})
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor read nonexistent: error",
+          String.starts_with?(r["text"], "error:"),
+          true
+        )
+
+    # Test 4: Write a new file (creates parent dirs)
+    editor_new = Path.join(editor_tmp_dir, "sub/dir/new.txt")
+
+    r =
+      editor_roundtrip.(%{"action" => "write", "path" => editor_new, "content" => "hello\nworld"})
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor write: response",
+          String.starts_with?(r["text"], "wrote "),
+          true
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor write: file exists",
+          File.read!(editor_new),
+          "hello\nworld"
+        )
+
+    # Test 5: Insert before pattern
+    r =
+      editor_roundtrip.(%{
+        "action" => "insert",
+        "path" => editor_tmp,
+        "text" => "inserted A\ninserted B",
+        "before_pattern" => "line 5"
+      })
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert before_pattern: response",
+          String.starts_with?(r["text"], "inserted 2 lines"),
+          true
+        )
+
+    updated = File.read!(editor_tmp) |> String.split("\n")
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert before_pattern: line before target",
+          Enum.at(updated, 4),
+          "inserted A"
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert before_pattern: target shifted",
+          Enum.at(updated, 6),
+          "line 5"
+        )
+
+    # Test 6: Insert after_line
+    # Reset file
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    _r =
+      editor_roundtrip.(%{
+        "action" => "insert",
+        "path" => editor_tmp,
+        "text" => "after line 3",
+        "after_line" => 3
+      })
+
+    updated = File.read!(editor_tmp) |> String.split("\n")
+
+    failures =
+      failures ++
+        assert_eq("editor insert after_line: placement", Enum.at(updated, 3), "after line 3")
+
+    # Test 6b: Insert before_pattern with last: true
+    # File with multiple closing braces, like a Nix config
+    nix_like = "{\n  inner = {\n    x = 1;\n  };\n  y = 2;\n}"
+    File.write!(editor_tmp, nix_like)
+
+    _r =
+      editor_roundtrip.(%{
+        "action" => "insert",
+        "path" => editor_tmp,
+        "text" => "  z = 3;",
+        "before_pattern" => "}",
+        "last" => true
+      })
+
+    updated = File.read!(editor_tmp) |> String.split("\n")
+    # The last "}" is the outer closing brace — inserted line should be just before it
+    last_brace_idx = length(updated) - 1
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert last before_pattern: before last }",
+          Enum.at(updated, last_brace_idx),
+          "}"
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert last before_pattern: inserted line",
+          Enum.at(updated, last_brace_idx - 1),
+          "  z = 3;"
+        )
+
+    # Test 6c: Insert before_pattern WITHOUT last (should hit first match)
+    File.write!(editor_tmp, nix_like)
+
+    _r =
+      editor_roundtrip.(%{
+        "action" => "insert",
+        "path" => editor_tmp,
+        "text" => "FIRST",
+        "before_pattern" => "}"
+      })
+
+    updated = File.read!(editor_tmp) |> String.split("\n")
+    # First "}" is the inner closing brace at index 3 — FIRST should be at index 3 now
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert first before_pattern: hits first }",
+          Enum.at(updated, 3),
+          "FIRST"
+        )
+
+    # Test 7: Replace (single occurrence)
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    r =
+      editor_roundtrip.(%{
+        "action" => "replace",
+        "path" => editor_tmp,
+        "find" => "line",
+        "replace" => "LINE"
+      })
+
+    failures =
+      failures ++ assert_eq("editor replace single: count", r["text"], "replaced 1 occurrences")
+
+    updated_content = File.read!(editor_tmp)
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor replace single: first replaced",
+          String.starts_with?(updated_content, "LINE 1"),
+          true
+        )
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor replace single: rest untouched",
+          String.contains?(updated_content, "line 2"),
+          true
+        )
+
+    # Test 8: Replace all
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    r =
+      editor_roundtrip.(%{
+        "action" => "replace",
+        "path" => editor_tmp,
+        "find" => "line",
+        "replace" => "ROW",
+        "all" => true
+      })
+
+    failures =
+      failures ++ assert_eq("editor replace all: count", r["text"], "replaced 10 occurrences")
+
+    updated_content = File.read!(editor_tmp)
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor replace all: no originals",
+          String.contains?(updated_content, "line"),
+          false
+        )
+
+    # Test 9: Replace with regex
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    r =
+      editor_roundtrip.(%{
+        "action" => "replace",
+        "path" => editor_tmp,
+        "find" => "line (\\d+)",
+        "replace" => "item-\\1",
+        "regex" => true,
+        "all" => true
+      })
+
+    failures =
+      failures ++ assert_eq("editor replace regex: count", r["text"], "replaced 10 occurrences")
+
+    updated_content = File.read!(editor_tmp)
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor replace regex: transformed",
+          String.contains?(updated_content, "item-1"),
+          true
+        )
+
+    # Test 10: Delete by line range
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    r =
+      editor_roundtrip.(%{
+        "action" => "delete",
+        "path" => editor_tmp,
+        "from_line" => 3,
+        "to_line" => 5
+      })
+
+    failures = failures ++ assert_eq("editor delete range: count", r["text"], "deleted 3 lines")
+    updated = File.read!(editor_tmp) |> String.split("\n")
+    failures = failures ++ assert_eq("editor delete range: length", length(updated), 7)
+
+    failures =
+      failures ++
+        assert_eq("editor delete range: line 3 gone", Enum.member?(updated, "line 3"), false)
+
+    # Test 11: Delete by pattern
+    File.write!(editor_tmp, Enum.join(editor_lines, "\n"))
+
+    r =
+      editor_roundtrip.(%{
+        "action" => "delete",
+        "path" => editor_tmp,
+        "pattern" => "line 1"
+      })
+
+    # "line 1" matches "line 1" and "line 10"
+    failures = failures ++ assert_eq("editor delete pattern: count", r["text"], "deleted 2 lines")
+    updated = File.read!(editor_tmp) |> String.split("\n")
+    failures = failures ++ assert_eq("editor delete pattern: length", length(updated), 8)
+
+    # Test 12: Insert into nonexistent file (creates it)
+    editor_create = Path.join(editor_tmp_dir, "created.txt")
+
+    _r =
+      editor_roundtrip.(%{
+        "action" => "insert",
+        "path" => editor_create,
+        "text" => "brand new file"
+      })
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor insert creates file",
+          File.read!(editor_create),
+          "brand new file"
+        )
+
+    # Test 13: Unknown action
+    r = editor_roundtrip.(%{"action" => "bogus"})
+
+    failures =
+      failures ++
+        assert_eq(
+          "editor unknown action: error",
+          r["error"],
+          "unknown_command"
+        )
+
+    # Cleanup
+    Gizmo.Mailbox.unregister(editor_recv)
+    File.rm_rf!(editor_tmp_dir)
 
     IO.puts("")
 
