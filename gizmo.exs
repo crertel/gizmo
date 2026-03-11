@@ -296,9 +296,10 @@ defmodule Gizmo.LLM do
         notes: %{
           type: "object",
           description:
-            "Annotations for bindings. Keys are binding names, values are " <>
-              "short descriptions. These persist across cycles and are shown " <>
-              "alongside binding values.",
+            "Persistent notes shown every cycle. Use for binding annotations " <>
+              "(key = binding name, value = description) AND for tracking your " <>
+              "progress. Recommended keys: \"_step\" (current plan step, e.g. " <>
+              "\"3: run nixos-rebuild\"), \"_plan\" (overall goal). Update every response.",
           additionalProperties: %{type: "string"}
         }
       }
@@ -1085,6 +1086,7 @@ defmodule Gizmo.Services.Bash do
         Gizmo.Trace.emit_service(%{
           event: "bash:done",
           handle: handle,
+          command: String.slice(job.command, 0, 200),
           exit_code: status,
           output_bytes: byte_size(output)
         })
@@ -1092,7 +1094,7 @@ defmodule Gizmo.Services.Bash do
         if status == 0 do
           Gizmo.Mailbox.route(
             job.reply_to,
-            {state.mailbox_id, %{"text" => output, "output" => output, "exit_code" => 0}}
+            {state.mailbox_id, %{"text" => output, "output" => output, "exit_code" => 0, "command" => String.slice(job.command, 0, 200)}}
           )
         else
           Gizmo.Mailbox.route(
@@ -1101,7 +1103,8 @@ defmodule Gizmo.Services.Bash do
              %{
                "text" => "error: exit code #{status}: #{output}",
                "output" => output,
-               "exit_code" => status
+               "exit_code" => status,
+               "command" => String.slice(job.command, 0, 200)
              }}
           )
         end
@@ -1118,23 +1121,24 @@ defmodule Gizmo.Services.Bash do
         {:noreply, state}
 
       %{mode: :kill} = job ->
-        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "kill"})
+        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, command: String.slice(job.command, 0, 200), mode: "kill"})
         kill_port(job.port)
 
         Gizmo.Mailbox.route(
           job.reply_to,
           {state.mailbox_id,
            %{
-             "text" => "error: timeout after #{job.timeout_ms}ms",
+             "text" => "error: timeout after #{job.timeout_ms}ms — command was killed: #{String.slice(job.command, 0, 200)}. To allow more time, resend with \"timeout\": <ms> in your bash message (e.g. \"timeout\": 180000 for 3 minutes)",
              "error" => "timeout",
-             "timeout_ms" => job.timeout_ms
+             "timeout_ms" => job.timeout_ms,
+             "command" => String.slice(job.command, 0, 200)
            }}
         )
 
         {:noreply, cleanup_job(state, handle)}
 
       %{mode: :notify} = job ->
-        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, mode: "notify"})
+        Gizmo.Trace.emit_service(%{event: "bash:timeout", handle: handle, command: String.slice(job.command, 0, 200), mode: "notify"})
 
         text =
           case job.note do
@@ -1177,7 +1181,7 @@ defmodule Gizmo.Services.Bash do
     port =
       Port.open(
         {:spawn_executable, "/bin/sh"},
-        [:binary, :exit_status, :stderr_to_stdout, args: ["-c", command]]
+        [:binary, :exit_status, :stderr_to_stdout, args: ["-c", command <> " </dev/null"]]
       )
 
     timer_ref =
@@ -1194,6 +1198,7 @@ defmodule Gizmo.Services.Bash do
       timeout_ms: timeout_ms,
       mode: mode,
       note: note,
+      command: command,
       output: [],
       status: :running
     }
@@ -3659,9 +3664,11 @@ defmodule Gizmo.Agent do
       will see as your system prompt on the NEXT eval cycle. Multiple frames
       are concatenated in order with --- separators. An empty array [] means
       this process is finished (or in idle mode, resets to the boot frame).
-    - notes: an object mapping binding names to short descriptions. Use this to
-      annotate what each binding contains. Notes persist across cycles and are
-      shown alongside binding values in the user message.
+    - notes: an object for persisting information across cycles. Use it to
+      annotate bindings (key = binding name, value = description) AND to track
+      your progress. Recommended: set "_step" to your current plan step (e.g.
+      "3: run nixos-rebuild") and "_plan" to your overall goal. Notes are shown
+      in full every cycle — update them each response to reflect current state.
 
     ## Messages are JSON objects
 

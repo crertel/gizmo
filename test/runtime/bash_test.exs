@@ -34,7 +34,9 @@ defmodule Gizmo.BashTest do
           5_000 -> :timeout
         end
 
-      assert result["text"] == "error: timeout after 200ms"
+      assert result["error"] == "timeout"
+      assert result["timeout_ms"] == 200
+      assert String.starts_with?(result["text"], "error: timeout after 200ms")
       Gizmo.Mailbox.unregister(recv)
       GenServer.stop(pid)
     end
@@ -56,7 +58,9 @@ defmodule Gizmo.BashTest do
           5_000 -> :timeout
         end
 
-      assert result["text"] == "error: timeout after 200ms"
+      assert result["error"] == "timeout"
+      assert result["timeout_ms"] == 200
+      assert String.starts_with?(result["text"], "error: timeout after 200ms")
       Gizmo.Mailbox.unregister(recv)
       GenServer.stop(pid)
     end

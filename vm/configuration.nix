@@ -15,6 +15,9 @@ let
     # Add system packages to PATH (systemd services get a minimal PATH by default)
     export PATH="/run/current-system/sw/bin:$PATH"
 
+    # Set NIX_PATH so nixos-rebuild can find <nixpkgs> and <nixos-config>
+    export NIX_PATH="nixpkgs=${pkgs.path}:nixos-config=/etc/nixos/configuration.nix"
+
     # Source API key + optional flags from shared directory
     if [ -f /tmp/shared/.env ]; then
       set -a
@@ -24,8 +27,14 @@ let
 
     # Copy gizmo.exs to a mutable location (migration + self-modification need this)
     mkdir -p /var/lib/gizmo
-    cp /etc/gizmo/gizmo.exs ${gizmoScript}
-    chmod 644 ${gizmoScript}
+    if [ -f /etc/gizmo/gizmo.exs ]; then
+      cp /etc/gizmo/gizmo.exs ${gizmoScript}
+      chmod 644 ${gizmoScript}
+    elif [ ! -f ${gizmoScript} ]; then
+      echo "ERROR: no gizmo.exs at /etc/gizmo/ or ${gizmoScript}" >&2
+      poweroff
+      exit 1
+    fi
 
     # Set up source tree if shared by host (for nix-shell / nix build inside VM)
     if [ -d /tmp/shared/src ]; then
@@ -53,9 +62,14 @@ let
       read -ra flags <<< "$GIZMO_FLAGS"
     fi
 
+    # Wait for GOTIME signal from host (touch /tmp/gizmo-vm.*/GOTIME)
+    echo "Waiting for /tmp/shared/GOTIME ..."
+    while [ ! -f /tmp/shared/GOTIME ]; do sleep 1; done
+    echo "GOTIME received, launching agent."
+
     # Run gizmo agent
     ${beamPkgs.elixir_1_19}/bin/elixir ${gizmoScript} \
-      --trace-file /tmp/shared/trace.log \
+      --trace-file /tmp/shared/trace.log --trace-service --trace-messages \
       "''${flags[@]}" "''${frames[@]}" || true
 
     # Clean shutdown via ACPI
@@ -65,19 +79,34 @@ in
 {
   # ── QEMU virtualisation settings ──────────────────────────────────────────
   virtualisation.graphics = false;
-  virtualisation.cores = 2;
-  virtualisation.memorySize = 2048;
+  virtualisation.cores = 4;
+  virtualisation.memorySize = 8192;
   virtualisation.diskSize = 4096;
+  virtualisation.msize = 524288;  # 512KB — 32x default, big win for 9p read throughput
   virtualisation.qemu.options = [ "-no-reboot" ];
+
+  # VM boots via QEMU direct kernel boot — GRUB is unnecessary.
+  # qemu-vm.nix sets grub.device via mkVMOverride (priority 10), so we
+  # can't override the device — just disable GRUB entirely.
+  boot.loader.grub.enable = lib.mkForce false;
   virtualisation.forwardPorts = [
     { from = "host"; host.port = 8080; guest.port = 8080; }
     { from = "host"; host.port = 2525; guest.port = 25; }
+    { from = "host"; host.port = 2222; guest.port = 22; }
   ];
 
   # ── Networking (SLiRP user-mode, no sudo/TAP needed) ──────────────────────
   networking.hostName = "gizmo-vm";
   networking.useDHCP = true;
-  networking.firewall.allowedTCPPorts = [ 25 8080 ];
+  networking.firewall.allowedTCPPorts = [ 22 25 8080 ];
+
+  # ── SSH access ─────────────────────────────────────────────────────────────
+  services.openssh.enable = true;
+  services.openssh.settings.PermitRootLogin = "yes";
+  services.openssh.settings.PermitEmptyPasswords = "yes";
+
+  # Swap — nixos-rebuild is memory-hungry, this prevents OOM kills
+  swapDevices = [{ device = "/var/swapfile"; size = 4096; }];
 
   # Suppress boot noise — only gizmo output on serial console
   boot.kernelParams = [ "quiet" "loglevel=3" ];
@@ -114,6 +143,10 @@ in
     wants = [ "network-online.target" ];
     wantedBy = [ "multi-user.target" ];
 
+    # Don't restart the agent when nixos-rebuild runs — it's a long-lived
+    # oneshot and killing it mid-task loses all progress.
+    restartIfChanged = false;
+
     environment.HOME = "/root";
 
     serviceConfig = {
@@ -127,15 +160,15 @@ in
 
   # ── Nix tooling inside the VM ────────────────────────────────────────────
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
-  nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
+  nix.nixPath = [ "nixpkgs=${pkgs.path}" "nixos-config=/etc/nixos/configuration.nix" ];
 
   # Seed /etc/nixos/configuration.nix so agents can nixos-rebuild switch.
   # The copy is mutable — agents can edit it and rebuild the system.
   system.activationScripts.seed-nixos-config = let
     seedConfig = pkgs.writeText "seed-configuration.nix" (
       builtins.replaceStrings
-        [ "../gizmo.exs" ]
-        [ "/etc/gizmo/gizmo.exs" ]
+        [ ''environment.etc."gizmo/gizmo.exs".source = ../gizmo.exs;'' "in\n{" ]
+        [ "# gizmo.exs managed by run-agent.sh at /var/lib/gizmo/gizmo.exs" "in\n{\n  imports = [ <nixpkgs/nixos/modules/virtualisation/qemu-vm.nix> ];\n" ]
         (builtins.readFile ./configuration.nix)
     );
   in ''
@@ -152,6 +185,6 @@ in
   # inside the VM lets agents nixos-rebuild, install packages, bind ports, etc.
   # without privilege escalation surprises. The worst case is a trashed VM
   # that gets rm -rf'd on exit.
-  users.users.root.password = "";
+  users.users.root.password = "gizmo";
   system.stateVersion = "24.11";
 }
