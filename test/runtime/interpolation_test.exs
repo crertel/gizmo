@@ -60,8 +60,7 @@ defmodule Gizmo.InterpolationTest do
       eval_resp = %{
         ops: [
           {:send, "human", %{"text" => "Hello ${name}, status: ${status}"}},
-          {:receive, "reply"},
-          {:spawn, ["child frame ${name}"], "child", %{grind: true}},
+          {:spawn, ["child frame ${name}"], "child", %{}},
           {:send, "${_parent}", %{"text" => "result: ${result}"}}
         ],
         frames: ["next frame ${name} ${ctx}"],
@@ -78,9 +77,8 @@ defmodule Gizmo.InterpolationTest do
         })
 
       assert Enum.at(interpolated.ops, 0) == {:send, "human", %{"text" => "Hello Alice, status: ok"}}
-      assert Enum.at(interpolated.ops, 1) == {:receive, "reply"}
-      assert Enum.at(interpolated.ops, 2) == {:spawn, ["child frame Alice"], "child", %{grind: true}}
-      assert Enum.at(interpolated.ops, 3) == {:send, "mb_parent_1", %{"text" => "result: 42"}}
+      assert Enum.at(interpolated.ops, 1) == {:spawn, ["child frame Alice"], "child", %{}}
+      assert Enum.at(interpolated.ops, 2) == {:send, "mb_parent_1", %{"text" => "result: 42"}}
       assert interpolated.frames == ["next frame Alice main"]
       assert interpolated.notes == %{"name" => "the user's name"}
     end

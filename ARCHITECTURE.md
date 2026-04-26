@@ -1,15 +1,20 @@
 # Gizmo Architecture
 
 Gizmo is a minimal runtime for LLM agents modeled on process calculus and the
-BEAM. An agent is a process with a context stack, a mailbox, and four ops.
+BEAM. An agent is a process with a context stack, a mailbox, and three ops.
 Everything else—tool use, memory, multi-agent coordination, human
 interaction—is built on top as mailbox-backed services.
+
+> [!IMPORTANT]
+> The current runtime exposes three ops only: `send`, `spawn`, `trap`.
+> Older references to `receive` or grind mode in this document are historical
+> and should be read as design archaeology, not current behavior.
 
 ## Key Principles
 
 - **Eval is the loop, not an operation.** The runtime calls the LLM in a loop.
   The LLM is the rewrite rule; the context stack is the string being rewritten.
-- **Four ops only.** `send`, `receive`, `spawn`, `trap`. No
+- **Three ops only.** `send`, `spawn`, `trap`. No
   special-cased tool calling, memory, or orchestration primitives.
 - **Everything is a mailbox.** Bash, a key-value store, a human, another
   agent—same interface. The agent doesn't know or care what's behind a mailbox.

@@ -1,8 +1,8 @@
 # Gizmo
 
 Gizmo is a minimal runtime for LLM agents modeled on process calculus and the
-BEAM. An agent is a process with a context stack, a mailbox, and four ops
-(`send`, `receive`, `spawn`, `trap`). Everything else — tool use, memory,
+BEAM. An agent is a process with a context stack, a mailbox, and three ops
+(`send`, `spawn`, `trap`). Everything else — tool use, memory,
 multi-agent coordination, human interaction — is built on top as mailbox-backed
 services.
 
@@ -89,7 +89,6 @@ elixir gizmo.exs my_task.txt
 | `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
 | `--idle` | Idle (restore boot frame) when frames exhaust instead of terminating |
 | `--boot <file>` | Separate boot frame file (used for idle recovery) |
-| `--grind` | Hot-loop mode (no inter-cycle message wait) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
 | `--name <id>` | Custom mailbox ID for the root agent |
 | `--each` | Spawn one agent per positional file (instead of stacking) |
@@ -147,7 +146,6 @@ elixir gizmo.exs --max-cycles 10 task.txt
 
 ```
 gizmo.exs              # The entire runtime (single-file script)
-gizmo_minimal.exs      # Stripped-down runtime (see below)
 flake.nix              # Nix dev shell
 test/                  # Example boot frames
   01_hello.txt         # One-shot greeter
@@ -157,7 +155,7 @@ test/                  # Example boot frames
   05_loop.txt          # Echo-bot loop
   06_chat.txt          # Multi-turn chatbot
   07_reaper.txt        # Reaper service (parent kills child)
-  08_lucky_number.txt  # Grind child + reaper (dice game)
+  08_lucky_number.txt  # Legacy grind/receive experiment (historical)
   09_lucky_number_idle.txt # Idle child + trap (dice game variant)
   10_marketplace.txt   # Disowned peers + blackboard discovery (marketplace)
   11a_named_spawn.txt  # Named child spawn (custom mailbox ID)
@@ -177,14 +175,6 @@ PROMPTING.md           # Guide for writing boot frames
 FUTURE_WORK.md         # Ideas for future development
 DEAD_ENDS.md           # Approaches tried and abandoned
 ```
-
-### `gizmo_minimal.exs`
-
-`gizmo_minimal.exs` is a stripped-down copy of `gizmo.exs` with the inline test
-suite, OpenAI backend, and verbose logging removed. It is functionally equivalent
-(Anthropic-only, trace output preserved) but roughly half the size (~2,700 lines
-vs ~6,500). It may be easier to read when learning the codebase, but `gizmo.exs`
-is the canonical version — always develop against and run from that.
 
 ## Further reading
 

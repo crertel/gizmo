@@ -264,6 +264,62 @@ mental model.
   join message wakes it).
 - **Watchdog service.** Periodic tick messages for agents that need a heartbeat.
 
+## `receive` Op and Grind Mode as Permanent Escape Hatches
+
+**Introduced:** Stage 12
+**Removed:** Stage 19
+
+After the Stage 12 rewrite, the runtime had two models at once:
+
+- the default, message-driven model where every cycle wakes on a mailbox message
+- the old hot-loop model, preserved as `--grind`
+
+The `receive` op survived only to make grind-mode agents viable. In practice,
+that meant the language surface and the prompting guide had to explain two
+different cycle semantics, two different meanings of `${_msg}`, and several
+non-obvious failure modes around interpolation and mailbox consumption.
+
+### Why we removed them
+
+- **The escape hatch became the complexity center.** The default runtime was
+  message-driven, but the docs and examples spent a disproportionate amount of
+  time explaining when *not* to use `receive`, why grind behaved differently,
+  and how to work around same-cycle interpolation hazards.
+- **Autonomous multi-cycle work did not require a second execution model.**
+  Self-messaging, watchdog ticks, idle restore, and traps already covered the
+  real use cases without special semantics.
+- **Tests had to encode two notions of "next cycle."** In message-driven mode,
+  advancing to the next cycle requires an actual wakeup. In grind mode, time
+  alone advances the machine. That split leaked into prompts, examples, and
+  regression tests.
+- **`receive` duplicated `_msg` with worse ergonomics.** It created extra
+  bindings, but only by re-introducing blocking control flow inside a cycle.
+  The resulting prompts were harder to reason about than "send now, handle the
+  response as `${_msg}` next cycle."
+- **The old model encouraged prompt-level protocol tricks.** Patterns like the
+  two-cycle roll worked, but they were artifacts of the runtime's quirks, not
+  primitives we wanted the language to center.
+
+### What replaced them
+
+- **One execution model only:** message-driven wakeups with `${_msg}`,
+  `${_msg_source}`, and `${_payload}`.
+- **Autonomous continuation:** `send` to `${_self}` or schedule watchdog ticks
+  when an agent needs to reawaken itself.
+- **Long-lived workers:** `idle: true` on spawned children rather than
+  hot-looping daemons.
+- **Child / interrupt handling:** `trap` instead of grind-specific polling
+  patterns.
+
+### Result
+
+The runtime surface is now smaller and more uniform:
+
+- ops: `send`, `spawn`, `trap`
+- one inter-cycle message semantics
+- fewer prompt footguns
+- no duplicate "minimal" runtime to keep in sync
+
 ## `untrap` as a Separate Op
 
 **Introduced:** Stage 12 (initial implementation)

@@ -13,8 +13,7 @@ defmodule Gizmo.AgentTest do
       {:ok, _agent_mb, agent_pid} =
         Gizmo.Agent.start(["one shot frame"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
+          receive_timeout: 100
         )
 
       ref = Process.monitor(agent_pid)
@@ -28,44 +27,6 @@ defmodule Gizmo.AgentTest do
 
       assert result == :ok
       assert wait_for_exit_ref(ref, agent_pid) == :normal
-      Gizmo.Mailbox.unregister(test_mb)
-    end
-  end
-
-  describe "receive + timeout" do
-    test "receive timeout stores 'timeout' in binding" do
-      test_mb = register_test_mailbox("timeout_test")
-      cycle = :counters.new(1, [:atomics])
-
-      chat_fn = fn _system, _messages, _opts ->
-        c = :counters.get(cycle, 1)
-        :counters.add(cycle, 1, 1)
-
-        if c == 0 do
-          {:ok, %{ops: [{:receive, "msg"}], frames: ["got it"], notes: %{}}}
-        else
-          {:ok, %{ops: [{:send, test_mb, %{"text" => "${msg}"}}], frames: [], notes: %{}}}
-        end
-      end
-
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["initial frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
-        )
-
-      ref = Process.monitor(pid)
-
-      msg =
-        receive do
-          {:mailbox_msg, ^test_mb, {_from, msg}} -> msg
-        after
-          5_000 -> :no_message
-        end
-
-      assert msg == %{"text" => "timeout"}
-      wait_for_exit_ref(ref, pid)
       Gizmo.Mailbox.unregister(test_mb)
     end
   end
@@ -93,7 +54,7 @@ defmodule Gizmo.AgentTest do
           true ->
             {:ok,
              %{
-               ops: [{:spawn, ["child frame"], "worker", %{}}, {:receive, "result"}],
+               ops: [{:spawn, ["child frame"], "worker", %{}}],
                frames: ["parent waiting"],
                notes: %{}
              }}
@@ -103,8 +64,7 @@ defmodule Gizmo.AgentTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent frame"],
           chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
+          receive_timeout: 5_000
         )
 
       ref = Process.monitor(pid)
@@ -136,8 +96,7 @@ defmodule Gizmo.AgentTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["frame A", "frame B"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
+          receive_timeout: 100
         )
 
       ref = Process.monitor(pid)
@@ -164,11 +123,7 @@ defmodule Gizmo.AgentTest do
             {:ok, %{ops: [], frames: [], notes: %{}}}
 
           1 ->
-            {:ok, %{ops: [{:receive, "input"}], frames: ["waiting for work"], notes: %{}}}
-
-          2 ->
-            {:ok,
-             %{ops: [{:send, test_mb, %{"text" => "${input}"}}], frames: [], notes: %{}}}
+            {:ok, %{ops: [{:send, test_mb, %{"text" => "${_msg}"}}], frames: [], notes: %{}}}
 
           _ ->
             {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -179,7 +134,6 @@ defmodule Gizmo.AgentTest do
         Gizmo.Agent.start(["idle boot frame"],
           chat_fn: chat_fn,
           receive_timeout: 2_000,
-          grind: true,
           quit_on_exhaust: false
         )
 
@@ -220,8 +174,7 @@ defmodule Gizmo.AgentTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["always fail frame"],
           chat_fn: always_fail_fn,
-          receive_timeout: 100,
-          grind: true
+          receive_timeout: 100
         )
 
       ref = Process.monitor(pid)
@@ -259,7 +212,7 @@ defmodule Gizmo.AgentTest do
           c == 0 ->
             {:ok,
              %{
-               ops: [{:spawn, ["crash frame"], "worker", %{}}, {:receive, "death_msg"}],
+               ops: [{:spawn, ["crash frame"], "worker", %{}}],
                frames: ["parent waiting for child death"],
                notes: %{}
              }}
@@ -290,8 +243,7 @@ defmodule Gizmo.AgentTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent frame"],
           chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
+          receive_timeout: 5_000
         )
 
       ref = Process.monitor(pid)
@@ -303,8 +255,8 @@ defmodule Gizmo.AgentTest do
     end
   end
 
-  describe "dest/notes round-trip" do
-    test "binding value forwarded and shown in user message with notes" do
+  describe "_msg/notes round-trip" do
+    test "wake message is shown in the user message with notes" do
       test_mb = register_test_mailbox("notes_test")
       cycle = :counters.new(1, [:atomics])
       capture = Agent.start_link(fn -> nil end) |> elem(1)
@@ -317,9 +269,9 @@ defmodule Gizmo.AgentTest do
           0 ->
             {:ok,
              %{
-               ops: [{:receive, "data"}],
+               ops: [],
                frames: ["check data"],
-               notes: %{"data" => "response from service"}
+               notes: %{"_self" => "agent mailbox"}
              }}
 
           1 ->
@@ -333,7 +285,7 @@ defmodule Gizmo.AgentTest do
 
             {:ok,
              %{
-               ops: [{:send, test_mb, %{"text" => "${data}"}}],
+               ops: [{:send, test_mb, %{"text" => "${_msg}"}}],
                frames: [],
                notes: %{}
              }}
@@ -346,8 +298,7 @@ defmodule Gizmo.AgentTest do
       {:ok, agent_mb, pid} =
         Gizmo.Agent.start(["notes test frame"],
           chat_fn: chat_fn,
-          receive_timeout: 2_000,
-          grind: true
+          receive_timeout: 2_000
         )
 
       Process.sleep(50)
@@ -366,8 +317,8 @@ defmodule Gizmo.AgentTest do
       wait_for_exit_ref(ref, pid, 5_000)
 
       user_msg = Agent.get(capture, & &1)
-      assert user_msg != nil && String.contains?(to_string(user_msg), "${data} = hello_data")
-      assert user_msg != nil && String.contains?(to_string(user_msg), "(response from service)")
+      assert user_msg != nil && String.contains?(to_string(user_msg), "${_msg} = hello_data")
+      assert user_msg != nil && String.contains?(to_string(user_msg), "(agent mailbox)")
 
       Agent.stop(capture)
       Gizmo.Mailbox.unregister(test_mb)

@@ -6,7 +6,6 @@ defmodule Gizmo.OpsTest do
       good_input = %{
         "ops" => [
           %{"op" => "send", "mailbox" => "human", "msg" => %{"text" => "hello"}},
-          %{"op" => "receive", "dest" => "msg"},
           %{"op" => "spawn", "frames" => ["f1", "f2"], "dest" => "child"},
           %{"op" => "trap", "pattern" => "^alert:", "frames" => ["handler"]}
         ],
@@ -15,11 +14,10 @@ defmodule Gizmo.OpsTest do
       }
 
       {:ok, good_result} = Gizmo.LLM.normalize_eval(good_input)
-      assert length(good_result.ops) == 4
+      assert length(good_result.ops) == 3
 
       assert good_result.ops == [
                {:send, "human", %{"text" => "hello"}},
-               {:receive, "msg"},
                {:spawn, ["f1", "f2"], "child", %{}},
                {:trap, "^alert:", ["handler"]}
              ]
@@ -49,13 +47,6 @@ defmodule Gizmo.OpsTest do
     end
   end
 
-  describe "receive validation" do
-    test "receive missing dest" do
-      bad_recv = %{"ops" => [%{"op" => "receive"}], "frames" => []}
-      assert match?({:error, {:invalid_op, "receive", _}}, Gizmo.LLM.normalize_eval(bad_recv))
-    end
-  end
-
   describe "spawn validation" do
     test "spawn missing frames" do
       bad_spawn = %{"ops" => [%{"op" => "spawn", "dest" => "c"}], "frames" => []}
@@ -65,16 +56,6 @@ defmodule Gizmo.OpsTest do
     test "spawn missing dest" do
       bad_spawn2 = %{"ops" => [%{"op" => "spawn", "frames" => ["f"]}], "frames" => []}
       assert match?({:error, {:invalid_op, "spawn", _}}, Gizmo.LLM.normalize_eval(bad_spawn2))
-    end
-
-    test "spawn with grind: true" do
-      spawn_grind = %{
-        "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => true}],
-        "frames" => []
-      }
-
-      {:ok, result} = Gizmo.LLM.normalize_eval(spawn_grind)
-      assert hd(result.ops) == {:spawn, ["f"], "c", %{grind: true}}
     end
 
     test "spawn with idle: true" do
@@ -87,18 +68,6 @@ defmodule Gizmo.OpsTest do
       assert hd(result.ops) == {:spawn, ["f"], "c", %{idle: true}}
     end
 
-    test "spawn with grind+idle" do
-      spawn_both = %{
-        "ops" => [
-          %{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => true, "idle" => false}
-        ],
-        "frames" => []
-      }
-
-      {:ok, result} = Gizmo.LLM.normalize_eval(spawn_both)
-      assert hd(result.ops) == {:spawn, ["f"], "c", %{grind: true, idle: false}}
-    end
-
     test "spawn with no opts gives empty map" do
       spawn_no_opts = %{
         "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c"}],
@@ -107,15 +76,6 @@ defmodule Gizmo.OpsTest do
 
       {:ok, result} = Gizmo.LLM.normalize_eval(spawn_no_opts)
       assert hd(result.ops) == {:spawn, ["f"], "c", %{}}
-    end
-
-    test "spawn grind non-bool" do
-      bad = %{
-        "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "grind" => "yes"}],
-        "frames" => []
-      }
-
-      assert match?({:error, {:invalid_op, "spawn", _}}, Gizmo.LLM.normalize_eval(bad))
     end
 
     test "spawn with disown: true" do

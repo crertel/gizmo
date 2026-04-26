@@ -192,43 +192,4 @@ defmodule Gizmo.MessageDrivenTest do
       Gizmo.Mailbox.unregister(test_mb)
     end
   end
-
-  describe "grind mode" do
-    test "loops without external messages" do
-      test_mb = register_test_mailbox("grind_test")
-      cycle = :counters.new(1, [:atomics])
-
-      chat_fn = fn _system, _messages, _opts ->
-        c = :counters.get(cycle, 1)
-        :counters.add(cycle, 1, 1)
-
-        if c < 3 do
-          {:ok, %{ops: [], frames: ["grind frame"], notes: %{}}}
-        else
-          {:ok,
-           %{ops: [{:send, test_mb, %{"text" => "ground_#{c}"}}], frames: [], notes: %{}}}
-        end
-      end
-
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["grind test frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
-        )
-
-      ref = Process.monitor(pid)
-
-      result =
-        receive do
-          {:mailbox_msg, ^test_mb, {_from, msg}} -> msg
-        after
-          5_000 -> :no_message
-        end
-
-      assert result["text"] == "ground_3"
-      wait_for_exit_ref(ref, pid)
-      Gizmo.Mailbox.unregister(test_mb)
-    end
-  end
 end

@@ -7,15 +7,15 @@ defmodule Gizmo.RuntimeOptionsTest do
 
       chat_fn = fn _system, _messages, _opts ->
         :counters.add(cycle, 1, 1)
-        {:ok, %{ops: [], frames: ["keep going"], notes: %{}}}
+        {:ok,
+         %{ops: [{:send, "${_self}", %{"text" => "next"}}], frames: ["keep going"], notes: %{}}}
       end
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["max cycles test"],
           chat_fn: chat_fn,
           receive_timeout: 100,
-          max_cycles: 5,
-          grind: true
+          max_cycles: 5
         )
 
       ref = Process.monitor(pid)
@@ -39,7 +39,8 @@ defmodule Gizmo.RuntimeOptionsTest do
         if c >= 54 do
           {:ok, %{ops: [], frames: [], notes: %{}}}
         else
-          {:ok, %{ops: [], frames: ["keep going"], notes: %{}}}
+          {:ok,
+           %{ops: [{:send, "${_self}", %{"text" => "next"}}], frames: ["keep going"], notes: %{}}}
         end
       end
 
@@ -47,8 +48,7 @@ defmodule Gizmo.RuntimeOptionsTest do
         Gizmo.Agent.start(["unlimited cycles test"],
           chat_fn: chat_fn,
           receive_timeout: 100,
-          max_cycles: 0,
-          grind: true
+          max_cycles: 0
         )
 
       ref = Process.monitor(pid)
@@ -76,8 +76,7 @@ defmodule Gizmo.RuntimeOptionsTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["quit on exhaust test"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
+          receive_timeout: 100
         )
 
       ref = Process.monitor(pid)
@@ -110,7 +109,10 @@ defmodule Gizmo.RuntimeOptionsTest do
 
         {:ok,
          %{
-           ops: [{:send, test_mb, %{"text" => "cycle-#{c}"}}],
+           ops: [
+             {:send, test_mb, %{"text" => "cycle-#{c}"}},
+             {:send, "${_self}", %{"text" => "again"}}
+           ],
            frames: [],
            notes: %{}
          }}
@@ -121,7 +123,6 @@ defmodule Gizmo.RuntimeOptionsTest do
           chat_fn: chat_fn,
           receive_timeout: 100,
           max_cycles: 3,
-          grind: true,
           quit_on_exhaust: false
         )
 

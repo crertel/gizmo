@@ -6,6 +6,13 @@ reads it, decides what ops to run and what frames to return, and the runtime
 executes a loop: prompt the LLM, run ops, replace the context stack with the
 returned frames, repeat.
 
+> [!IMPORTANT]
+> Current Gizmo has three ops only: `send`, `spawn`, `trap`.
+> `receive` and grind mode were removed after experimentation. If you see older
+> examples referring to them, treat those sections as historical notes pending
+> rewrite. The supported pattern is: send a request now, handle the reply as
+> `${_msg}` on the next wakeup.
+
 ## Quick start
 
 Generate a starter boot frame:
@@ -48,7 +55,7 @@ Understanding the eval loop is critical for writing good prompts.
 3. The LLM returns: ops (operations to execute), frames (new context stack),
    and notes (annotations for bindings).
 4. Interpolation runs on the returned ops and frames BEFORE ops execute.
-5. Ops execute sequentially (send, receive, spawn, trap).
+5. Ops execute sequentially (send, spawn, trap).
 6. The returned frames become the new context stack.
 7. If frames is empty []:
    - Default: the agent terminates.
@@ -80,9 +87,7 @@ bindings are set automatically by the message-driven model:
 - `${_self}` — this agent's mailbox ID
 - `${_parent}` — the parent agent's mailbox ID (spawned children only)
 
-The `spawn` op creates bindings via its `dest` field. The `receive` op
-creates two bindings: `${dest}` (text summary) and `${dest_payload}`
-(full JSON), mirroring `_msg` / `_payload`.
+The `spawn` op creates bindings via its `dest` field.
 
 ```
 # Agent sent {"command": "uname -a"} to bash last cycle. Bash response woke this cycle.

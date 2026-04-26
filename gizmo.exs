@@ -2,7 +2,7 @@
 Mix.install([{:req, "~> 0.5"}])
 
 # =============================================================================
-# Gizmo — Stages 0–12: Skeleton, LLM Client, Interpolation, Mailbox Router, Services, Agent, HumanInput, Spawn, Supervision, CLI, Message-Driven Eval
+# Gizmo — single-file runtime
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -15,7 +15,6 @@ defmodule Gizmo.Format do
   @bold "\e[1m"
   @cyan "\e[36m"
   @green "\e[32m"
-  @yellow "\e[33m"
   @magenta "\e[35m"
   @red "\e[31m"
   # @blue "\e[34m"
@@ -53,10 +52,6 @@ defmodule Gizmo.Format do
     msg_str = if is_map(msg), do: Jason.encode!(msg), else: msg
 
     "#{agent_tag(id)}   #{@green}send#{@reset} #{@bold}#{mailbox}#{@reset} ← #{truncate(msg_str, 80)}"
-  end
-
-  def op_receive(id, dest, timeout) do
-    "#{agent_tag(id)}   #{@yellow}receive#{@reset} → #{@bold}${#{dest}}#{@reset} #{@dim}(timeout: #{timeout}ms)#{@reset}"
   end
 
   def op_spawn(id, child_frames, dest) do
@@ -235,7 +230,7 @@ defmodule Gizmo.LLM do
             properties: %{
               op: %{
                 type: "string",
-                enum: ["send", "receive", "spawn", "trap"],
+                enum: ["send", "spawn", "trap"],
                 description: "The op to invoke."
               },
               pattern: %{
@@ -255,14 +250,7 @@ defmodule Gizmo.LLM do
                 items: %{type: "string"},
                 description: "Frames for child process (for spawn) or handler (for trap)."
               },
-              dest: %{
-                type: "string",
-                description: "Binding name for the result (for receive and spawn)."
-              },
-              grind: %{
-                type: "boolean",
-                description: "Override child loop mode (for spawn). Default: inherit parent."
-              },
+              dest: %{type: "string", description: "Binding name for the child mailbox ID."},
               idle: %{
                 type: "boolean",
                 description:
@@ -349,12 +337,6 @@ defmodule Gizmo.LLM do
     end
   end
 
-  defp validate_op(%{"op" => "receive"} = op) do
-    with :ok <- require_string(op, "dest", "receive") do
-      {:ok, {:receive, op["dest"]}}
-    end
-  end
-
   defp validate_op(%{"op" => "spawn"} = op) do
     with :ok <- require_list(op, "frames", "spawn"),
          :ok <- require_string(op, "dest", "spawn"),
@@ -376,8 +358,7 @@ defmodule Gizmo.LLM do
   defp validate_spawn_opts(op) do
     opts = %{}
 
-    with {:ok, opts} <- validate_spawn_bool(op, "grind", :grind, opts),
-         {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
+    with {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
          {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts),
          {:ok, opts} <- validate_spawn_string(op, "name", :name, opts),
          {:ok, opts} <- validate_spawn_string(op, "model", :model, opts) do
@@ -3345,7 +3326,6 @@ defmodule Gizmo.Migration.Snapshot do
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: state.quit_on_exhaust,
-      grind: state.grind,
       log_timings: state.log_timings,
       log_full_prompts: state.log_full_prompts,
       run_start: state.run_start,
@@ -3451,7 +3431,6 @@ defmodule Gizmo.Migration.Snapshot do
       receive_timeout: agent_snap.receive_timeout,
       max_cycles: agent_snap.max_cycles,
       quit_on_exhaust: agent_snap.quit_on_exhaust,
-      grind: agent_snap.grind,
       log_timings: agent_snap.log_timings,
       log_full_prompts: agent_snap.log_full_prompts,
       run_start: new_run_start,
@@ -3500,7 +3479,6 @@ defmodule Gizmo.Agent.Wrapper do
     receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
     quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, true)
-    grind = Keyword.get(opts, :grind, false)
     log_timings = Keyword.get(opts, :log_timings, false)
     log_full_prompts = Keyword.get(opts, :log_full_prompts, false)
     run_start = Keyword.get(opts, :run_start, System.monotonic_time(:millisecond))
@@ -3527,7 +3505,6 @@ defmodule Gizmo.Agent.Wrapper do
       receive_timeout: receive_timeout,
       max_cycles: max_cycles,
       quit_on_exhaust: quit_on_exhaust,
-      grind: grind,
       log_timings: log_timings,
       log_full_prompts: log_full_prompts,
       run_start: run_start,
@@ -3640,13 +3617,13 @@ defmodule Gizmo.Agent do
 
     ## Cycle lifecycle
 
-    Each eval cycle follows this sequence: wake (receive a message, or
-    immediately in grind mode) → bind ${_msg}/${_msg_source}/${_payload} →
-    build system prompt from context stack → call LLM → interpolate returned
-    ops and frames against current bindings → execute ops in order → replace
-    context stack with returned frames → sleep (or loop in grind mode).
-    Interpolation happens BEFORE ops execute, so a binding set by receive()
-    in this cycle is not available via ${name} until the NEXT cycle.
+    Each eval cycle follows this sequence: wake on a mailbox message →
+    bind ${_msg}/${_msg_source}/${_payload} → build system prompt from
+    context stack → call LLM → interpolate returned ops and frames against
+    current bindings → execute ops in order → replace the context stack
+    with returned frames → sleep until the next message.
+    Interpolation happens BEFORE ops execute, so any value produced by this
+    cycle's ops is not available via ${name} until the NEXT cycle.
 
     ## eval_response contract
 
@@ -3677,11 +3654,10 @@ defmodule Gizmo.Agent do
     - ${_msg} = message["text"] if present, otherwise the full JSON encoding.
     - ${_payload} = the full JSON encoding of the message, always.
     - Trap regex matching operates against the ${_msg} string.
-    - receive("x") stores the text summary in ${x} and the full JSON in ${x_payload}.
 
     ## Ops
 
-    You have four ops, issued as JSON objects in the ops array. Only include
+    You have three ops, issued as JSON objects in the ops array. Only include
     the ops you actually need. Do NOT include ops you don't use.
 
     - send: Send a message to a named mailbox. Non-blocking, fire-and-forget.
@@ -3690,22 +3666,11 @@ defmodule Gizmo.Agent do
       human-readable summary. ${name} interpolation works inside msg values.
       {"op": "send", "mailbox": "<target>", "msg": {"text": "hello"}}
 
-    - receive: Block until a message arrives in your mailbox. Two bindings
-      are created: ${dest} holds the text summary (the "text" field of the
-      JSON message, or the full JSON if no "text" key), and ${dest_payload}
-      holds the full JSON encoding. This mirrors _msg/_payload.
-      NOTE: In message-driven mode (the default), you usually do NOT need
-      receive — messages arrive automatically as ${_msg} between cycles.
-      Use receive only in grind mode or when you need to explicitly block
-      mid-cycle.
-      {"op": "receive", "dest": "<binding_name>"}
-
     - spawn: Create a child process with the given frames as its context
       stack. The child's mailbox ID is stored in the binding named by "dest".
       The child receives ${_parent} bound to your mailbox ID.
       {"op": "spawn", "frames": ["<task text>"], "dest": "<binding_name>"}
       Optional fields:
-        "grind": true/false — override child's loop mode (default: inherit).
         "idle": true/false — child restores boot frame on empty (default: inherit).
         "disown": true — detach child (no ${_parent}, no death monitor).
         "name": "<id>" — custom mailbox ID (must be unique; duplicate triggers op error).
@@ -3753,7 +3718,7 @@ defmodule Gizmo.Agent do
     ## Interpolation
 
     In message object values and frames, you can use:
-    - ${name} — named binding from receive or spawn results
+    - ${name} — named binding from prior cycles or spawn results
     - $$ — literal dollar sign
     - @N — inject frame N (0-indexed) from your current context stack verbatim
     - @name — inject the contents of a named section (see below)
@@ -3923,19 +3888,6 @@ defmodule Gizmo.Agent do
     "watchdog". Ticks arrive with ${_msg} = "tick" from source "watchdog".
     Send {"action": "cancel"} to stop all your timers.
 
-    ## Grind mode
-
-    In grind mode (set via --grind flag or "grind": true in spawn), the
-    process loops continuously without waiting for messages between cycles.
-    ${_msg} and ${_msg_source} are NOT re-bound after the first cycle —
-    they stay as "init"/"runtime". Use explicit receive ops to block for
-    messages when needed. Bindings from receive and spawn persist across
-    cycles as long as the frame stack does not drain to [].
-
-    Grind mode is useful for worker agents that need to churn through
-    multi-step work using blocking receive ops rather than waiting for
-    messages to arrive between cycles.
-
     ## Idle mode
 
     By default, returning frames: [] terminates the process. In idle mode
@@ -3987,11 +3939,10 @@ defmodule Gizmo.Agent do
        interpolated by the runtime and produce unexpected results. Only use
        @name references as standalone frame entries like ["@step2"].
 
-    3. DO NOT issue receive ops in message-driven mode (the default). All
-       responses arrive automatically as ${_msg} on the next cycle. Sending
-       to 'human' is fire-and-forget. Sending to 'bash', 'blackboard', or
-       'human_input' produces a response that arrives as ${_msg} — return a
-       continuation frame to handle it on the next cycle.
+    3. All responses arrive automatically as ${_msg} on the next cycle.
+       Sending to 'human' is fire-and-forget. Sending to 'bash',
+       'blackboard', or 'human_input' produces a response that arrives as
+       ${_msg} — return a continuation frame to handle it on the next cycle.
 
     4. ONLY issue ops you need THIS cycle. Do not pre-issue ops for future
        steps. Each cycle should do one logical step, then hand off to the next
@@ -4025,12 +3976,11 @@ defmodule Gizmo.Agent do
       {"ops": [{"op": "send", "mailbox": "bash", "msg": {"command": "ls"}}],
        "frames": ["@step2"], "notes": {}}
 
-    Spawn child and receive result (grind mode):
+    Spawn child and wait for its reply naturally:
       {"ops": [
-         {"op": "spawn", "frames": ["Send result to ${_parent}, then terminate."], "dest": "kid"},
-         {"op": "receive", "dest": "result"}
+         {"op": "spawn", "frames": ["Send result to ${_parent}, then terminate."], "dest": "kid"}
        ],
-       "frames": ["@0"], "notes": {"result": "child's reply"}}
+       "frames": ["Wait for the child's reply in ${_msg}. Use it, then terminate."], "notes": {}}
     """
   end
 
@@ -4127,10 +4077,7 @@ defmodule Gizmo.Agent do
     eval_loop_inner(context_stack, state, loop)
   end
 
-  # Inter-cycle message wait: determines whether to block for a mailbox message.
-  # First cycle: no wait, bind _msg="init", _msg_source="runtime".
-  # Grind mode: no wait, loop immediately.
-  # Message-driven (default): block on receive, bind _msg/_msg_source, check trap.
+  # Inter-cycle message wait: first cycle synthesizes init, later cycles block for a mailbox message.
   defp maybe_wait_for_message(_state, %{cycles: 0}, bindings, binding_notes, context_stack) do
     # First cycle: no wait, synthetic init message
     bindings =
@@ -4145,11 +4092,6 @@ defmodule Gizmo.Agent do
       |> Map.put("_msg_source", "message source")
       |> Map.put("_payload", "full JSON payload")
 
-    {bindings, binding_notes, context_stack}
-  end
-
-  defp maybe_wait_for_message(%{grind: true}, _loop, bindings, binding_notes, context_stack) do
-    # Grind mode: no wait, loop immediately
     {bindings, binding_notes, context_stack}
   end
 
@@ -4309,7 +4251,7 @@ defmodule Gizmo.Agent do
       0 -> :ok
     end
 
-    # Inter-cycle message wait: block until a message arrives (unless grind or first cycle)
+    # Inter-cycle message wait: block until a message arrives (except cycle 0)
     {bindings, binding_notes, context_stack} =
       maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
 
@@ -4389,9 +4331,6 @@ defmodule Gizmo.Agent do
           case op do
             {:send, mb, msg} ->
               Logger.info(Gizmo.Format.op_send(id, mb, msg))
-
-            {:receive, dest} ->
-              Logger.info(Gizmo.Format.op_receive(id, dest, state.receive_timeout))
 
             {:spawn, cf, dest, _opts} ->
               Logger.info(Gizmo.Format.op_spawn(id, cf, dest))
@@ -4509,7 +4448,6 @@ defmodule Gizmo.Agent do
   defp format_ops_for_trace(ops) do
     Enum.map(ops, fn
       {:send, mb, msg} -> %{op: "send", mailbox: mb, msg: msg}
-      {:receive, dest} -> %{op: "receive", dest: dest}
       {:spawn, frames, dest, opts} -> %{op: "spawn", frames: frames, dest: dest, opts: opts}
       {:trap, pattern, frames} -> %{op: "trap", pattern: pattern, frames: frames}
     end)
@@ -4553,12 +4491,10 @@ defmodule Gizmo.Agent do
   end
 
   defp op_name({:send, _, _}), do: "send"
-  defp op_name({:receive, _}), do: "receive"
   defp op_name({:spawn, _, _, _}), do: "spawn"
   defp op_name({:trap, _, _}), do: "trap"
 
   defp op_summary({:send, mb, _}), do: "send(to='#{mb}')"
-  defp op_summary({:receive, dest}), do: "receive(dest='#{dest}')"
   defp op_summary({:spawn, _, dest, _}), do: "spawn(dest='#{dest}')"
   defp op_summary({:trap, pattern, _}), do: "trap(pattern='#{pattern}')"
 
@@ -4567,36 +4503,7 @@ defmodule Gizmo.Agent do
     {:cont, frames, bindings, trap}
   end
 
-  defp execute_op({:receive, dest}, frames, state, bindings, trap) do
-    message =
-      receive do
-        {:mailbox_msg, _to, {_from_mb, message}} ->
-          message
-      after
-        state.receive_timeout ->
-          "timeout"
-      end
-
-    {text_str, payload_str} =
-      case message do
-        m when is_map(m) ->
-          {Map.get(m, "text", Jason.encode!(m)), Jason.encode!(m)}
-
-        s when is_binary(s) ->
-          {s, s}
-      end
-
-    new_bindings =
-      bindings
-      |> Map.put(dest, text_str)
-      |> Map.put("#{dest}_payload", payload_str)
-
-    {:cont, frames, new_bindings, trap}
-  end
-
   defp execute_op({:spawn, child_frames, dest, spawn_opts}, frames, state, bindings, trap) do
-    child_grind = Map.get(spawn_opts, :grind, state.grind)
-
     child_quit_on_exhaust =
       if Map.has_key?(spawn_opts, :idle),
         do: !spawn_opts.idle,
@@ -4632,7 +4539,6 @@ defmodule Gizmo.Agent do
       receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: child_quit_on_exhaust,
-      grind: child_grind,
       log_timings: state.log_timings,
       log_full_prompts: state.log_full_prompts,
       run_start: state.run_start,
@@ -4718,7 +4624,6 @@ defmodule Gizmo.CLI do
           max_cycles: :integer,
           boot: :string,
           idle: :boolean,
-          grind: :boolean,
           watchdog: :integer,
           log_timings: :boolean,
           log_full_prompts: :boolean,
@@ -4818,13 +4723,12 @@ defmodule Gizmo.CLI do
       --test              Run smoke tests, then exit
       --init <file>       Write a starter boot frame to <file>
       -v                  Lifecycle + cycle headers + frames summary
-      -vv                 + ops per cycle (send, receive, spawn, trap)
+      -vv                 + ops per cycle (send, spawn, trap)
       -vvv                + bindings, full frame content
       --thinking          Enable extended thinking (Anthropic only)
       --model <id>        LLM model to use (default: env var or claude-sonnet-4-20250514)
       --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
       --idle              Idle (restore boot frame) when frames exhaust instead of terminating
-      --grind             Hot-loop eval (no inter-cycle message wait)
       --watchdog N        Send periodic watchdog:tick messages every N ms
       --boot <file>       Separate boot frame file (used for idle recovery)
       --log-timings       Show LLM call, cycle, and wall-clock timing per eval cycle
@@ -5062,7 +4966,6 @@ defmodule Gizmo.CLI do
     thinking = opts[:thinking] || false
     max_cycles = opts[:max_cycles]
     idle = opts[:idle] || false
-    grind = opts[:grind] || false
     watchdog_ms = opts[:watchdog]
 
     # Build trace outputs list
@@ -5129,7 +5032,6 @@ defmodule Gizmo.CLI do
 
     run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
     run_opts = if idle, do: Keyword.put(run_opts, :quit_on_exhaust, false), else: run_opts
-    run_opts = if grind, do: Keyword.put(run_opts, :grind, true), else: run_opts
 
     run_opts =
       if opts[:log_timings], do: Keyword.put(run_opts, :log_timings, true), else: run_opts

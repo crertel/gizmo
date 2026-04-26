@@ -26,17 +26,17 @@ The LLM returns structured JSON via a forced tool call (`eval_response`),
 eliminating the need for a text parser. The `eval_response` tool schema
 defines the ops array and frames array directly.
 
-- [x] `eval_response` tool schema with ops (send/receive/spawn/trap) and frames
+- [x] `eval_response` tool schema with ops (send/spawn/trap) and frames
 - [x] Anthropic: forced via `tool_choice: {type: "tool", name: "eval_response"}`
 - [x] OpenAI: forced via `response_format: {type: "json_schema", ...}`
-- [x] Normalized to Elixir tuples: `{:send, mailbox, msg}`, `:receive`, etc.
+- [x] Normalized to Elixir tuples: `{:send, mailbox, msg}`, `{:spawn, ...}`, `{:trap, ...}`
 - [x] Validation of op fields (`validate_op/1` — send requires mailbox + msg, spawn requires frames + dest, etc.)
 
 ## Stage 3: Interpolation
 
 Resolve `${name}` references in text.
 
-- [x] `${name}` named resolution against a bindings map (populated by `receive(dest)` and `spawn(dest)`)
+- [x] `${name}` named resolution against a bindings map (populated by `spawn(dest)` and runtime bindings)
 - [x] Escaping (`$$` for literal `$`)
 - [x] Apply interpolation to frame text and message content (`interpolate_response/3`)
 - [x] Unit tests (in-process smoke tests via `--test`)
@@ -171,18 +171,15 @@ between cycles and wake on mailbox messages.
 - [x] ~`untrap` op~ — removed, `trap(pattern, [])` clears trap (see DEAD_ENDS.md)
 - [x] Refactor `eval_loop/7` to `eval_loop/3` with loop map
 - [x] Thread trap through `execute_ops`/`execute_op`
-- [x] Add `grind` flag (opt-in hot-loop for worker agents)
 - [x] Implement inter-cycle message wait (`maybe_wait_for_message`)
   - First cycle: `${_msg} = "init"`, `${_msg_source} = "runtime"`
-  - Grind mode: no wait (preserves old behavior)
   - Default: block on `receive`, bind `${_msg}` / `${_msg_source}`
   - Trap match: bind `${_interrupt}` / `${_interrupt_source}`, prepend handler frames
 - [x] Replace `fork`/`join` with `spawn` + `_self`/`_parent` bindings (see DEAD_ENDS.md)
 - [x] Add `Gizmo.Services.Watchdog` — periodic tick messages to target mailbox
 - [x] Update `runtime_prompt()` with message-driven model, trap, watchdog docs
-- [x] CLI: `--grind`, `--watchdog <ms>` flags
-- [x] Existing tests updated with `grind: true` to preserve behavior
-- [x] New smoke tests: first cycle init, message-driven wake, trap fire, trap no-match, grind mode
+- [x] CLI: `--watchdog <ms>` flag
+- [x] New smoke tests: first cycle init, message-driven wake, trap fire, trap no-match
 - [x] Op set evolution: `send, receive, fork, join` → `send, receive, spawn, trap`
 
 ## Stage 13: Reaper Service
@@ -198,6 +195,16 @@ mailbox ID to the reaper.
 - [x] Parent receives `child_died:` notification as usual (no special case)
 - [x] Tests: parent kills child, sibling rejected (smoke tests in `--test`)
 - [x] Test frame: `test/08_lucky_number.txt` — grind child rolls dice, parent reaps on 1
+
+## Stage 19: Remove `receive`, Remove Grind, Collapse to One Execution Model
+
+Cut the experimental escape hatches and keep the runtime message-driven only.
+
+- [x] Remove `receive` from the eval schema, validation, tracing, logging, and op execution
+- [x] Remove grind from CLI, runtime state, spawn options, and migration snapshots
+- [x] Convert runtime tests to self-message / natural wakeup patterns
+- [x] Delete `gizmo_minimal.exs`
+- [x] Record the outcome in `DEAD_ENDS.md`
 
 ## Stage 14: Agent Naming and Multi-Agent CLI
 

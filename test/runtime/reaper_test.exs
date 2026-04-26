@@ -20,7 +20,10 @@ defmodule Gizmo.ReaperTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["reaper child frame"], "kid", %{}}],
+                 ops: [
+                   {:spawn, ["reaper child frame"], "kid", %{}},
+                   {:send, "${_self}", %{"text" => "continue"}}
+                 ],
                  frames: ["parent: send kill to reaper"],
                  notes: %{}
                }}
@@ -28,10 +31,7 @@ defmodule Gizmo.ReaperTest do
             1 ->
               {:ok,
                %{
-                 ops: [
-                   {:send, "reaper", %{"target" => "${kid}"}},
-                   {:receive, "death_note"}
-                 ],
+                 ops: [{:send, "reaper", %{"target" => "${kid}"}}],
                  frames: ["parent: forward death notification"],
                  notes: %{}
                }}
@@ -39,7 +39,7 @@ defmodule Gizmo.ReaperTest do
             2 ->
               {:ok,
                %{
-                 ops: [{:send, test_mb, %{"text" => "${death_note}"}}],
+                 ops: [{:send, test_mb, %{"text" => "${_msg}"}}],
                  frames: [],
                  notes: %{}
                }}
@@ -53,8 +53,7 @@ defmodule Gizmo.ReaperTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent: spawn child"],
           chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
+          receive_timeout: 5_000
         )
 
       ref = Process.monitor(pid)
@@ -112,8 +111,7 @@ defmodule Gizmo.ReaperTest do
       {:ok, _attacker_mb, _attacker_pid} =
         Gizmo.Agent.start(["attacker: try to kill target"],
           chat_fn: attacker_chat_fn,
-          receive_timeout: 5_000,
-          grind: true
+          receive_timeout: 5_000
         )
 
       # Wait for attacker to signal it's done

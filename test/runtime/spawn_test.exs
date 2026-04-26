@@ -3,7 +3,7 @@ defmodule Gizmo.SpawnTest do
   import Gizmo.TestSupport
 
   describe "spawn opts" do
-    test "grind parent spawns message-driven child" do
+    test "parent spawns child and sends it a message" do
       test_mb = register_test_mailbox("spawn_opts_test")
       parent_cycle = :counters.new(1, [:atomics])
       child_cycle = :counters.new(1, [:atomics])
@@ -31,7 +31,10 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["msg-child"], "kid", %{grind: false}}],
+                 ops: [
+                   {:spawn, ["msg-child"], "kid", %{}},
+                   {:send, "${_self}", %{"text" => "continue"}}
+                 ],
                  frames: ["parent: send to child"],
                  notes: %{}
                }}
@@ -47,11 +50,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn msg child"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn msg child"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 
@@ -67,17 +66,17 @@ defmodule Gizmo.SpawnTest do
       Gizmo.Mailbox.unregister(test_mb)
     end
 
-    test "message-driven parent spawns grind child" do
+    test "message-driven parent spawns child" do
       test_mb = register_test_mailbox("spawn_opts_test2")
       parent_cycle = :counters.new(1, [:atomics])
 
       chat_fn = fn system, _messages, _opts ->
         sys = flatten_system(system)
 
-        if String.contains?(sys, "grind-child") do
+        if String.contains?(sys, "worker-child") do
           {:ok,
            %{
-             ops: [{:send, test_mb, %{"text" => "grind child done"}}],
+             ops: [{:send, test_mb, %{"text" => "worker child done"}}],
              frames: [],
              notes: %{}
            }}
@@ -88,7 +87,7 @@ defmodule Gizmo.SpawnTest do
           case c do
             0 ->
               {:ok,
-               %{ops: [{:spawn, ["grind-child"], "kid", %{grind: true}}], frames: [], notes: %{}}}
+               %{ops: [{:spawn, ["worker-child"], "kid", %{}}], frames: [], notes: %{}}}
 
             _ ->
               {:ok, %{ops: [], frames: [], notes: %{}}}
@@ -97,11 +96,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, mb, pid} =
-        Gizmo.Agent.start(["parent: spawn grind child"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: false
-        )
+        Gizmo.Agent.start(["parent: spawn child"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       Gizmo.Mailbox.route(mb, {"test", %{"text" => "start"}})
 
@@ -115,7 +110,7 @@ defmodule Gizmo.SpawnTest do
         end
 
       wait_for_exit_ref(ref, pid, 5_000)
-      assert result["text"] == "grind child done"
+      assert result["text"] == "worker child done"
       Gizmo.Mailbox.unregister(test_mb)
     end
 
@@ -151,7 +146,7 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["disown-child"], "kid", %{disown: true, grind: true}}],
+                 ops: [{:spawn, ["disown-child"], "kid", %{disown: true}}],
                  frames: [],
                  notes: %{}
                }}
@@ -163,11 +158,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn disown child"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn disown child"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 
@@ -215,7 +206,7 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["named-child"], "kid", %{name: "my_worker", grind: true}}],
+                 ops: [{:spawn, ["named-child"], "kid", %{name: "my_worker"}}],
                  frames: [],
                  notes: %{}
                }}
@@ -227,11 +218,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn named child"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn named child"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 
@@ -271,7 +258,10 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["collide-child"], "kid1", %{name: "unique_name", grind: true}}],
+                 ops: [
+                   {:spawn, ["collide-child"], "kid1", %{name: "unique_name"}},
+                   {:send, "${_self}", %{"text" => "continue"}}
+                 ],
                  frames: ["parent: spawn second"],
                  notes: %{}
                }}
@@ -279,7 +269,10 @@ defmodule Gizmo.SpawnTest do
             1 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["collide-child"], "kid2", %{name: "unique_name", grind: true}}],
+                 ops: [
+                   {:send, "${_self}", %{"text" => "continue"}},
+                   {:spawn, ["collide-child"], "kid2", %{name: "unique_name"}}
+                 ],
                  frames: ["parent: check error"],
                  notes: %{}
                }}
@@ -303,11 +296,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn collision test"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn collision test"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 
@@ -347,7 +336,7 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["model-child"], "kid", %{model: "test-model", grind: true}}],
+                 ops: [{:spawn, ["model-child"], "kid", %{model: "test-model"}}],
                  frames: [],
                  notes: %{}
                }}
@@ -359,11 +348,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn child with model"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn child with model"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 
@@ -402,7 +387,7 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [{:spawn, ["inherit-child"], "kid", %{grind: true}}],
+                 ops: [{:spawn, ["inherit-child"], "kid", %{}}],
                  frames: [],
                  notes: %{}
                }}
@@ -414,11 +399,7 @@ defmodule Gizmo.SpawnTest do
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn child without model"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000,
-          grind: true
-        )
+        Gizmo.Agent.start(["parent: spawn child without model"], chat_fn: chat_fn, receive_timeout: 5_000)
 
       ref = Process.monitor(pid)
 

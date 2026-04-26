@@ -27,8 +27,7 @@ defmodule Gizmo.SupervisionTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["supervised agent frame"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
-          grind: true
+          receive_timeout: 100
         )
 
       ref = Process.monitor(pid)
