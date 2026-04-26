@@ -12,8 +12,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, _agent_mb, agent_pid} =
         Gizmo.Agent.start(["one shot frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 100
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(agent_pid)
@@ -63,8 +62,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(pid)
@@ -95,8 +93,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["frame A", "frame B"],
-          chat_fn: chat_fn,
-          receive_timeout: 100
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(pid)
@@ -133,7 +130,6 @@ defmodule Gizmo.AgentTest do
       {:ok, agent_mb, pid} =
         Gizmo.Agent.start(["idle boot frame"],
           chat_fn: chat_fn,
-          receive_timeout: 2_000,
           quit_on_exhaust: false
         )
 
@@ -173,8 +169,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["always fail frame"],
-          chat_fn: always_fail_fn,
-          receive_timeout: 100
+          chat_fn: always_fail_fn
         )
 
       ref = Process.monitor(pid)
@@ -242,8 +237,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(pid)
@@ -297,8 +291,7 @@ defmodule Gizmo.AgentTest do
 
       {:ok, agent_mb, pid} =
         Gizmo.Agent.start(["notes test frame"],
-          chat_fn: chat_fn,
-          receive_timeout: 2_000
+          chat_fn: chat_fn
         )
 
       Process.sleep(50)

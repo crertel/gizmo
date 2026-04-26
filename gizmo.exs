@@ -3323,7 +3323,6 @@ defmodule Gizmo.Migration.Snapshot do
       mailbox_id: state.mailbox_id,
       parent: state.parent,
       chat_config: state.chat_config,
-      receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: state.quit_on_exhaust,
       log_timings: state.log_timings,
@@ -3428,7 +3427,6 @@ defmodule Gizmo.Migration.Snapshot do
       parent: agent_snap.parent,
       chat_fn: chat_fn,
       chat_config: chat_config,
-      receive_timeout: agent_snap.receive_timeout,
       max_cycles: agent_snap.max_cycles,
       quit_on_exhaust: agent_snap.quit_on_exhaust,
       log_timings: agent_snap.log_timings,
@@ -3463,7 +3461,6 @@ end
 
 defmodule Gizmo.Agent.Wrapper do
   require Logger
-  @default_receive_timeout 30_000
 
   def start_link({frames, opts, caller}) do
     :proc_lib.start_link(__MODULE__, :init_agent, [{frames, opts, caller}])
@@ -3476,7 +3473,6 @@ defmodule Gizmo.Agent.Wrapper do
       Keyword.get(opts, :chat_config, %{backend: :anthropic, model: nil, thinking: false})
 
     parent = Keyword.get(opts, :parent, nil)
-    receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
     quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, true)
     log_timings = Keyword.get(opts, :log_timings, false)
@@ -3502,7 +3498,6 @@ defmodule Gizmo.Agent.Wrapper do
       parent: parent,
       chat_fn: chat_fn,
       chat_config: chat_config,
-      receive_timeout: receive_timeout,
       max_cycles: max_cycles,
       quit_on_exhaust: quit_on_exhaust,
       log_timings: log_timings,
@@ -3995,7 +3990,6 @@ defmodule Gizmo.Agent do
   Options:
     - parent: parent mailbox_id (provides ${_parent} binding)
     - chat_fn: fn(system, messages, opts) -> {:ok, eval_response} (default: Anthropic)
-    - receive_timeout: ms (default 30_000)
   """
   def start(frames, opts \\ []) do
     caller = self()
@@ -4536,7 +4530,6 @@ defmodule Gizmo.Agent do
       parent: parent_arg,
       chat_fn: child_chat_fn,
       chat_config: child_chat_config,
-      receive_timeout: state.receive_timeout,
       max_cycles: state.max_cycles,
       quit_on_exhaust: child_quit_on_exhaust,
       log_timings: state.log_timings,
@@ -5001,13 +4994,23 @@ defmodule Gizmo.CLI do
         do: :openai,
         else: :anthropic
 
+    base_chat_fn =
+      case backend do
+        :openai -> &Gizmo.LLM.OpenAI.chat/3
+        :anthropic -> &Gizmo.LLM.Anthropic.chat/3
+      end
+
+    run_opts = Keyword.put(run_opts, :chat_fn, base_chat_fn)
+
     run_opts =
       if thinking do
-        chat_fn = fn system, messages, chat_opts ->
-          Gizmo.LLM.Anthropic.chat(system, messages, Keyword.put(chat_opts, :thinking, true))
+        chat_fn = run_opts[:chat_fn]
+
+        wrapped = fn system, messages, chat_opts ->
+          chat_fn.(system, messages, Keyword.put(chat_opts, :thinking, true))
         end
 
-        Keyword.put(run_opts, :chat_fn, chat_fn)
+        Keyword.put(run_opts, :chat_fn, wrapped)
       else
         run_opts
       end
@@ -5016,7 +5019,7 @@ defmodule Gizmo.CLI do
 
     run_opts =
       if model do
-        chat_fn = run_opts[:chat_fn] || (&Gizmo.LLM.Anthropic.chat/3)
+        chat_fn = run_opts[:chat_fn]
 
         wrapped = fn system, messages, chat_opts ->
           chat_fn.(system, messages, Keyword.put(chat_opts, :model, model))

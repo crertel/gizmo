@@ -1,396 +1,242 @@
 # Gizmo Architecture
 
 Gizmo is a minimal runtime for LLM agents modeled on process calculus and the
-BEAM. An agent is a process with a context stack, a mailbox, and three ops.
-Everything else—tool use, memory, multi-agent coordination, human
-interaction—is built on top as mailbox-backed services.
-
-> [!IMPORTANT]
-> The current runtime exposes three ops only: `send`, `spawn`, `trap`.
-> Older references to `receive` or grind mode in this document are historical
-> and should be read as design archaeology, not current behavior.
+BEAM. An agent is a process with a context stack, a mailbox, and three ops:
+`send`, `spawn`, and `trap`. Everything else, including tool use, memory,
+timers, and multi-agent coordination, is implemented as mailbox-backed
+services.
 
 ## Key Principles
 
 - **Eval is the loop, not an operation.** The runtime calls the LLM in a loop.
-  The LLM is the rewrite rule; the context stack is the string being rewritten.
-- **Three ops only.** `send`, `spawn`, `trap`. No
-  special-cased tool calling, memory, or orchestration primitives.
+- **Three ops only.** `send`, `spawn`, `trap`.
 - **Everything is a mailbox.** Bash, a key-value store, a human, another
-  agent—same interface. The agent doesn't know or care what's behind a mailbox.
-- **The context stack is the prompt.** Frames are concatenated bottom-up and
-  sent to the LLM. The boot frame is always the prefix, enabling prompt
-  caching.
+  agent: same message interface.
+- **The context stack is the prompt.** Frames are concatenated into the system
+  prompt. The boot frame remains the stable prefix for prompt caching.
 
 ## Process Model
 
-```
+```text
 ┌─────────────────────────────┐
 │         Agent Process       │
 │  (plain process via         │
 │   :proc_lib / Wrapper)      │
 │                             │
-│  context_stack: [frame]     │  ← the prompt, bottom-up
-│  mailbox_id:    mb_id       │  ← address for receiving messages
+│  context_stack: [frame]     │  ← prompt, bottom-up
+│  mailbox_id:    mb_id       │  ← receiving address
 │  parent_id:     mb_id|nil   │  ← ${_parent} binding
+│  trap:          {regex, frames}|nil
 │                             │
-│  trap:           {regex, frames}|nil
-│  grind:          bool           │
-│                                 │
-│  eval loop:                     │
-│    wait for message (or grind)  │
-│    check trap → prepend handler │
-│    concat stack → LLM           │
-│    LLM → {ops, frames}         │
-│    execute ops                  │
-│    replace stack with frames    │
-│    repeat                       │
-└─────────────────────────────────┘
+│  eval loop:                 │
+│    wait for mailbox message │
+│    check trap               │
+│    build prompt             │
+│    LLM → {ops, frames}      │
+│    execute ops              │
+│    replace stack            │
+│    repeat                   │
+└─────────────────────────────┘
 ```
 
-By default, agents **terminate** when the context stack drains to `[]`.
-With `--idle`, the boot frame is restored instead and the agent waits for
-new messages — useful for long-running daemon-style agents.
+By default, agents terminate when the context stack drains to `[]`. With
+`--idle`, the boot frame is restored instead and the agent waits for new
+messages.
 
 ## Ops
 
 | Op | JSON format | Behavior |
-|---------|-----------|----------|
-| `send`  | `{"op": "send", "mailbox": "...", "msg": {...}}` | Async fire-and-forget message to any mailbox. `msg` is always a JSON object. Non-blocking. |
-| `receive` | `{"op": "receive", "dest": "..."}` | Block until a message arrives. Text summary stored in `dest`, full JSON in `dest_payload`. |
-| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create child process with given frames. Child mailbox ID stored in binding `dest`. Optional fields: `grind` (override loop mode), `idle` (override exhaust behavior), `disown` (no `_parent` binding, no death monitor), `name` (custom mailbox ID instead of auto-generated), `model` (override LLM model for child). |
-| `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register interrupt handler. PCRE regex pattern matched against inter-cycle messages. On match, handler frames prepend to stack. Empty frames clears the trap. |
+|----|-------------|----------|
+| `send` | `{"op": "send", "mailbox": "...", "msg": {...}}` | Async message delivery to any mailbox. `msg` is always a JSON object. |
+| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create a child process. Store the child's mailbox ID in binding `dest`. Optional fields: `idle`, `disown`, `name`, `model`. |
+| `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register an interrupt handler. On match, handler frames are prepended to the stack. Empty frames clear the trap. |
 
-All message content is interpolated (`${name}` from bindings) at operation
-time.
+Interpolation applies to op payloads and returned frames before ops execute.
 
 ## Well-Known Services
 
-These are supervised processes with fixed mailbox names, registered at boot
-by `Gizmo.Supervision`. They are not syscalls.
+These are supervised processes with fixed mailbox names. They are ordinary
+mailbox endpoints, not special opcodes.
 
 | Service | Mailbox | Purpose |
 |---------|---------|---------|
-| **blackboard** | `"blackboard"` | Key-value store. Shared memory. `{"action": "read", "key": "..."}` / `{"action": "write", "key": "...", "value": "..."}`. |
-| **bash** | `"bash"` | Shell command execution. `{"command": "..."}` with optional `"timeout"`, `"mode"`, `"note"`. |
-| **human** | `"human"` | Terminal output. `{"text": "..."}`. |
-| **human_input** | `"human_input"` | Terminal input. `{"prompt": "..."}`, responds with user's typed line. |
-| **exception** | `"exception"` | Error notification sink. Receives agent retry/cycle exhaustion reports. |
-| **reaper** | `"reaper"` | Agent lifecycle. `{"target": "<mailbox_id>"}` to kill a descendant. |
-| **watchdog** | `"watchdog"` | Timer service. `{"action": "every/after/cancel/list", "ms": N}`. |
-| **pager** | `"pager"` | Document pager. `{"action": "open", "path": "..."}` spawns a per-document session. |
-| **batch** | `"batch"` | Fan-out parallel requests. `{"requests": [...], "timeout": N}` → collects all results. |
-| **eval** | `"eval"` | Evaluate Elixir expressions. `{"code": "...", "timeout": N}` with AST allowlist sandboxing. |
-| **factory** | `"factory"` | Create custom stateful services at runtime. `{"action": "create", "name": "...", "code": "fn msg, state -> ... end", "state": init}`. Workers register as their own mailbox. |
-| **migration** | `"migration"` | Live runtime migration. `{"action": "migrate", "script": "/path/to/gizmo.exs"}` snapshots all agents and services, spawns a new BEAM via `:peer`, transfers state, and shuts down the old node. Requires `--node` and `--cookie`. |
+| `blackboard` | `"blackboard"` | Key-value store. |
+| `bash` | `"bash"` | Shell command execution with optional timeout/mode. |
+| `human` | `"human"` | Terminal output. |
+| `human_input` | `"human_input"` | Terminal input. |
+| `exception` | `"exception"` | Error notification sink. |
+| `reaper` | `"reaper"` | Kill descendant agents. |
+| `watchdog` | `"watchdog"` | Timer service: `every`, `after`, `cancel`, `list`. |
+| `pager` | `"pager"` | Document pager with per-document sessions. |
+| `batch` | `"batch"` | Parallel fan-out and result collection. |
+| `eval` | `"eval"` | Sandboxed Elixir expression evaluation. |
+| `factory` | `"factory"` | Runtime creation of custom stateful services. |
+| `migration` | `"migration"` | Live runtime migration. |
 
-Per-agent state (not well-known, created per agent instance):
+Per-agent runtime state:
 
 | Component | Scope | Purpose |
 |-----------|-------|---------|
-| **bindings** | in-process | Named bindings map. Values from `receive` (`dest` + `dest_payload`), `spawn` (`dest`), runtime (`_self`, `_parent`, `_msg`, `_payload`, `_msg_source`), and error recovery (`_op_error`, `_pending_ops`). Threaded through eval loop. |
-| **messages queue** | per-agent | FIFO queue of `{content, source}` tuples. Each agent gets its own `MessagesQueue` GenServer. Currently unused in the runtime path (write-only scaffolding removed); the module is retained for test assertions. |
+| `bindings` | in-process | Named values such as `${_self}`, `${_parent}`, `${_msg}`, `${_payload}`, `${_msg_source}`, spawn `dest` bindings, and error recovery bindings. |
+| `messages queue` | per-agent | Retained support module for tests and migration bookkeeping. Not part of the live eval path. |
 
-## Eval Loop Detail
+## Eval Loop
 
-```
-1. Wait for message (message-driven mode):
-   a. First cycle: no wait, _msg="init", _msg_source="runtime"
-   b. Grind mode: no wait, loop immediately
-   c. Default: block on receive, bind _msg/_msg_source
-   d. If trap matches: bind _interrupt/_interrupt_source, prepend handler frames
-2. Concatenate runtime prompt + all context stack frames → system prompt
-3. Build user message: "Begin." + current bindings
-4. Call LLM with system prompt and user message
-5. LLM returns structured {ops, frames, notes} via eval_response tool
-6. Interpolate frames and op strings against bindings and sections
-7. Execute ops sequentially (may update bindings via receive/spawn, trap state).
-   If an op fails, remaining ops are skipped and _op_error/_pending_ops are bound.
+```text
+1. Wait for a mailbox message.
+   - First cycle is synthetic: _msg="init", _msg_source="runtime"
+   - Later cycles wake on {:mailbox_msg, ...}
+   - If a trap matches, prepend handler frames and bind _interrupt
+2. Concatenate runtime preamble + context stack → system prompt
+3. Build user message from current bindings
+4. Call LLM
+5. LLM returns {ops, frames, notes}
+6. Interpolate returned frames and op payloads
+7. Execute ops sequentially
 8. Replace context stack with returned frames
 9. If stack is empty:
-   a. Default → agent terminates
-   b. If idle mode and boot frame exists → restore boot frame (idle)
-   c. If no boot frame → agent terminates
-10. Goto 1
+   - default: terminate
+   - with --idle: restore boot frame and wait again
+10. Repeat
 ```
 
-The stack is **self-reducing**:
-- 0 replacement frames → stack shrinks (work done)
-- 1 replacement frame → continuation
-- N replacement frames → task decomposition
+The stack is self-reducing:
+
+- `frames: []` means the current work is done.
+- One returned frame is a continuation.
+- Multiple returned frames represent queued future work.
 
 ## LLM Output Format
 
-The LLM returns structured JSON via a forced tool call (`eval_response`).
-The response contains three fields: `ops` (syscalls to execute), `frames`
-(replacement frames for the context stack), and `notes` (binding annotations).
+The LLM returns structured JSON via the forced `eval_response` tool:
 
 ```json
 {
   "ops": [
     {"op": "send", "mailbox": "human", "msg": {"text": "I'll check the files."}},
-    {"op": "send", "mailbox": "bash", "msg": {"command": "ls -la"}},
-    {"op": "receive", "dest": "listing"}
+    {"op": "send", "mailbox": "bash", "msg": {"command": "ls -la"}}
   ],
   "frames": [
-    "Process the directory listing in ${listing}."
+    "The directory listing arrived as ${_msg}. Summarize it for the human."
   ],
-  "notes": {"listing": "output of ls -la"}
+  "notes": {"_plan": "inspect the working directory"}
 }
 ```
 
-Each op is an object with an `"op"` field and op-specific parameters:
-
-| Op | Fields | Example |
-|----|--------|---------|
-| `send` | `mailbox`, `msg` | `{"op": "send", "mailbox": "bash", "msg": {"command": "ls"}}` |
-| `receive` | `dest` | `{"op": "receive", "dest": "output"}` |
-| `spawn` | `frames`, `dest`, [`grind`], [`idle`], [`disown`], [`name`], [`model`] | `{"op": "spawn", "frames": ["child task"], "dest": "child", "disown": true}` |
-| `trap` | `pattern`, `frames` | `{"op": "trap", "pattern": "^alert:", "frames": ["handle ${_interrupt}"]}` |
-| `trap` (clear) | `pattern`, `frames=[]` | `{"op": "trap", "pattern": ".*", "frames": []}` |
-
-The schema is enforced by the LLM provider (Anthropic tool_use with forced
-tool_choice, OpenAI structured outputs with json_schema). This eliminates
-parsing ambiguity and the need for a text parser.
-
 ## Interpolation
 
-- `${name}` — named binding resolved from bindings map (populated by
-  `receive` (`dest` + `dest_payload`), `spawn` (`dest`), and runtime
-  bindings `_self`/`_parent`/`_msg`/`_payload`/`_msg_source`)
-- `@N` — inject frame N (0-indexed) from the current context stack
-- `@name` — inject contents of a named section (`@@section-name` ... `@@end`)
-- `$$` — literal `$`; `@@` — literal `@`
-- Resolved at operation time, not at frame push time
-- Section content injected via `@name` is quoted (no `${name}` expansion)
+- `${name}`: named bindings from the runtime or previous cycles
+- `@N`: inject frame `N` from the current context stack
+- `@name`: inject a named section (`@@name` ... `@@end`)
+- `$$`: literal `$`
+- `@@`: literal `@`
+
+Important consequence: interpolation happens before the current cycle's ops
+run. If you need a service response, send the request now and return a
+continuation frame that handles `${_msg}` on the next cycle.
 
 ## Runtime Bindings
 
-The runtime provides every agent with identity bindings:
+- `${_self}`: this agent's mailbox ID
+- `${_parent}`: parent mailbox ID for non-disowned children
+- `${_msg}`: text summary of the message that woke this cycle
+- `${_payload}`: full JSON payload of that message
+- `${_msg_source}`: sender mailbox ID
+- `${_interrupt}` / `${_interrupt_source}`: trap match details
+- `${_op_error}` / `${_pending_ops}`: op recovery metadata
 
-- `${_self}` — this agent's own mailbox ID. Always available.
-- `${_parent}` — the spawning agent's mailbox ID. Only available for
-  child agents created via `spawn` without `disown: true`. Root agents
-  and disowned children do not have `_parent`.
+Spawn adds one more binding: the child mailbox ID is stored under the op's
+`dest` name.
 
-These bindings persist across cycles (preserved on idle reset) and enable
-symmetric communication: the parent has `${child_dest}` from `spawn`, the
-child has `${_parent}` from the runtime. Disowned children must discover
-peers through the blackboard or other shared services.
+## Message-Driven Model
 
-## Error Handling
+Gizmo now has one execution model only: message-driven wakeups.
 
-```
-LLM error → retry (×3) → exception mailbox → agent terminates
-op error  → bind _op_error/_pending_ops → retry counter increments → LLM re-plans
-cycle limit exceeded → exception mailbox → agent terminates
-```
+- First cycle runs immediately with synthetic `init`.
+- Subsequent cycles run only when a mailbox message arrives.
+- Time-based wakeups are explicit service messages, typically from
+  `watchdog`.
+- Autonomous continuation is explicit: self-send or watchdog scheduling.
 
-Three retries for LLM errors (schema violation, API error). After exhaustion,
-the error is reported to the `"exception"` mailbox and the agent terminates.
+## Idle Mode
 
-Op execution errors (bad regex in `trap`, name collision in `spawn`) are
-caught and recovered: the remaining ops are skipped, `${_op_error}` and
-`${_pending_ops}` are bound with error details, and the retry counter
-increments (so max-retries still protects against infinite error loops).
-The LLM sees the error context on the next cycle and can re-plan.
+`--idle` and `"idle": true` on `spawn` control only one thing: what happens
+when frames drain to `[]`.
 
-A configurable cycle limit (`--max-cycles`, default 50) catches infinite loops.
-Set to 0 for unlimited cycles. The limit is inherited by spawned children.
-Transient API errors (429, 5xx) are retried with exponential backoff at the
-HTTP layer before reaching the eval retry logic.
+- Default: terminate.
+- Idle: restore the boot frame and wait for more messages.
 
-Service input validation: bash, watchdog, and pager services validate
-LLM-generated payloads at their boundaries. Invalid inputs (non-integer
-timeouts, malformed line numbers) fall back to defaults or return error
-messages instead of crashing the service.
+This is the runtime's long-lived worker/daemon mechanism.
 
-## Supervision Tree
+## Trap
 
-```
-Gizmo.Supervision (one_for_one)
-├── Gizmo.Mailbox.Registry (Registry)
-├── Gizmo.Services.Blackboard ("blackboard")
-├── Gizmo.Services.Bash ("bash")
-├── Gizmo.Services.Human ("human")
-├── Gizmo.Services.HumanInput ("human_input")
-├── Gizmo.Services.Exception ("exception")
-├── Gizmo.Services.Reaper ("reaper")
-├── Gizmo.Services.Watchdog ("watchdog")
-├── Gizmo.Services.Pager ("pager")
-├── Gizmo.Services.Batch ("batch")
-├── Gizmo.Services.Eval ("eval")
-├── Gizmo.FactorySupervisor (DynamicSupervisor)
-│   ├── FactoryWorker (:temporary)
-│   └── ...
-├── Gizmo.Services.Factory ("factory")
-├── Gizmo.Services.Migration ("migration")
-└── Gizmo.AgentSupervisor (DynamicSupervisor)
-    ├── Agent via Wrapper (:temporary)
-    ├── Agent via Wrapper (:temporary)
-    └── ...
-```
-
-- All services run under a single `one_for_one` supervisor (`Gizmo.Supervision`).
-  If a service crashes, it is automatically restarted. Services are independent
-  so one crash does not affect others.
-- Agent processes run under `Gizmo.AgentSupervisor` (`DynamicSupervisor`) with
-  `:temporary` restart — they are not restarted on exit. Restarting a crashed
-  agent from its boot frame would duplicate work and confuse parent processes
-  waiting for child messages. The watcher pattern (`Process.monitor`) notifies
-  parents of child death via a `child_died:` message.
-- `Gizmo.Agent.Wrapper` bridges `DynamicSupervisor` and the bare eval loop,
-  using `:proc_lib.start_link/3` for proper OTP process initialization.
-
-## Message Routing
-
-```
-┌──────────┐    send(mb_id, msg)    ┌───────────────┐
-│  Agent   │ ──────────────────────→│ MailboxRouter  │
-│ Process  │                        │  (Registry)    │
-│          │←───────────────────────│               │
-└──────────┘    message delivery    └───────┬───────┘
-                                            │
-                    ┌───────────────────────┬┴──────────────┐
-                    │                       │               │
-              ┌─────┴─────┐         ┌──────┴──┐    ┌──────┴──────┐
-              │   bash    │         │  human  │    │ other agent │
-              └───────────┘         └─────────┘    └─────────────┘
-```
-
-The router is an Elixir `Registry`. Each mailbox ID maps to an Elixir PID.
-`send` is non-blocking message delivery. `receive` blocks the calling
-process until a message arrives in its mailbox.
-
-## Boot Frame
-
-The boot frame is frame 0 on every agent's context stack. It is user-provided
-content (task description, workflow steps, named sections). The runtime prompt
-(syscall reference, well-known mailboxes, interpolation rules) is prepended
-automatically by `Gizmo.Agent.runtime_prompt/0`.
-
-By default, agents terminate when the context stack drains to `[]`. With
-`--idle`, the boot frame is restored so the agent idles and can receive
-new work. Agents return `frames: []` to finish (optionally after a `send`
-to communicate results).
-
-### Multi-file stacks
-
-Multiple files can be loaded as frames:
-
-- `gizmo task.txt` — frames=[task], boot_frame=task (backward compatible)
-- `gizmo a.txt b.txt` — frames=[a, b], boot_frame=a
-- `gizmo --boot sys.txt task.txt` — frames=[sys, task], boot_frame=sys
-- `gizmo --each a.txt b.txt` — one independent agent per file
-- `gizmo --each --boot sys.txt a.txt b.txt` — each agent gets [sys, file]
-
-With `--boot`, the boot frame is separate from task frames. Without it, the
-first positional file serves as both. This lets you reuse a generic boot
-frame (with sections, idle behavior, etc.) across different task files.
-
-With `--each`, each positional file becomes an independent agent instead of
-being stacked into one. Combined with `--boot`, each agent gets the boot
-frame as its first frame and the positional file as its second.
-
-Different boot frames = different "OS distributions." Same kernel, different
-preloaded services and instructions.
-
-### Agent naming
-
-By default, agents get auto-generated mailbox IDs like `agent_1`, `agent_2`.
-The `--name <id>` CLI flag sets a custom mailbox ID for the root agent. In
-spawn ops, `"name": "worker"` gives the child a custom ID. Names must be
-unique — a duplicate name triggers op error recovery (`_op_error` is bound
-and the LLM can retry with a different name).
-
-Name collisions are recovered via the op error mechanism: `_op_error` is
-bound with details and the LLM can re-plan on the next cycle.
-
-Named agents are easier to address in boot frames, debug in logs, and
-filter in traces.
-
-## Message-Driven Eval Loop
-
-By default, agents are **message-driven**: they sleep between eval cycles and
-only wake when a message arrives in their mailbox. This avoids wasting LLM
-calls on idle spinning.
-
-- **First cycle**: Runs immediately with `${_msg} = "init"` and
-  `${_msg_source} = "runtime"`. No actual message needed.
-- **Subsequent cycles**: Block on `receive` for `{:mailbox_msg, ...}`.
-  Content bound to `${_msg}`, source to `${_msg_source}`.
-- **Grind mode** (`--grind` or `grind: true`): Opt-in hot loop. Agent cycles
-  continuously without waiting for messages. Preserves the pre-Stage 12
-  behavior for worker agents that need to churn.
-
-## Grind and Idle: The Two Axes
-
-`grind` and `idle` control two orthogonal aspects of agent behavior. **Grind**
-controls cycle pacing: does the agent wait for a message between cycles
-(message-driven, the default) or hot-loop continuously? **Idle** controls
-frame-exhaust behavior: does the agent terminate when frames drain to `[]`
-(the default) or restore the boot frame and wait for more work?
-
-| | **terminate on exhaust** (default) | **idle on exhaust** (`--idle`) |
-|---|---|---|
-| **message-driven** (default) | One-shot / request-response. Agent wakes on message, does work, terminates when frames drain to `[]`. | Daemon. Agent wakes on message, does work, idles back to boot frame to wait for more. |
-| **grind** (`--grind`) | Worker loop. Agent hot-loops with explicit `receive` ops, terminates when frames drain to `[]`. | Hot-loop daemon. Agent hot-loops, restores boot frame on exhaust. Bindings reset. Rare. |
-
-Key invariants across the grid:
-
-- **`_msg` binding:** Updated from the mailbox message each cycle in
-  message-driven mode. Stays `"init"` in grind mode (only the first cycle
-  gets the wake message).
-- **Bindings accumulation:** Bindings from `receive`/`spawn` persist across
-  cycles. On idle restore, bindings reset to `{_self, _parent}` only.
-- **Trap availability:** Traps fire between cycles in message-driven mode
-  only. In grind mode, there is no inter-cycle message check, so traps do
-  not fire.
-- **Performance:** Grind skips the inter-cycle mailbox wait, yielding ~2x
-  faster cycle throughput. Message-driven mode pays one LLM roundtrip per
-  message boundary.
-
-## Trap (Interrupt Handler)
-
-A single-slot interrupt handler registered via the `trap` op:
+Trap is a single-slot interrupt handler:
 
 ```json
-{"op": "trap", "pattern": "^alert:", "frames": ["Handle alert: ${_interrupt}"]}
+{"op": "trap", "pattern": "^alert:", "frames": ["Handle ${_interrupt}"]}
 ```
 
-When a message matching the PCRE regex pattern arrives between cycles:
-1. Handler frames are prepended to the context stack.
-2. `${_interrupt}` and `${_interrupt_source}` are bound.
-3. `${_msg}` and `${_msg_source}` are also bound as usual.
+When a matching message arrives between cycles:
 
-The trap persists across cycles — it fires again on the next matching
-message. Only one trap can be active; a new `trap` replaces the old one.
-Pass empty frames to clear it:
+1. handler frames are prepended to the stack
+2. `${_interrupt}` and `${_interrupt_source}` are bound
+3. `${_msg}` and `${_msg_source}` are also bound normally
+
+Clear a trap by returning:
 
 ```json
 {"op": "trap", "pattern": ".*", "frames": []}
 ```
 
-This enables spawn simplification: a parent spawns a child, continues
-sleeping, and naturally wakes when the child's message arrives. No
-need to pair `spawn` + `receive` in the same op list.
+## Boot Frame and Multi-File Stacks
 
-## Watchdog Service
+- `gizmo task.txt` → `task.txt` is both boot frame and task frame
+- `gizmo a.txt b.txt` → stacked frames, `a.txt` is boot frame
+- `gizmo --boot sys.txt task.txt` → `sys.txt` is boot frame, `task.txt` is stacked on top
+- `gizmo --each a.txt b.txt` → one independent agent per file
 
-`Gizmo.Services.Watchdog` is a per-agent GenServer that sends periodic
-`"tick"` messages (from source `"watchdog"`) to a target mailbox.
-Started on demand via `--watchdog <ms>` or programmatically. Monitors the
-target agent and stops when it dies.
+With `--idle`, the boot frame is what gets restored on exhaust.
 
-Useful for agents that need periodic think-ticks without external stimulus.
+## Agent Naming
+
+- Root agent: `--name <id>`
+- Child agent: `"name": "worker"` on `spawn`
+
+Name collisions are recovered as op errors via `${_op_error}`.
+
+## Error Handling
+
+- LLM errors: retry up to 3 times, then report to `exception`
+- Op errors: bind `${_op_error}` and `${_pending_ops}`, skip remaining ops, let the LLM re-plan next cycle
+- Cycle limit: `--max-cycles N`, with `0` meaning unlimited
+
+## Supervision Tree
+
+```text
+Gizmo.Supervision
+├── Registry
+├── blackboard
+├── bash
+├── human
+├── human_input
+├── exception
+├── reaper
+├── watchdog
+├── pager
+├── batch
+├── eval
+├── factory supervisor + factory
+├── migration
+└── agent supervisor
+```
+
+Services are restarted if they crash. Agents are `:temporary` children and are
+not restarted.
 
 ## Technology
 
-- **Language:** Elixir 1.19 / Erlang/OTP 28
-- **Packaging:** Single `gizmo.exs` script file, run with `elixir gizmo.exs`
-- **Dependencies:** `Req` (installed via `Mix.install/2` at script top)
-- **JSON:** Req handles JSON encoding/decoding; Erlang `:json` for edge cases
-- **Process model:** OTP process (`:proc_lib` via `Gizmo.Agent.Wrapper`) per agent, `DynamicSupervisor` for spawn
-- **Message routing:** Elixir Registry
-- **LLM backend:** Anthropic Claude and OpenAI-compatible APIs via Req
-- **Human interface:** Initially IO, later Phoenix LiveView
+- Elixir 1.19 / OTP 28
+- Single-file `gizmo.exs`
+- `Req` for HTTP and LLM transport
+- Anthropic and OpenAI-compatible backends
+- Registry-based mailbox routing

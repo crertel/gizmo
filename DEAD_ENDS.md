@@ -320,6 +320,34 @@ The runtime surface is now smaller and more uniform:
 - fewer prompt footguns
 - no duplicate "minimal" runtime to keep in sync
 
+## Agent-Level `receive_timeout`
+
+**Introduced:** early eval-loop implementation
+**Removed:** after the message-driven simplification
+
+For a while the agent startup path, state, child spawn options, and migration
+snapshots all carried a `receive_timeout` option. The idea was to let idle
+agents wake or fail if no message arrived quickly enough.
+
+### Why we removed it
+
+- **It no longer had semantics.** The actual message wait path had become a
+  plain mailbox `receive`, so the option was just dead plumbing.
+- **It duplicated watchdog's job.** If an agent needs a timed wakeup, the
+  message should come from an explicit service such as `watchdog`, not a hidden
+  scheduler branch inside the eval loop.
+- **It made migration state noisier.** Snapshots and restore code had to carry
+  an option that did not change runtime behavior.
+
+### What replaced it
+
+- **Explicit timed wakeups via `watchdog`.** Agents that need periodic or
+  delayed reactivation schedule a timer and handle the resulting mailbox
+  message as `${_msg}` from `${_msg_source} = "watchdog"`.
+
+The result is a cleaner rule: agents wake for messages, and timeouts are just
+another message source.
+
 ## `untrap` as a Separate Op
 
 **Introduced:** Stage 12 (initial implementation)

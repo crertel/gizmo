@@ -49,8 +49,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn msg child"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn msg child"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -95,8 +94,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, mb, pid} =
-        Gizmo.Agent.start(["parent: spawn child"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, mb, pid} = Gizmo.Agent.start(["parent: spawn child"], chat_fn: chat_fn)
 
       Gizmo.Mailbox.route(mb, {"test", %{"text" => "start"}})
 
@@ -157,8 +155,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn disown child"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn disown child"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -217,8 +214,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn named child"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn named child"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -295,8 +291,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn collision test"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn collision test"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -347,8 +342,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn child with model"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn child with model"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -398,8 +392,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["parent: spawn child without model"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn child without model"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -482,8 +475,7 @@ defmodule Gizmo.SpawnTest do
 
       {:ok, _server_mb, server_pid} =
         Gizmo.Agent.start(["server: start"],
-          chat_fn: server_chat_fn,
-          receive_timeout: 5_000
+          chat_fn: server_chat_fn
         )
 
       server_ref = Process.monitor(server_pid)
@@ -491,8 +483,7 @@ defmodule Gizmo.SpawnTest do
 
       {:ok, _client_mb, client_pid} =
         Gizmo.Agent.start(["client: start"],
-          chat_fn: client_chat_fn,
-          receive_timeout: 5_000
+          chat_fn: client_chat_fn
         )
 
       client_ref = Process.monitor(client_pid)

@@ -24,8 +24,7 @@ defmodule Gizmo.MessageDrivenTest do
          }}
       end
 
-      {:ok, _mb, pid} =
-        Gizmo.Agent.start(["init test frame"], chat_fn: chat_fn, receive_timeout: 100)
+      {:ok, _mb, pid} = Gizmo.Agent.start(["init test frame"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -70,8 +69,7 @@ defmodule Gizmo.MessageDrivenTest do
         end
       end
 
-      {:ok, agent_mb, pid} =
-        Gizmo.Agent.start(["reactive frame"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, agent_mb, pid} = Gizmo.Agent.start(["reactive frame"], chat_fn: chat_fn)
 
       Process.sleep(100)
       Gizmo.Mailbox.route(agent_mb, {"test_sender", "wake_msg"})
@@ -118,8 +116,7 @@ defmodule Gizmo.MessageDrivenTest do
         end
       end
 
-      {:ok, agent_mb, pid} =
-        Gizmo.Agent.start(["trap test frame"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, agent_mb, pid} = Gizmo.Agent.start(["trap test frame"], chat_fn: chat_fn)
 
       Process.sleep(100)
       Gizmo.Mailbox.route(agent_mb, {"alert_src", "alert:fire!"})
@@ -172,8 +169,7 @@ defmodule Gizmo.MessageDrivenTest do
         end
       end
 
-      {:ok, agent_mb, pid} =
-        Gizmo.Agent.start(["notrap test frame"], chat_fn: chat_fn, receive_timeout: 5_000)
+      {:ok, agent_mb, pid} = Gizmo.Agent.start(["notrap test frame"], chat_fn: chat_fn)
 
       Process.sleep(100)
       Gizmo.Mailbox.route(agent_mb, {"sender", "hello_normal"})

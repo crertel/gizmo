@@ -52,8 +52,7 @@ defmodule Gizmo.ReaperTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["parent: spawn child"],
-          chat_fn: chat_fn,
-          receive_timeout: 5_000
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(pid)
@@ -84,8 +83,7 @@ defmodule Gizmo.ReaperTest do
 
       {:ok, target_mb, target_pid} =
         Gizmo.Agent.start(["deny target frame"],
-          chat_fn: target_chat_fn,
-          receive_timeout: 30_000
+          chat_fn: target_chat_fn
         )
 
       # Attacker agent: sends target_mb to reaper on cycle 0, then exits
@@ -110,8 +108,7 @@ defmodule Gizmo.ReaperTest do
 
       {:ok, _attacker_mb, _attacker_pid} =
         Gizmo.Agent.start(["attacker: try to kill target"],
-          chat_fn: attacker_chat_fn,
-          receive_timeout: 5_000
+          chat_fn: attacker_chat_fn
         )
 
       # Wait for attacker to signal it's done

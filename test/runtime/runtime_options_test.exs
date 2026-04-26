@@ -14,7 +14,6 @@ defmodule Gizmo.RuntimeOptionsTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["max cycles test"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
           max_cycles: 5
         )
 
@@ -47,7 +46,6 @@ defmodule Gizmo.RuntimeOptionsTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["unlimited cycles test"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
           max_cycles: 0
         )
 
@@ -75,8 +73,7 @@ defmodule Gizmo.RuntimeOptionsTest do
 
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["quit on exhaust test"],
-          chat_fn: chat_fn,
-          receive_timeout: 100
+          chat_fn: chat_fn
         )
 
       ref = Process.monitor(pid)
@@ -121,7 +118,6 @@ defmodule Gizmo.RuntimeOptionsTest do
       {:ok, _mb, pid} =
         Gizmo.Agent.start(["idle mode boot frame"],
           chat_fn: chat_fn,
-          receive_timeout: 100,
           max_cycles: 3,
           quit_on_exhaust: false
         )

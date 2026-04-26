@@ -56,7 +56,8 @@ Central message routing registry.
 Implement the service processes that back the well-known mailboxes.
 
 ### 5a: Args Stack (removed)
-- Replaced by named bindings via `dest` field on `receive` and `spawn` ops.
+- Replaced by named bindings via `dest` field on the old `receive` op and on
+  `spawn`.
   Bindings are threaded through the eval loop as a plain map — no GenServer needed.
 
 ### 5b: Messages Queue
@@ -81,11 +82,12 @@ Implement the service processes that back the well-known mailboxes.
 - [x] Read user input → send to agent's mailbox
 - [ ] ~Swap IO for Phoenix channel~ — deferred, see Deferred / Future
 
-## Stage 6: Agent Process (The Core)
+## Stage 6: Agent Process (The Core, Historical Notes)
 
 The GenServer that runs the eval loop.
 
-- [x] State: mailbox_id, parent, chat_fn, verbose, receive_timeout, msgs_queue (bindings threaded through eval_loop)
+- [x] Early state included mailbox identity, parent, chat fn, messages queue,
+  and other runtime options. Later simplification removed `receive_timeout`.
 - [x] Boot frame loaded on init
 - [x] Eval loop implementation:
   - Concatenate context stack as system prompt
@@ -95,7 +97,8 @@ The GenServer that runs the eval loop.
   - Push replacement frames
   - Loop
 - [x] `send` op: interpolate msg, route via mailbox router
-- [x] `receive` op: block until message arrives, store in bindings[dest]
+- [x] Early versions still had a `receive` op before the runtime collapsed to
+  the current three-op model.
 - [x] Idle behavior: boot frame self-replaces, checks mailbox
 - [x] Error handling: retry on LLM failure (3x)
 - [x] Exception mailbox on retry exhaustion (routes to "exception" service and terminates)
