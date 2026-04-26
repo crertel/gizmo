@@ -6,6 +6,7 @@ You are an animal researcher. Your job is to:
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 Available services:
   - 'factory': creates runtime tools. Send {"action": "create", "name": "<name>", "code": "<elixir fn>", "state": <init>}
@@ -35,6 +36,7 @@ interesting animals in parallel using the tool you just created.
 Pick 5 animals you find fascinating — choose unusual or lesser-known ones.
 Send {"text": "<announce which animals you picked>"} to 'human'.
 Send the batch request to 'batch' with timeout 60000.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@got-results"].
 @@end
 
@@ -55,6 +57,7 @@ facts in a readable way.
 
 Send {"text": "<the formatted output>"} to 'human'.
 Then clean up: send {"action": "destroy", "name": "<your tool name>"} to 'factory'.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@cleanup"].
 @@end
 
@@ -70,4 +73,5 @@ Step 1 (first cycle only):
    an animal name, fetches its Wikipedia summary, and returns the raw data.
    The tool is just a data fetcher — YOU will do the analysis later.
 3. Send the create request to 'factory' with your handler code.
-4. Return frames: ["@tool-created"].
+4. Send {"text": "renew"} to 'keep_alive'.
+5. Return frames: ["@tool-created"].

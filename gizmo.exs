@@ -251,11 +251,6 @@ defmodule Gizmo.LLM do
                 description: "Frames for child process (for spawn) or handler (for trap)."
               },
               dest: %{type: "string", description: "Binding name for the child mailbox ID."},
-              idle: %{
-                type: "boolean",
-                description:
-                  "Child restores boot frame on empty frames (for spawn). Default: inherit parent."
-              },
               disown: %{
                 type: "boolean",
                 description:
@@ -358,8 +353,7 @@ defmodule Gizmo.LLM do
   defp validate_spawn_opts(op) do
     opts = %{}
 
-    with {:ok, opts} <- validate_spawn_bool(op, "idle", :idle, opts),
-         {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts),
+    with {:ok, opts} <- validate_spawn_bool(op, "disown", :disown, opts),
          {:ok, opts} <- validate_spawn_string(op, "name", :name, opts),
          {:ok, opts} <- validate_spawn_string(op, "model", :model, opts) do
       {:ok, opts}
@@ -861,6 +855,7 @@ defmodule Gizmo.Services.MessagesQueue do
   end
 
   def push(pid, content, source), do: GenServer.call(pid, {:push, content, source})
+  def push_front(pid, content, source), do: GenServer.call(pid, {:push_front, content, source})
   def enqueue(pid, {content, source}), do: push(pid, content, source)
   def pop(pid), do: GenServer.call(pid, :pop)
   def to_list(pid), do: GenServer.call(pid, :to_list)
@@ -876,6 +871,10 @@ defmodule Gizmo.Services.MessagesQueue do
     {:reply, :ok, %{state | queue: :queue.in({content, source}, q)}}
   end
 
+  def handle_call({:push_front, content, source}, _from, %{queue: q} = state) do
+    {:reply, :ok, %{state | queue: :queue.in_r({content, source}, q)}}
+  end
+
   def handle_call(:pop, _from, %{queue: q} = state) do
     case :queue.out(q) do
       {{:value, item}, q2} -> {:reply, {:ok, item}, %{state | queue: q2}}
@@ -889,6 +888,25 @@ defmodule Gizmo.Services.MessagesQueue do
 
   def handle_call(:snapshot, _from, %{queue: q} = state) do
     {:reply, %{contents: :queue.to_list(q)}, state}
+  end
+end
+
+defmodule Gizmo.Services.KeepAlive do
+  use GenServer
+
+  def start_link(mailbox_id \\ "keep_alive") do
+    GenServer.start_link(__MODULE__, mailbox_id)
+  end
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id}}
+  end
+
+  @impl true
+  def handle_info({:mailbox_msg, _to, {_from, _msg}}, state) do
+    {:noreply, state}
   end
 end
 
@@ -3324,7 +3342,6 @@ defmodule Gizmo.Migration.Snapshot do
       parent: state.parent,
       chat_config: state.chat_config,
       max_cycles: state.max_cycles,
-      quit_on_exhaust: state.quit_on_exhaust,
       log_timings: state.log_timings,
       log_full_prompts: state.log_full_prompts,
       run_start: state.run_start,
@@ -3338,6 +3355,7 @@ defmodule Gizmo.Migration.Snapshot do
       bindings: loop.bindings,
       binding_notes: loop.binding_notes,
       trap: serialize_trap(loop.trap),
+      awaiting_exhaustion: Map.get(loop, :awaiting_exhaustion, false),
       init_bindings: loop.init_bindings,
       init_notes: loop.init_notes,
       # Drained messages from process mailbox
@@ -3428,7 +3446,6 @@ defmodule Gizmo.Migration.Snapshot do
       chat_fn: chat_fn,
       chat_config: chat_config,
       max_cycles: agent_snap.max_cycles,
-      quit_on_exhaust: agent_snap.quit_on_exhaust,
       log_timings: agent_snap.log_timings,
       log_full_prompts: agent_snap.log_full_prompts,
       run_start: new_run_start,
@@ -3443,6 +3460,7 @@ defmodule Gizmo.Migration.Snapshot do
           bindings: agent_snap.bindings,
           binding_notes: agent_snap.binding_notes,
           trap: deserialize_trap(agent_snap.trap),
+          awaiting_exhaustion: agent_snap[:awaiting_exhaustion] || false,
           init_bindings: agent_snap.init_bindings,
           init_notes: agent_snap.init_notes
         },
@@ -3474,7 +3492,6 @@ defmodule Gizmo.Agent.Wrapper do
 
     parent = Keyword.get(opts, :parent, nil)
     max_cycles = Keyword.get(opts, :max_cycles, 50)
-    quit_on_exhaust = Keyword.get(opts, :quit_on_exhaust, true)
     log_timings = Keyword.get(opts, :log_timings, false)
     log_full_prompts = Keyword.get(opts, :log_full_prompts, false)
     run_start = Keyword.get(opts, :run_start, System.monotonic_time(:millisecond))
@@ -3499,7 +3516,6 @@ defmodule Gizmo.Agent.Wrapper do
       chat_fn: chat_fn,
       chat_config: chat_config,
       max_cycles: max_cycles,
-      quit_on_exhaust: quit_on_exhaust,
       log_timings: log_timings,
       log_full_prompts: log_full_prompts,
       run_start: run_start,
@@ -3571,6 +3587,7 @@ defmodule Gizmo.Supervision do
       %{id: Gizmo.Mailbox.Registry, start: {Gizmo.Mailbox, :start, []}, type: :supervisor},
       {Gizmo.Services.Blackboard, "blackboard"},
       {Gizmo.Services.Bash, {"bash", bash_timeout}},
+      {Gizmo.Services.KeepAlive, "keep_alive"},
       {Gizmo.Services.Human, "human"},
       {Gizmo.Services.HumanInput, "human_input"},
       {Gizmo.Services.Exception, "exception"},
@@ -3635,7 +3652,8 @@ defmodule Gizmo.Agent do
     - frames: replacement frames for your context stack. These define what you
       will see as your system prompt on the NEXT eval cycle. Multiple frames
       are concatenated in order with --- separators. An empty array [] means
-      this process is finished (or in idle mode, resets to the boot frame).
+      your current stack is exhausted. If you renewed this cycle with
+      keep_alive, the runtime queues a stack_exhausted message next.
     - notes: an object for persisting information across cycles. Use it to
       annotate bindings (key = binding name, value = description) AND to track
       your progress. Recommended: set "_step" to your current plan step (e.g.
@@ -3666,7 +3684,6 @@ defmodule Gizmo.Agent do
       The child receives ${_parent} bound to your mailbox ID.
       {"op": "spawn", "frames": ["<task text>"], "dest": "<binding_name>"}
       Optional fields:
-        "idle": true/false — child restores boot frame on empty (default: inherit).
         "disown": true — detach child (no ${_parent}, no death monitor).
         "name": "<id>" — custom mailbox ID (must be unique; duplicate triggers op error).
         "model": "<model_id>" — LLM model for the child (default: inherit parent's model).
@@ -3680,8 +3697,10 @@ defmodule Gizmo.Agent do
       To clear a trap, pass an empty frames array:
       {"op": "trap", "pattern": ".*", "frames": []}
 
-    To terminate, return "frames": []. To terminate with a result, send the
-    result first, then return "frames": [].
+    To stay alive after this cycle, send any JSON message to the "keep_alive"
+    mailbox. If you do not send keep_alive during a cycle, you die after that
+    cycle regardless of what frames you return. To terminate with a result,
+    send the result first, then omit keep_alive.
 
     ## Runtime bindings
 
@@ -3838,6 +3857,12 @@ defmodule Gizmo.Agent do
       :string, :binary, :calendar, :rand, :unicode, :re.
       All other modules are rejected at parse time.
 
+    - keep_alive: Lease-renewal mailbox. Send any JSON object here during a
+      cycle if you want to survive past the end of that cycle.
+      {"op": "send", "mailbox": "keep_alive", "msg": {"text": "renew"}}
+      The payload is ignored by the service; only the fact that you sent it
+      matters to the runtime.
+
     - factory: Create custom stateful services at runtime. Provide an arity-2
       handler function as a code string plus optional initial state, and the
       factory compiles it and wraps it in a GenServer with its own mailbox.
@@ -3869,8 +3894,8 @@ defmodule Gizmo.Agent do
 
     ## Message-driven model
 
-    By default, your process sleeps between eval cycles and only wakes when
-    a message arrives in your mailbox. The runtime automatically binds:
+    Your process sleeps between eval cycles and only wakes when a message
+    arrives in your mailbox. The runtime automatically binds:
 
     - ${_msg}: The "text" field of the message (or full JSON if no "text").
     - ${_msg_source}: Mailbox ID of the sender.
@@ -3883,16 +3908,15 @@ defmodule Gizmo.Agent do
     "watchdog". Ticks arrive with ${_msg} = "tick" from source "watchdog".
     Send {"action": "cancel"} to stop all your timers.
 
-    ## Idle mode
+    At the end of EVERY cycle, you must send a message to "keep_alive" if you
+    want to survive. No keep_alive means the process dies after that cycle,
+    even if you returned more frames.
 
-    By default, returning frames: [] terminates the process. In idle mode
-    (set via --idle flag or "idle": true in spawn), returning empty frames
-    instead restores the boot frame (your initial context stack) and the
-    process waits for a new message. Bindings are reset to just ${_self}
-    and ${_parent} — all other bindings from the previous run are cleared.
-
-    Idle mode is useful for long-running daemon-style agents that handle
-    repeated requests. Each request starts fresh from the boot frame.
+    If you DID send keep_alive and returned frames: [], the runtime injects
+    a synthetic message at the FRONT of your mailbox queue:
+    {"text": "stack_exhausted", "type": "stack_exhausted"} from source "runtime".
+    This lets a trap decide how to rebuild work before any normal queued
+    messages are handled.
 
     ## Trap (interrupt handler)
 
@@ -3948,8 +3972,9 @@ defmodule Gizmo.Agent do
        as ${_msg}. Send 'Result: ${_msg}' to 'human', then terminate with
        empty frames []."
 
-    6. When terminating (frames: []), just send any final messages and
-       return empty frames. Do NOT return continuation frames after [].
+    6. When terminating, just send any final messages and OMIT keep_alive.
+       Returning frames: [] without keep_alive kills the process. Returning
+       frames: [] with keep_alive triggers stack_exhausted on the next wake.
 
     ## Examples
 
@@ -3976,6 +4001,13 @@ defmodule Gizmo.Agent do
          {"op": "spawn", "frames": ["Send result to ${_parent}, then terminate."], "dest": "kid"}
        ],
        "frames": ["Wait for the child's reply in ${_msg}. Use it, then terminate."], "notes": {}}
+
+    Long-lived worker with explicit renewal:
+      {"ops": [
+         {"op": "send", "mailbox": "keep_alive", "msg": {"text": "renew"}},
+         {"op": "trap", "pattern": "^stack_exhausted$", "frames": ["@boot"]}
+       ],
+       "frames": [], "notes": {}}
     """
   end
 
@@ -3983,9 +4015,10 @@ defmodule Gizmo.Agent do
   Spawn an agent process under the DynamicSupervisor. Returns {:ok, mailbox_id, pid}.
 
   Agents run as :temporary children — they are not restarted on exit.
-  By default, agents terminate when frames drain to []. With quit_on_exhaust: false
-  (--idle), the initial frames are saved as boot frames and re-pushed when the
-  context stack drains, so the agent idles and waits for new work.
+  Agents are ephemeral by default: after every eval cycle, an agent dies unless
+  that cycle sent a message to the "keep_alive" mailbox. If a renewed cycle
+  returns frames: [], the runtime injects a synthetic stack_exhausted message at
+  the front of the mailbox queue so traps can decide how to continue.
 
   Options:
     - parent: parent mailbox_id (provides ${_parent} binding)
@@ -4030,23 +4063,6 @@ defmodule Gizmo.Agent do
   @max_eval_retries 3
 
   def eval_loop(frames, state, init_bindings \\ %{}, init_notes \\ %{})
-  def eval_loop([], %{boot_frames: []}, _init_bindings, _init_notes), do: :ok
-  def eval_loop([], %{quit_on_exhaust: true}, _init_bindings, _init_notes), do: :ok
-
-  def eval_loop([], %{boot_frames: boot_frames} = state, init_bindings, init_notes) do
-    loop = %{
-      retries: 0,
-      cycles: 0,
-      persisted_sections: %{},
-      bindings: init_bindings,
-      binding_notes: init_notes,
-      trap: nil,
-      init_bindings: init_bindings,
-      init_notes: init_notes
-    }
-
-    eval_loop_inner(boot_frames, state, loop)
-  end
 
   def eval_loop(context_stack, state, init_bindings, init_notes) do
     loop = %{
@@ -4056,6 +4072,7 @@ defmodule Gizmo.Agent do
       bindings: init_bindings,
       binding_notes: init_notes,
       trap: nil,
+      awaiting_exhaustion: false,
       init_bindings: init_bindings,
       init_notes: init_notes
     }
@@ -4068,6 +4085,7 @@ defmodule Gizmo.Agent do
   with the restored context_stack, state, and loop map.
   """
   def eval_loop_restored(context_stack, state, loop) do
+    loop = Map.put_new(loop, :awaiting_exhaustion, false)
     eval_loop_inner(context_stack, state, loop)
   end
 
@@ -4090,30 +4108,7 @@ defmodule Gizmo.Agent do
   end
 
   defp maybe_wait_for_message(state, %{trap: trap} = loop, bindings, binding_notes, context_stack) do
-    # Message-driven: block until a message arrives (or migration pause)
-    {msg_content, msg_source} =
-      receive do
-        {:mailbox_msg, _to, {from_mb, message}} ->
-          {message, from_mb}
-
-        {:migration_pause, reply_to, ref} ->
-          drained = drain_mailbox_messages()
-          snapshot = Gizmo.Migration.Snapshot.snapshot_agent(state, loop, context_stack, drained)
-          send(reply_to, {:migration_snapshot, ref, snapshot})
-
-          receive do
-            {:migration_resume} ->
-              Enum.each(drained, fn msg -> send(self(), msg) end)
-
-            {:migration_stop} ->
-              exit(:migration_stopped)
-          end
-
-          # After resume, re-enter the wait
-          receive do
-            {:mailbox_msg, _to, {from_mb, message}} -> {message, from_mb}
-          end
-      end
+    {msg_content, msg_source} = receive_next_message(state, loop, context_stack)
 
     # Extract _msg (summary text) and _payload (full JSON) from message content
     {msg_text, payload_text} =
@@ -4162,18 +4157,34 @@ defmodule Gizmo.Agent do
     end
   end
 
-  defp eval_loop_inner([], %{boot_frames: []}, _loop), do: :ok
-  defp eval_loop_inner([], %{quit_on_exhaust: true}, _loop), do: :ok
+  defp receive_next_message(state, loop, context_stack) do
+    case Gizmo.Services.MessagesQueue.pop(state.msgs_queue) do
+      {:ok, item} ->
+        item
 
-  defp eval_loop_inner([], %{boot_frames: boot_frames} = state, loop) do
-    eval_loop_inner(boot_frames, state, %{
-      loop
-      | retries: 0,
-        persisted_sections: %{},
-        bindings: loop.init_bindings,
-        binding_notes: loop.init_notes
-    })
+      {:error, :empty} ->
+        receive do
+          {:mailbox_msg, _to, {from_mb, message}} ->
+            {message, from_mb}
+
+          {:migration_pause, reply_to, ref} ->
+            drained = drain_mailbox_messages()
+            snapshot = Gizmo.Migration.Snapshot.snapshot_agent(state, loop, context_stack, drained)
+            send(reply_to, {:migration_snapshot, ref, snapshot})
+
+            receive do
+              {:migration_resume} ->
+                Enum.each(drained, fn msg -> send(self(), msg) end)
+                receive_next_message(state, loop, context_stack)
+
+              {:migration_stop} ->
+                exit(:migration_stopped)
+            end
+        end
+    end
   end
+
+  defp eval_loop_inner([], _state, %{awaiting_exhaustion: false}), do: :ok
 
   defp eval_loop_inner(_context_stack, %{max_cycles: max_cycles} = state, %{cycles: cycles})
        when max_cycles > 0 and cycles >= max_cycles do
@@ -4223,7 +4234,8 @@ defmodule Gizmo.Agent do
            cycles: cycles,
            persisted_sections: persisted_sections,
            bindings: bindings,
-           binding_notes: binding_notes
+           binding_notes: binding_notes,
+           awaiting_exhaustion: awaiting_exhaustion
          } = loop
        ) do
     # Non-blocking check for migration pause request
@@ -4249,193 +4261,226 @@ defmodule Gizmo.Agent do
     {bindings, binding_notes, context_stack} =
       maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
 
-    # Build structured system prompt for caching
-    boot_text = Enum.join(state.boot_frames, "\n\n---\n\n")
+    if awaiting_exhaustion and context_stack == [] do
+      :ok
+    else
 
-    frames_text =
-      if length(context_stack) > 1 do
-        context_stack
-        |> Enum.with_index()
-        |> Enum.map_join("\n\n---\n\n", fn {frame, idx} ->
-          if idx == 0 do
-            ">>> CURRENT FRAME (follow ONLY these instructions) <<<\n#{frame}"
-          else
-            "--- QUEUED FRAME #{idx + 1} of #{length(context_stack)} (do NOT follow yet) ---\n#{frame}"
-          end
-        end)
-      else
-        Enum.join(context_stack, "\n\n---\n\n")
-      end
+      # Build structured system prompt for caching
+      boot_text = Enum.join(state.boot_frames, "\n\n---\n\n")
 
-    system_parts =
-      if context_stack == state.boot_frames do
-        [{state.runtime_preamble, :cached}, {frames_text, :cached}]
-      else
-        [{state.runtime_preamble, :cached}, {boot_text, :cached}, {frames_text, :uncached}]
-      end
-
-    # Flat string for logging and trace
-    system_prompt = Enum.map_join(system_parts, "\n\n---\n\n", fn {text, _} -> text end)
-
-    # Merge: current frame sections override persisted, but old ones survive
-    current_sections = Gizmo.Interpolation.extract_sections(context_stack)
-    sections = Map.merge(persisted_sections, current_sections)
-
-    id = state.mailbox_id
-
-    Logger.warning(Gizmo.Format.separator(id))
-    Logger.warning(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
-    Logger.debug(Gizmo.Format.bindings_line(id, bindings, binding_notes))
-
-    user_content =
-      if map_size(bindings) == 0 do
-        "Begin."
-      else
-        binding_lines =
-          bindings
-          |> Enum.sort()
-          |> Enum.map(fn {key, val} ->
-            case Map.get(binding_notes, key) do
-              nil -> "${#{key}} = #{val}"
-              note -> "${#{key}} = #{val} (#{note})"
+      frames_text =
+        if length(context_stack) > 1 do
+          context_stack
+          |> Enum.with_index()
+          |> Enum.map_join("\n\n---\n\n", fn {frame, idx} ->
+            if idx == 0 do
+              ">>> CURRENT FRAME (follow ONLY these instructions) <<<\n#{frame}"
+            else
+              "--- QUEUED FRAME #{idx + 1} of #{length(context_stack)} (do NOT follow yet) ---\n#{frame}"
             end
           end)
-          |> Enum.join("\n")
+        else
+          Enum.join(context_stack, "\n\n---\n\n")
+        end
 
-        "Begin.\n\nCurrent bindings:\n#{binding_lines}"
+      system_parts =
+        if context_stack == state.boot_frames do
+          [{state.runtime_preamble, :cached}, {frames_text, :cached}]
+        else
+          [{state.runtime_preamble, :cached}, {boot_text, :cached}, {frames_text, :uncached}]
+        end
+
+      # Flat string for logging and trace
+      system_prompt = Enum.map_join(system_parts, "\n\n---\n\n", fn {text, _} -> text end)
+
+      # Merge: current frame sections override persisted, but old ones survive
+      current_sections = Gizmo.Interpolation.extract_sections(context_stack)
+      sections = Map.merge(persisted_sections, current_sections)
+
+      id = state.mailbox_id
+
+      Logger.warning(Gizmo.Format.separator(id))
+      Logger.warning(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
+      Logger.debug(Gizmo.Format.bindings_line(id, bindings, binding_notes))
+
+      user_content =
+        if map_size(bindings) == 0 do
+          "Begin."
+        else
+          binding_lines =
+            bindings
+            |> Enum.sort()
+            |> Enum.map(fn {key, val} ->
+              case Map.get(binding_notes, key) do
+                nil -> "${#{key}} = #{val}"
+                note -> "${#{key}} = #{val} (#{note})"
+              end
+            end)
+            |> Enum.join("\n")
+
+          "Begin.\n\nCurrent bindings:\n#{binding_lines}"
+        end
+
+      if state.log_full_prompts do
+        Logger.flush()
+        IO.puts(:stderr, Gizmo.Format.full_prompt(id, system_prompt, user_content))
       end
 
-    if state.log_full_prompts do
-      Logger.flush()
-      IO.puts(:stderr, Gizmo.Format.full_prompt(id, system_prompt, user_content))
-    end
+      cycle_start = System.monotonic_time(:millisecond)
+      llm_start = System.monotonic_time(:millisecond)
 
-    cycle_start = System.monotonic_time(:millisecond)
-    llm_start = System.monotonic_time(:millisecond)
+      llm_result = state.chat_fn.(system_parts, [%{role: "user", content: user_content}], [])
 
-    llm_result = state.chat_fn.(system_parts, [%{role: "user", content: user_content}], [])
+      case llm_result do
+        {:ok, response} ->
+          llm_ms = System.monotonic_time(:millisecond) - llm_start
 
-    case llm_result do
-      {:ok, response} ->
-        llm_ms = System.monotonic_time(:millisecond) - llm_start
+          interpolated = Gizmo.LLM.interpolate_response(response, bindings, sections)
 
-        interpolated = Gizmo.LLM.interpolate_response(response, bindings, sections)
+          for op <- interpolated.ops do
+            case op do
+              {:send, mb, msg} ->
+                Logger.info(Gizmo.Format.op_send(id, mb, msg))
 
-        for op <- interpolated.ops do
-          case op do
-            {:send, mb, msg} ->
-              Logger.info(Gizmo.Format.op_send(id, mb, msg))
+              {:spawn, cf, dest, _opts} ->
+                Logger.info(Gizmo.Format.op_spawn(id, cf, dest))
 
-            {:spawn, cf, dest, _opts} ->
-              Logger.info(Gizmo.Format.op_spawn(id, cf, dest))
+              {:trap, _pattern, []} ->
+                Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
 
-            {:trap, _pattern, []} ->
-              Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
-
-            {:trap, pattern, _} ->
-              Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
-          end
-        end
-
-        Logger.warning(Gizmo.Format.frames_line(id, interpolated.frames))
-
-        # Merge notes from this cycle's response into binding_notes
-        new_binding_notes = Map.merge(binding_notes, interpolated.notes)
-
-        # Execute ops — may modify context_stack via spawn, updates bindings and trap
-        ops_result =
-          execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
-
-        {new_stack, new_bindings, new_trap, new_retries, op_error} =
-          case ops_result do
-            {:ok, stack, b, t} ->
-              {stack, b, t, 0, nil}
-
-            {:op_error, error_desc, remaining_desc, stack, b, t} ->
-              Logger.error(
-                "#{Gizmo.Format.agent_tag(id)}   \e[31mop error:\e[0m #{error_desc} (#{remaining_desc})"
-              )
-
-              err_bindings =
-                b
-                |> Map.put("_op_error", error_desc)
-                |> Map.put("_pending_ops", remaining_desc)
-
-              {stack, err_bindings, t, retries + 1, error_desc}
+              {:trap, pattern, _} ->
+                Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
+            end
           end
 
-        cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+          Logger.warning(Gizmo.Format.frames_line(id, interpolated.frames))
 
-        if state.log_timings do
-          Logger.flush()
+          # Merge notes from this cycle's response into binding_notes
+          new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
-          IO.puts(
-            :stderr,
-            Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start, interpolated.usage)
-          )
-        end
+          ops_result =
+            execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
 
-        Gizmo.Trace.emit(state.trace_outputs, %{
-          event: "cycle",
-          agent: id,
-          cycle: cycles + 1,
-          llm_ms: llm_ms,
-          cycle_ms: cycle_ms,
-          t_ms: System.monotonic_time(:millisecond) - state.run_start,
-          system_prompt: system_prompt,
-          user_content: user_content,
-          ops: format_ops_for_trace(interpolated.ops),
-          frames: interpolated.frames,
-          bindings: new_bindings,
-          notes: interpolated.notes,
-          usage: interpolated.usage,
-          error: op_error
-        })
+          {new_stack, new_bindings, new_trap, keep_alive_sent, new_retries, op_error} =
+            case ops_result do
+              {:ok, stack, b, t, keep_alive_sent} ->
+                {stack, b, t, keep_alive_sent, 0, nil}
 
-        eval_loop_inner(new_stack, state, %{
-          loop
-          | retries: new_retries,
-            cycles: cycles + 1,
-            persisted_sections: sections,
+              {:op_error, error_desc, remaining_desc, stack, b, t, keep_alive_sent} ->
+                Logger.error(
+                  "#{Gizmo.Format.agent_tag(id)}   \e[31mop error:\e[0m #{error_desc} (#{remaining_desc})"
+                )
+
+                err_bindings =
+                  b
+                  |> Map.put("_op_error", error_desc)
+                  |> Map.put("_pending_ops", remaining_desc)
+
+                {stack, err_bindings, t, keep_alive_sent, retries + 1, error_desc}
+            end
+
+          cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+
+          if state.log_timings do
+            Logger.flush()
+
+            IO.puts(
+              :stderr,
+              Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start, interpolated.usage)
+            )
+          end
+
+          Gizmo.Trace.emit(state.trace_outputs, %{
+            event: "cycle",
+            agent: id,
+            cycle: cycles + 1,
+            llm_ms: llm_ms,
+            cycle_ms: cycle_ms,
+            t_ms: System.monotonic_time(:millisecond) - state.run_start,
+            system_prompt: system_prompt,
+            user_content: user_content,
+            ops: format_ops_for_trace(interpolated.ops),
+            frames: interpolated.frames,
             bindings: new_bindings,
-            binding_notes: new_binding_notes,
-            trap: new_trap
-        })
+            notes: interpolated.notes,
+            usage: interpolated.usage,
+            error: op_error,
+            keep_alive: keep_alive_sent
+          })
 
-      {:error, reason} ->
-        llm_ms = System.monotonic_time(:millisecond) - llm_start
-        cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+          cond do
+            not keep_alive_sent ->
+              :ok
 
-        if state.log_timings do
-          Logger.flush()
-          IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start))
-        end
+            new_stack == [] ->
+              :ok =
+                Gizmo.Services.MessagesQueue.push_front(
+                  state.msgs_queue,
+                  %{"text" => "stack_exhausted", "type" => "stack_exhausted"},
+                  "runtime"
+                )
 
-        Gizmo.Trace.emit(state.trace_outputs, %{
-          event: "cycle",
-          agent: id,
-          cycle: cycles + 1,
-          llm_ms: llm_ms,
-          cycle_ms: cycle_ms,
-          t_ms: System.monotonic_time(:millisecond) - state.run_start,
-          system_prompt: system_prompt,
-          user_content: user_content,
-          ops: nil,
-          frames: nil,
-          bindings: nil,
-          notes: nil,
-          usage: nil,
-          error: inspect(reason)
-        })
+              eval_loop_inner([], state, %{
+                loop
+                | retries: new_retries,
+                  cycles: cycles + 1,
+                  persisted_sections: sections,
+                  bindings: new_bindings,
+                  binding_notes: new_binding_notes,
+                  trap: new_trap,
+                  awaiting_exhaustion: true
+              })
 
-        Logger.error(Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
+            true ->
+              eval_loop_inner(new_stack, state, %{
+                loop
+                | retries: new_retries,
+                  cycles: cycles + 1,
+                  persisted_sections: sections,
+                  bindings: new_bindings,
+                  binding_notes: new_binding_notes,
+                  trap: new_trap,
+                  awaiting_exhaustion: false
+              })
+          end
 
-        eval_loop_inner(context_stack, state, %{
-          loop
-          | retries: retries + 1,
-            cycles: cycles + 1,
-            persisted_sections: sections
-        })
+        {:error, reason} ->
+          llm_ms = System.monotonic_time(:millisecond) - llm_start
+          cycle_ms = System.monotonic_time(:millisecond) - cycle_start
+
+          if state.log_timings do
+            Logger.flush()
+            IO.puts(:stderr, Gizmo.Format.timing_line(id, llm_ms, cycle_ms, state.run_start))
+          end
+
+          Gizmo.Trace.emit(state.trace_outputs, %{
+            event: "cycle",
+            agent: id,
+            cycle: cycles + 1,
+            llm_ms: llm_ms,
+            cycle_ms: cycle_ms,
+            t_ms: System.monotonic_time(:millisecond) - state.run_start,
+            system_prompt: system_prompt,
+            user_content: user_content,
+            ops: nil,
+            frames: nil,
+            bindings: nil,
+            notes: nil,
+            usage: nil,
+            error: inspect(reason),
+            keep_alive: false
+          })
+
+          Logger.error(Gizmo.Format.error_line(id, reason, retries + 1, @max_eval_retries))
+
+          eval_loop_inner(context_stack, state, %{
+            loop
+            | retries: retries + 1,
+              cycles: cycles + 1,
+              persisted_sections: sections,
+              awaiting_exhaustion: false
+          })
+      end
     end
   end
 
@@ -4448,19 +4493,19 @@ defmodule Gizmo.Agent do
   end
 
   defp execute_ops(ops, frames, state, bindings, trap) do
-    execute_ops_loop(ops, frames, state, bindings, trap)
+    execute_ops_loop(ops, frames, state, bindings, trap, false)
   end
 
-  defp execute_ops_loop([], frames, _state, bindings, trap) do
-    {:ok, frames, bindings, trap}
+  defp execute_ops_loop([], frames, _state, bindings, trap, keep_alive_sent) do
+    {:ok, frames, bindings, trap, keep_alive_sent}
   end
 
-  defp execute_ops_loop([op | rest], frames, state, bindings, trap) do
+  defp execute_ops_loop([op | rest], frames, state, bindings, trap, keep_alive_sent) do
     try do
-      {:cont, new_frames, new_bindings, new_trap} =
-        execute_op(op, frames, state, bindings, trap)
+      {:cont, new_frames, new_bindings, new_trap, keep_alive_sent} =
+        execute_op(op, frames, state, bindings, trap, keep_alive_sent)
 
-      execute_ops_loop(rest, new_frames, state, new_bindings, new_trap)
+      execute_ops_loop(rest, new_frames, state, new_bindings, new_trap, keep_alive_sent)
     rescue
       e ->
         error_desc = "#{op_name(op)} failed: #{Exception.message(e)}"
@@ -4468,7 +4513,7 @@ defmodule Gizmo.Agent do
         remaining_desc =
           "#{length(rest)} op(s) skipped: #{Enum.map_join(rest, ", ", &op_summary/1)}"
 
-        {:op_error, error_desc, remaining_desc, frames, bindings, trap}
+        {:op_error, error_desc, remaining_desc, frames, bindings, trap, keep_alive_sent}
     end
   end
 
@@ -4492,17 +4537,23 @@ defmodule Gizmo.Agent do
   defp op_summary({:spawn, _, dest, _}), do: "spawn(dest='#{dest}')"
   defp op_summary({:trap, pattern, _}), do: "trap(pattern='#{pattern}')"
 
-  defp execute_op({:send, mailbox, msg}, frames, state, bindings, trap) do
+  defp execute_op({:send, mailbox, msg}, frames, state, bindings, trap, keep_alive_sent) do
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
-    {:cont, frames, bindings, trap}
+
+    keep_alive_sent =
+      if mailbox == "keep_alive", do: true, else: keep_alive_sent
+
+    {:cont, frames, bindings, trap, keep_alive_sent}
   end
 
-  defp execute_op({:spawn, child_frames, dest, spawn_opts}, frames, state, bindings, trap) do
-    child_quit_on_exhaust =
-      if Map.has_key?(spawn_opts, :idle),
-        do: !spawn_opts.idle,
-        else: state.quit_on_exhaust
-
+  defp execute_op(
+         {:spawn, child_frames, dest, spawn_opts},
+         frames,
+         state,
+         bindings,
+         trap,
+         keep_alive_sent
+       ) do
     disown = Map.get(spawn_opts, :disown, false)
     parent_arg = if disown, do: nil, else: state.mailbox_id
     child_name = Map.get(spawn_opts, :name, nil)
@@ -4531,7 +4582,6 @@ defmodule Gizmo.Agent do
       chat_fn: child_chat_fn,
       chat_config: child_chat_config,
       max_cycles: state.max_cycles,
-      quit_on_exhaust: child_quit_on_exhaust,
       log_timings: state.log_timings,
       log_full_prompts: state.log_full_prompts,
       run_start: state.run_start,
@@ -4578,18 +4628,25 @@ defmodule Gizmo.Agent do
       end)
     end
 
-    {:cont, frames, Map.put(bindings, dest, child_mb), trap}
+    {:cont, frames, Map.put(bindings, dest, child_mb), trap, keep_alive_sent}
   end
 
-  defp execute_op({:trap, _pattern, []}, frames, _state, bindings, _trap) do
+  defp execute_op({:trap, _pattern, []}, frames, _state, bindings, _trap, keep_alive_sent) do
     # Empty handler frames = clear the trap
-    {:cont, frames, bindings, nil}
+    {:cont, frames, bindings, nil, keep_alive_sent}
   end
 
-  defp execute_op({:trap, pattern, handler_frames}, frames, _state, bindings, _trap) do
+  defp execute_op(
+         {:trap, pattern, handler_frames},
+         frames,
+         _state,
+         bindings,
+         _trap,
+         keep_alive_sent
+       ) do
     case Regex.compile(pattern) do
       {:ok, regex} ->
-        {:cont, frames, bindings, {regex, handler_frames}}
+        {:cont, frames, bindings, {regex, handler_frames}, keep_alive_sent}
 
       {:error, {reason, _pos}} ->
         raise "invalid regex pattern '#{pattern}': #{reason}"
@@ -4616,7 +4673,6 @@ defmodule Gizmo.CLI do
           thinking: :boolean,
           max_cycles: :integer,
           boot: :string,
-          idle: :boolean,
           watchdog: :integer,
           log_timings: :boolean,
           log_full_prompts: :boolean,
@@ -4721,9 +4777,8 @@ defmodule Gizmo.CLI do
       --thinking          Enable extended thinking (Anthropic only)
       --model <id>        LLM model to use (default: env var or claude-sonnet-4-20250514)
       --max-cycles N      Max eval cycles before terminating (default: 50, 0 = unlimited)
-      --idle              Idle (restore boot frame) when frames exhaust instead of terminating
       --watchdog N        Send periodic watchdog:tick messages every N ms
-      --boot <file>       Separate boot frame file (used for idle recovery)
+      --boot <file>       Separate boot frame file (used for initial stack / boot sections)
       --log-timings       Show LLM call, cycle, and wall-clock timing per eval cycle
       --log-full-prompts  Show full system prompt and user message each cycle
       --runtime <file>     Use custom runtime preamble instead of built-in
@@ -4755,7 +4810,6 @@ defmodule Gizmo.CLI do
       elixir gizmo.exs task.txt                          # single file (boot = task)
       elixir gizmo.exs a.txt b.txt                       # multi-file (boot = a)
       elixir gizmo.exs --boot sys.txt task.txt            # separate boot frame
-      elixir gizmo.exs --idle --boot sys.txt task.txt      # idle on empty frames (restore boot)
       elixir gizmo.exs --max-cycles 5 task.txt            # limit to 5 eval cycles
       elixir gizmo.exs --name mybot task.txt              # named root agent
       elixir gizmo.exs --each a.txt b.txt                 # one agent per file
@@ -4958,7 +5012,6 @@ defmodule Gizmo.CLI do
 
     thinking = opts[:thinking] || false
     max_cycles = opts[:max_cycles]
-    idle = opts[:idle] || false
     watchdog_ms = opts[:watchdog]
 
     # Build trace outputs list
@@ -5034,7 +5087,6 @@ defmodule Gizmo.CLI do
     run_opts = Keyword.put(run_opts, :chat_config, chat_config)
 
     run_opts = if max_cycles, do: Keyword.put(run_opts, :max_cycles, max_cycles), else: run_opts
-    run_opts = if idle, do: Keyword.put(run_opts, :quit_on_exhaust, false), else: run_opts
 
     run_opts =
       if opts[:log_timings], do: Keyword.put(run_opts, :log_timings, true), else: run_opts

@@ -903,3 +903,32 @@ echo "GIZMO_FLAGS=\"${gizmo_flags[*]}\""
 ```
 This produces `GIZMO_FLAGS="--node gizmo_src@localhost --cookie test"` in
 the `.env` file, which bash sources correctly.
+
+## Idle Mode and Implicit Persistence
+
+**Discovered:** 2026 runtime simplification pass
+
+`idle` / `quit_on_exhaust` kept a second lifecycle model alive inside the
+runtime. An agent could survive because the scheduler silently restored its boot
+frame, while other agents died on `frames: []`. That made persistence implicit,
+inherited, and easy to trigger accidentally.
+
+### Why it didn't work
+
+- **Persistence was not explicit.** Surviving an eval cycle depended on runtime
+  mode rather than something the gremlin did that turn.
+- **Spawn semantics leaked parent policy.** Children inherited the parent's
+  exhaustion mode unless overridden, which was easy to forget and hard to see in
+  prompts.
+- **Exhaustion recovery was hidden control flow.** The agent never observed an
+  ordinary event saying its stack had drained; the runtime just resurrected it.
+
+### What replaced it
+
+- **Per-turn lease renewal.** A gremlin survives only if that turn sends a
+  message to `keep_alive`.
+- **Ordinary exhaustion event.** If a renewed turn returns `frames: []`, the
+  runtime front-queues `{"text":"stack_exhausted","type":"stack_exhausted"}`
+  from source `runtime`.
+- **Trap-owned continuation.** Long-lived gremlins trap `stack_exhausted` and
+  rebuild work explicitly. One-shot gremlins simply omit `keep_alive` and die.

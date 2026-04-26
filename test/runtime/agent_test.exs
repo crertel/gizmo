@@ -25,7 +25,7 @@ defmodule Gizmo.AgentTest do
         end
 
       assert result == :ok
-      assert wait_for_exit_ref(ref, agent_pid) == :normal
+      assert wait_for_exit_ref(ref, agent_pid) in [:normal, :noproc]
       Gizmo.Mailbox.unregister(test_mb)
     end
   end
@@ -53,7 +53,10 @@ defmodule Gizmo.AgentTest do
           true ->
             {:ok,
              %{
-               ops: [{:spawn, ["child frame"], "worker", %{}}],
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:spawn, ["child frame"], "worker", %{}}
+               ],
                frames: ["parent waiting"],
                notes: %{}
              }}
@@ -106,35 +109,38 @@ defmodule Gizmo.AgentTest do
     end
   end
 
-  describe "idle behavior" do
-    test "agent goes idle, wakes on message, terminates" do
-      test_mb = register_test_mailbox("idle_test")
+  describe "stack exhaustion behavior" do
+    test "renewed empty stack wakes with stack_exhausted and can terminate" do
+      test_mb = register_test_mailbox("stack_exhausted_agent_test")
       cycle = :counters.new(1, [:atomics])
 
-      chat_fn = fn _system, _messages, _opts ->
+      chat_fn = fn system, _messages, _opts ->
+        sys = flatten_system(system)
         c = :counters.get(cycle, 1)
         :counters.add(cycle, 1, 1)
 
-        case c do
-          0 ->
-            {:ok, %{ops: [], frames: [], notes: %{}}}
+        cond do
+          c == 0 ->
+            {:ok,
+             %{
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:trap, "^stack_exhausted$", ["stack exhausted handler"]}
+               ],
+               frames: [],
+               notes: %{}
+             }}
 
-          1 ->
+          String.contains?(sys, "stack exhausted handler") ->
             {:ok, %{ops: [{:send, test_mb, %{"text" => "${_msg}"}}], frames: [], notes: %{}}}
 
-          _ ->
+          true ->
             {:ok, %{ops: [], frames: [], notes: %{}}}
         end
       end
 
-      {:ok, agent_mb, pid} =
-        Gizmo.Agent.start(["idle boot frame"],
-          chat_fn: chat_fn,
-          quit_on_exhaust: false
-        )
-
-      Process.sleep(100)
-      Gizmo.Mailbox.route(agent_mb, {"test", "wake up!"})
+      {:ok, _agent_mb, pid} =
+        Gizmo.Agent.start(["stack exhausted boot frame"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -145,7 +151,8 @@ defmodule Gizmo.AgentTest do
           5_000 -> :no_message
         end
 
-      assert result == %{"text" => "wake up!"}
+      assert result == %{"text" => "stack_exhausted"}
+      assert :counters.get(cycle, 1) == 2
       wait_for_exit_ref(ref, pid, 5_000)
       Gizmo.Mailbox.unregister(test_mb)
     end
@@ -195,44 +202,38 @@ defmodule Gizmo.AgentTest do
 
   describe "child death notification" do
     test "parent receives child_died message when child crashes" do
-      child_death_cycle = :counters.new(1, [:atomics])
       cd_agent = Agent.start_link(fn -> nil end) |> elem(1)
 
-      base_chat_fn = fn system, _messages, _opts ->
+      chat_fn = fn system, messages, _opts ->
         sys = flatten_system(system)
-        c = :counters.get(child_death_cycle, 1)
-        :counters.add(child_death_cycle, 1, 1)
+        user_msg =
+          case messages do
+            [%{content: content} | _] -> to_string(content)
+            _ -> ""
+          end
 
         cond do
-          c == 0 ->
-            {:ok,
-             %{
-               ops: [{:spawn, ["crash frame"], "worker", %{}}],
-               frames: ["parent waiting for child death"],
-               notes: %{}
-             }}
-
           String.contains?(sys, "crash frame") ->
             raise "deliberate child crash"
 
-          c == 2 ->
+          String.contains?(user_msg, "child_died:") ->
+            Agent.update(cd_agent, fn _ -> user_msg end)
             {:ok, %{ops: [], frames: [], notes: %{}}}
+
+          String.contains?(sys, "parent waiting for child death") ->
+            {:ok, %{ops: [{:send, "keep_alive", %{"text" => "renew"}}], frames: ["parent waiting for child death"], notes: %{}}}
 
           true ->
-            {:ok, %{ops: [], frames: [], notes: %{}}}
+            {:ok,
+             %{
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:spawn, ["crash frame"], "worker", %{}}
+               ],
+               frames: ["parent waiting for child death"],
+               notes: %{}
+             }}
         end
-      end
-
-      chat_fn = fn system, messages, opts ->
-        result = base_chat_fn.(system, messages, opts)
-        c = :counters.get(child_death_cycle, 1)
-
-        if c == 3 do
-          user_msg = hd(messages)[:content] || hd(messages)["content"] || ""
-          Agent.update(cd_agent, fn _ -> user_msg end)
-        end
-
-        result
       end
 
       {:ok, _mb, pid} =
@@ -263,7 +264,7 @@ defmodule Gizmo.AgentTest do
           0 ->
             {:ok,
              %{
-               ops: [],
+               ops: [{:send, "keep_alive", %{"text" => "renew"}}],
                frames: ["check data"],
                notes: %{"_self" => "agent mailbox"}
              }}

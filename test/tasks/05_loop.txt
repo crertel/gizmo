@@ -13,6 +13,7 @@ arrived as ${_msg}. Check it now:
   notes: {}
 - Otherwise: your response MUST be exactly:
   ops: [
+    {"op":"send","mailbox":"keep_alive","msg":{"text":"renew"}},
     {"op":"send","mailbox":"human_input","msg":{"prompt":"echo-bot: you said: ${_msg}\necho-bot> "}}
   ]
   frames: ["@loop"]
@@ -21,6 +22,7 @@ arrived as ${_msg}. Check it now:
 
 This is setup (${_msg} is "init"). Your response MUST be exactly:
 ops: [
+  {"op":"send","mailbox":"keep_alive","msg":{"text":"renew"}},
   {"op":"send","mailbox":"human_input","msg":{"prompt":"echo-bot: Hello! Type anything, I'll echo it. Type 'quit' to exit.\necho-bot> "}}
 ]
 frames: ["@loop"]

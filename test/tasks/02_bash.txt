@@ -3,6 +3,7 @@ You are a system inspector. Do the following in order:
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Because you need the bash reply on the next cycle, also send {"text": "renew"} to 'keep_alive' before returning your continuation frame.
 
 @@step2
 The output of 'uname -a' arrived as ${_msg}.
@@ -11,7 +12,8 @@ Then terminate with an empty frames array [].
 @@end
 
 1. Send {"command": "uname -a"} to the 'bash' mailbox.
-2. Return frames: ["@step2"] to continue to the next step.
+2. Send {"text": "renew"} to 'keep_alive'.
+3. Return frames: ["@step2"] to continue to the next step.
 
 The bash output arrives automatically as ${_msg} on the next cycle.
 Do NOT try to send the result to 'human' in this cycle.

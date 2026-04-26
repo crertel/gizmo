@@ -58,7 +58,12 @@ defmodule Gizmo.MessageDrivenTest do
 
         case c do
           0 ->
-            {:ok, %{ops: [], frames: ["waiting for message"], notes: %{}}}
+            {:ok,
+             %{
+               ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+               frames: ["waiting for message"],
+               notes: %{}
+             }}
 
           1 ->
             {:ok,
@@ -102,7 +107,10 @@ defmodule Gizmo.MessageDrivenTest do
           0 ->
             {:ok,
              %{
-               ops: [{:trap, "^alert:", ["Handle interrupt: ${_interrupt}"]}],
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:trap, "^alert:", ["Handle interrupt: ${_interrupt}"]}
+               ],
                frames: ["base frame"],
                notes: %{}
              }}
@@ -146,7 +154,14 @@ defmodule Gizmo.MessageDrivenTest do
         case c do
           0 ->
             {:ok,
-             %{ops: [{:trap, "^alert:", ["handler frame"]}], frames: ["base frame"], notes: %{}}}
+             %{
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:trap, "^alert:", ["handler frame"]}
+               ],
+               frames: ["base frame"],
+               notes: %{}
+             }}
 
           1 ->
             user_msg =

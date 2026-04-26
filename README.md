@@ -87,8 +87,7 @@ elixir gizmo.exs my_task.txt
 | `--model <id>` | LLM model to use (default: env var or `claude-sonnet-4-20250514`) |
 | `--init <file>` | Generate a starter boot frame file |
 | `--max-cycles N` | Max eval cycles before terminating (default: 50, 0 = unlimited) |
-| `--idle` | Idle (restore boot frame) when frames exhaust instead of terminating |
-| `--boot <file>` | Separate boot frame file (used for idle recovery) |
+| `--boot <file>` | Separate boot frame file (used for initial stack / named boot sections) |
 | `--watchdog <ms>` | Periodic tick messages at given interval |
 | `--name <id>` | Custom mailbox ID for the root agent |
 | `--each` | Spawn one agent per positional file (instead of stacking) |
@@ -108,9 +107,9 @@ elixir gizmo.exs my_task.txt
 ### Positional arguments
 
 Without `--boot`, the first positional file is the boot frame and any additional
-files are stacked on top. With `--boot`, the boot file is used for idle recovery
-and all positional files are task frames. With `--each`, each positional file
-becomes a separate independent agent.
+files are stacked on top. With `--boot`, the boot file is used as the initial
+stack root and all positional files are task frames. With `--each`, each
+positional file becomes a separate independent agent.
 
 ### Signal handling
 

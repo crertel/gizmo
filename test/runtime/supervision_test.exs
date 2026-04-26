@@ -3,7 +3,7 @@ defmodule Gizmo.SupervisionTest do
 
   describe "supervision" do
     test "all well-known services are registered" do
-      for svc <- ["blackboard", "bash", "human", "human_input", "exception", "reaper", "watchdog", "pager", "batch", "eval"] do
+      for svc <- ["blackboard", "bash", "keep_alive", "human", "human_input", "exception", "reaper", "watchdog", "pager", "batch", "eval"] do
         assert elem(Gizmo.Mailbox.lookup(svc), 0) == :ok,
                "supervised service '#{svc}' not registered"
       end

@@ -5,10 +5,11 @@ interactively.
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@got-path
 The user's input arrived as ${_msg}. It is a file path.
-Send {"action": "open", "path": "${_msg}"} to 'pager'. Return frames: ["@opened"].
+Send {"action": "open", "path": "${_msg}"} to 'pager'. Send {"text": "renew"} to 'keep_alive'. Return frames: ["@opened"].
 @@end
 
 @@opened
@@ -21,6 +22,7 @@ If ${_msg} starts with "opened:":
   Send {"text": "Opened session ${_msg}"} to 'human'.
   Now ask the pager session for the first page: send {"action": "next"}
   to the session ID.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["Pager session: <SESSION_ID>.\n@browse"]
   (Replace <SESSION_ID> with the actual session ID you extracted.)
 Otherwise: Send {"text": "Unexpected response: ${_msg}"} to 'human'.
@@ -36,6 +38,7 @@ If ${_msg_source} is "human_input":
   The user typed a command. Parse it:
   If ${_msg} is "q" or "quit":
     Send {"action": "close"} to the pager session ID.
+    Send {"text": "renew"} to 'keep_alive'.
     Return frames: ["@closing"].
   If ${_msg} is "next":
     Send {"action": "next"} to the pager session ID.
@@ -45,6 +48,7 @@ If ${_msg_source} is "human_input":
     Extract the number N. Send {"action": "goto", "line": N} to the pager session ID.
   If ${_msg} starts with "search ":
     Extract the pattern. Send {"action": "search", "pattern": "<pattern>"} to the pager session ID.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@0"].
 
 If ${_msg_source} is your pager session ID:
@@ -52,9 +56,10 @@ If ${_msg_source} is your pager session ID:
   Send {"text": "${_msg}"} to 'human'.
   Then prompt for the next command: send {"prompt": "Command (next/prev/goto N/search PATTERN/q):"}
   to 'human_input'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@0"].
 
-Otherwise: Return frames: ["@0"].
+Otherwise: Send {"text": "renew"} to 'keep_alive'. Return frames: ["@0"].
 @@end
 
 @@closing
@@ -63,8 +68,10 @@ If ${_msg} is "closed":
   Send {"text": "Session closed. Goodbye!"} to 'human'.
   Terminate with empty frames [].
 Otherwise: Return frames: ["@closing"].
+Also send {"text": "renew"} to 'keep_alive' while waiting for the close confirmation.
 @@end
 
 Step 1:
 1. Send {"prompt": "Enter file path to read:"} to 'human_input'.
-2. Return frames: ["@got-path"].
+2. Send {"text": "renew"} to 'keep_alive'.
+3. Return frames: ["@got-path"].

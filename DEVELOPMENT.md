@@ -145,16 +145,17 @@ Production-grade process management.
 
 ## Stage 10: CLI Runtime Options
 
-Configurable cycle limits, stack exhaustion behavior, multi-file frame stacks,
-and signal handling.
+Configurable cycle limits, multi-file frame stacks, and signal handling.
 
 - [x] `--max-cycles N` — configurable eval cycle limit (default 50, 0 = unlimited)
-- [x] `--idle` — idle on empty frames instead of terminating (opt-in)
 - [x] `--boot <file>` — separate boot frame from task frames
 - [x] Multi-file positional args (stacked as frames)
-- [x] `max_cycles` and `quit_on_exhaust` (idle mode) propagated to spawned children
 - [x] SIGTERM and SIGQUIT signal traps for clean abort
-- [x] Tests: max_cycles limit, unlimited mode, terminate-on-exhaust and idle mode
+- [x] Tests: max_cycles limit, unlimited mode, termination behavior
+
+Later runtime evolution removed `--idle` / `quit_on_exhaust`. Persistence is
+now explicit via per-turn `keep_alive`, with renewed empty-stack turns waking
+through synthetic `stack_exhausted` messages.
 
 ## Stage 11: Polish and Hardening
 

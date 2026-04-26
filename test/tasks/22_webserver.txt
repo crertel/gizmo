@@ -29,6 +29,7 @@ TIPS FOR CHILDREN (include in their boot frame):
 
 The @@sections below are definitions. On your first cycle (when ${_msg} is
 "init"), follow @@first-cycle. On later cycles, follow your current frame.
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@http-worker
 Set up a web server on port 8080 serving a system status page. You run as

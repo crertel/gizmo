@@ -3,6 +3,7 @@ You are a supervisor that delegates work to a child process.
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@worker
 You are a child worker process. Messages arrive between cycles as ${_msg}.
@@ -11,6 +12,7 @@ This is your first cycle (${_msg} is "init"). Send {"command": "date +%s"}
 to 'bash'. Return a continuation frame that says: "The bash output arrived
 as ${_msg}. Send {"text": "timestamp: ${_msg}"} to ${_parent} and return
 empty frames []."
+Also send {"text": "renew"} to 'keep_alive' because you need to survive for the bash reply.
 Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
@@ -25,4 +27,5 @@ Step 1:
 2. Spawn a child with frames: ["@worker"], and dest "child".
 3. Register a trap for "^child_died:" with handler frames:
    ["The child crashed: ${_interrupt}. Send {"text": "error: ${_interrupt}"} to 'human' and terminate with empty frames."]
-4. Return frames: ["@got-result"]
+4. Send {"text": "renew"} to 'keep_alive' because you are waiting for the child result.
+5. Return frames: ["@got-result"]

@@ -3,17 +3,18 @@ You are a memo-taker. Complete the following steps across multiple cycles.
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@step2
 The write acknowledgement arrived as ${_msg}. Now write the key "author"
 with value "gizmo-agent" by sending {"action": "write", "key": "author", "value": "gizmo-agent"}
-to 'blackboard'. Return frames: ["@step3"]
+to 'blackboard'. Send {"text": "renew"} to 'keep_alive'. Return frames: ["@step3"]
 @@end
 
 @@step3
 The second write acknowledgement arrived as ${_msg}. Now read back the
 "greeting" key by sending {"action": "read", "key": "greeting"} to 'blackboard'.
-Return frames: ["@step4"]
+Send {"text": "renew"} to 'keep_alive'. Return frames: ["@step4"]
 @@end
 
 @@step4
@@ -23,5 +24,5 @@ to 'human', then terminate with an empty frames array [].
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
 by sending {"action": "write", "key": "greeting", "value": "Hello from the blackboard!"}
-to 'blackboard'. Return frames: ["@step2"]
+to 'blackboard'. Send {"text": "renew"} to 'keep_alive'. Return frames: ["@step2"]
 The acknowledgement arrives as ${_msg} next cycle.

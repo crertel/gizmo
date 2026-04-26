@@ -22,6 +22,17 @@ defmodule Gizmo.ServicesTest do
       assert Gizmo.Services.MessagesQueue.to_list(mq_pid) == [{"x", "s"}]
       GenServer.stop(mq_pid)
     end
+
+    test "push_front inserts ahead of queued items" do
+      {:ok, mq_pid} =
+        Gizmo.Services.MessagesQueue.start_link(Gizmo.Mailbox.generate_id("msg_queue"))
+
+      :ok = Gizmo.Services.MessagesQueue.push(mq_pid, "tail", "agent1")
+      :ok = Gizmo.Services.MessagesQueue.push_front(mq_pid, "head", "runtime")
+      assert Gizmo.Services.MessagesQueue.pop(mq_pid) == {:ok, {"head", "runtime"}}
+      assert Gizmo.Services.MessagesQueue.pop(mq_pid) == {:ok, {"tail", "agent1"}}
+      GenServer.stop(mq_pid)
+    end
   end
 
   describe "Blackboard" do

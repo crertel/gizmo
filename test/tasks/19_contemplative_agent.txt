@@ -10,6 +10,7 @@ Tuple, Range, Regex, :math, :rand, and all standard Elixir/Erlang modules.
 The @@sections below are definitions — do NOT follow them directly. On your
 first cycle (when ${_msg} is "init"), follow the @@init section. On later
 cycles, follow only your current frame (the text after the last --- separator).
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@init
 Send a warm self-introduction to 'human'. Tell them who you are — a gizmo
@@ -24,6 +25,7 @@ Use only standard Elixir/Erlang modules. No Req or HTTP.
 Remember: case clauses separated by ; maps use %{"k" => v} syntax.
 
 Send the create request to 'factory' with name "spark" and your handler code.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@first-tool"].
 @@end
 
@@ -32,6 +34,7 @@ STEP: First tool created. Factory replied: ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "error:" — read the error, fix the code, send a
 corrected create to 'factory' with name "spark".
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@first-tool"].
 
 If ${_msg} does NOT start with "error:" — spark is ready! Tell 'human' what
@@ -39,6 +42,7 @@ spark does and why you made it (keep it to 2-3 sentences).
 Now design your second tool 'lens' — something different from spark. Write
 a handler fn msg, state -> {reply_map, new_state} end with a "text" key.
 Send the create request to 'factory' with name "lens" and your handler code.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@second-tool"].
 @@end
 
@@ -47,6 +51,7 @@ STEP: Second tool created. Factory replied: ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "error:" — read the error, fix the code, send a
 corrected create to 'factory' with name "lens".
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@second-tool"].
 
 If ${_msg} does NOT start with "error:" — both tools live! Tell 'human' what
@@ -55,6 +60,7 @@ lens does (2-3 sentences). Now use both tools via batch:
     {"mailbox": "spark", "msg": <something interesting>},
     {"mailbox": "lens", "msg": <something interesting>}
   ]}
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@discovery"].
 @@end
 
@@ -68,6 +74,7 @@ Use both tools again via batch with DIFFERENT inputs:
     {"mailbox": "spark", "msg": <something new>},
     {"mailbox": "lens", "msg": <something new>}
   ]}
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@wonder"].
 @@end
 
@@ -78,6 +85,7 @@ Full results in ${_payload} as JSON with a "results" array.
 Share what you found with 'human'. Tell them you want to sit with this.
 Send {"action": "after", "ms": 5000} to 'watchdog'.
 Send {"text": "Let me sit with this for a moment..."} to 'human'.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@contemplate"].
 @@end
 
@@ -92,6 +100,7 @@ Batch-destroy both tools: send to 'batch':
     {"mailbox": "factory", "msg": {"action": "destroy", "name": "spark"}},
     {"mailbox": "factory", "msg": {"action": "destroy", "name": "lens"}}
   ]}
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@farewell"].
 @@end
 

@@ -374,7 +374,6 @@ Each agent process carries the following state through its eval loop:
   [`parent_id`], [The spawning agent's mailbox ID, or `nil` for root/disowned agents.],
   [`bindings`], [Map of named values from `spawn` and the runtime (`_self`, `_parent`, `_msg`, `_msg_source`, `_payload`).],
   [`trap`], [A `{regex, handler_frames}` tuple, or `nil`. Single-slot interrupt handler.],
-  [`idle`], [Boolean. If `true`, restores boot frame (instead of terminating) when frames drain to `[]`.],
   [`messages_queue`], [A per-agent `MessagesQueue` GenServer. Currently unused in the runtime path (retained for test assertions).],
 )
 
@@ -386,13 +385,13 @@ The *runtime bindings* are always available:
 - `${_msg_source}` --- the sender's mailbox ID. `"runtime"` on cycle 0.
 - `${_payload}` --- full JSON of the wake message. `"{}"` on cycle 0.
 
-=== Message-Driven Wakeups and Idle Restore
+=== Message-Driven Wakeups and Lease Renewal
 
 Current Gizmo has a single pacing model: *message-driven wakeups*. Every cycle
 after cycle 0 begins by blocking for a mailbox message. The message that woke
 the cycle is bound as `${_msg}`, `${_msg_source}`, and `${_payload}`.
 
-`idle` controls only frame-exhaust behavior:
+Liveness is explicit:
 
 #table(
   columns: (auto, 1fr),
@@ -402,14 +401,15 @@ the cycle is bound as `${_msg}`, `${_msg_source}`, and `${_payload}`.
   table.header(
     [*Mode*], [*Behavior*],
   ),
-  [Default], [Agent wakes on a message, does work, and terminates when frames drain to `[]`.],
-  [`idle: true` / `--idle`], [Agent wakes on a message, does work, then restores the boot frame instead of terminating when frames drain to `[]`. Bindings reset to `{_self, _parent}` plus fresh wake bindings.],
+  [No `keep_alive` sent], [Agent dies after the current cycle, regardless of returned frames.],
+  [`keep_alive` sent + non-empty `frames`], [Agent survives and waits for the next real mailbox message.],
+  [`keep_alive` sent + `frames: []`], [Runtime front-queues `stack_exhausted` from source `runtime`; a trap can rebuild work on the next wake.],
 )
 
 Key invariants:
 
 - *`_msg` binding:* Updated from the mailbox on every cycle after cycle 0.
-- *Bindings from `spawn`:* Persist until the stack drains. On idle restore, only identity bindings and the new wake message remain.
+- *Bindings from `spawn`:* Persist until the agent dies.
 - *Trap:* Fires between cycles, before prompt construction, when the wake message matches the regex.
 - *Autonomous continuation:* If an agent needs to wake itself later, it must schedule a watchdog tick or send a message to `${_self}`.
 
@@ -504,7 +504,6 @@ The `msg` field must be a JSON object. It is interpolated (recursively, includin
   "op": "spawn",
   "frames": ["<child frame 1>", ...],
   "dest": "<binding_name>",
-  "idle": true,
   "disown": true,
   "name": "worker",
   "model": "claude-..."
@@ -533,7 +532,6 @@ Optional fields:
   table.header(
     [*Field*], [*Effect*],
   ),
-  [`idle`], [Child restores boot frame on empty frames instead of terminating.],
   [`disown`], [No `${_parent}` binding, no death monitor. Fully independent peer.],
   [`name`], [Custom mailbox ID instead of auto-generated `agent_N`. Must be unique.],
   [`model`], [Override the LLM model for the child.],
@@ -1407,7 +1405,7 @@ This is also a prerequisite for the self-modifying runtime below: agents need to
 
 === Open Questions
 
-- Snapshot granularity---per-cycle, on-demand, or on idle?
+- Snapshot granularity---per-cycle, on-demand, or on renewal boundaries?
 - Do snapshots include in-flight message queue contents?
 - How to handle stale references (a resumed agent's `_parent` may no longer exist)?
 - Where is the boundary between "agent state" and "runtime state"?
@@ -1420,8 +1418,8 @@ Possible directions:
 
 - *Live message sequence diagrams.* Render agent-to-agent and agent-to-service message flow as a sequence diagram in real time. Show send/receive causality, message content, and timing.
 - *Context stack inspector.* Visualize the context stack as a live-updating list of frames, with interpolation results shown inline. Highlight which frame the LLM is "in" and how frames change across cycles.
-- *Binding timeline.* Show how each binding evolves over cycles---when it was created, overwritten, or reset (on idle restore). Useful for diagnosing stale-binding bugs.
-- *Agent lifecycle view.* A tree or graph showing spawn relationships, agent status (running, idle, terminated), and death notifications. Especially useful for multi-agent systems with disowned peers.
+- *Binding timeline.* Show how each binding evolves over cycles---when it was created, overwritten, or cleared by termination/restart. Useful for diagnosing stale-binding bugs.
+- *Agent lifecycle view.* A tree or graph showing spawn relationships, agent status (running, renewed, terminated), and death notifications. Especially useful for multi-agent systems with disowned peers.
 - *Trace replay.* Load a `--trace-file` NDJSON trace and step through it cycle-by-cycle, with full system prompt, user message, ops, and frames visible at each step.
 
 === Open Questions
@@ -1806,8 +1804,7 @@ an empty frames array [].
 
 Step 1:
 1. Send {"text": "Supervisor: spawning slow worker..."} to 'human'.
-2. Spawn a child with frames: ["@worker"], dest "child",
-   "idle": true.
+2. Spawn a child with frames: ["@worker"], dest "child".
 3. Return frames: ["@wait-for-ack"]
 ```
 
@@ -1817,13 +1814,13 @@ Step 1:
 - Ancestry check: only ancestors can kill descendants (no peer-to-peer kills).
 - The kill #sym.arrow death-notification flow: reaper kills the child, the monitor sends `child_died:` to the parent.
 - Multi-phase parent state machine: spawn #sym.arrow wait-for-ack #sym.arrow wait-for-death #sym.arrow report.
-- Child spawned with `idle: true`---a daemon that restores its frame on empty stack and wakes on real messages.
+- Child persists only if it renews with `keep_alive` in its own turns.
 
 === Questions for Reflection
 
 + Why is there a `@wait-for-death` phase between sending to reaper and reporting? Could you skip it?
 + What if the child sends its status message _after_ the parent sends to the reaper but _before_ the child actually dies? Is there a race condition?
-+ What does `idle: true` contribute to the worker's lifecycle?
++ What does `keep_alive` contribute to the worker's lifecycle?
 
 === Extension Projects
 
@@ -1853,12 +1850,12 @@ is intentionally no longer reproduced here because both grind mode and the
 - Rebuild the same autonomous roller using only message-driven wakeups.
 - Compare a self-message loop against a watchdog-driven loop.
 
-== 09: Lucky Number --- Idle + Trap
+== 09: Lucky Number --- Lease Renewal + Trap
 
 === Listing
 
 ```
-You are a supervisor for a number-guessing game. Spawn an idle child
+You are a supervisor for a number-guessing game. Spawn a child
 that rolls dice on a watchdog timer. If it rolls 1, kill it via reaper.
 Use a trap for child death notification.
 
@@ -1871,11 +1868,13 @@ Roller child. Messages arrive as ${_msg} from ${_msg_source}.
 
 If ${_msg} is "init":
   1. Send {"action": "every", "ms": 2000} to 'watchdog'.
-  2. Return frames: [].
+  2. Send {"text": "renew"} to 'keep_alive'.
+  3. Return frames: [].
 
 If ${_msg_source} is "watchdog":
   1. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
-  2. Return frames: ["@1"].
+  2. Send {"text": "renew"} to 'keep_alive'.
+  3. Return frames: ["@1"].
 
 Otherwise: return frames: [].
 @@end
@@ -1886,7 +1885,8 @@ Waiting for bash result. Message: ${_msg} from ${_msg_source}.
 If ${_msg_source} is "bash":
   1. Send {"text": "rolled:${_msg}"} to ${_parent}.
   2. Send {"text": "Child: I rolled ${_msg}"} to 'human'.
-  3. Return frames: [].
+  3. Send {"text": "renew"} to 'keep_alive'.
+  4. Return frames: [].
 
 Otherwise: return frames: ["@0"].
 @@end
@@ -1911,17 +1911,18 @@ Return frames: [].
 
 1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller", "@wait-roll"],
-   dest "child", "idle": true.
+   dest "child".
 3. Register a trap: pattern "^child_died:", frames ["@death-handler"].
-4. Return frames: ["@check-roll"].
+4. Send {"text": "renew"} to 'keep_alive'.
+5. Return frames: ["@check-roll"].
 ```
 
 === What to Learn
 
 The current supported autonomous-roll pattern:
 
-- Child in message-driven mode with `idle: true` and a watchdog timer.
-- Watchdog ticks trigger rolls; child goes idle between ticks.
+- Child uses `keep_alive` every turn it wants to survive.
+- Watchdog ticks trigger rolls; `stack_exhausted` can be trapped if the child wants to rebuild work after emptying its stack.
 - Parent uses `trap` for death handling instead of checking in every section.
 - Multi-frame spawn: `["@roller", "@wait-roll"]` gives the child a two-frame stack.
 
@@ -2092,7 +2093,7 @@ The eval loop originally hot-looped: call LLM, execute ops, loop immediately. A 
 
 When frames drained to `[]`, the runtime restored the boot frame and idled. One-shot agents couldn't terminate without hitting the cycle limit.
 
-*Replaced by:* Terminate-on-exhaust as default. `--idle` is opt-in for daemon-style agents.
+*Replaced by:* Explicit per-turn `keep_alive` renewal plus `stack_exhausted` as an ordinary runtime wakeup.
 
 == `untrap` as a Separate Op
 
@@ -2215,7 +2216,7 @@ Gizmo's op set maps onto the #sym.pi\-calculus surprisingly directly:
   [$x(y)$ (receive $y$ from $x$)], [`${_msg}` on the next wakeup], [Mailbox-driven wakeup rather than an explicit receive op],
   [#sym.nu $x$ (create channel $x$)], [`spawn(dest: "x")`], [New process = new mailbox ID],
   [$P | Q$ (parallel composition)], [`spawn` creates concurrent processes], [Agents run on the BEAM],
-  [$!P$ (replication)], [`@0` loop / idle restore], [Persistent behavior],
+  [$!P$ (replication)], [`keep_alive` + `stack_exhausted` trap], [Persistent behavior],
 )
 
 The key difference is that in the #sym.pi\-calculus, every process is a precisely specified term in a formal algebra. You can prove properties about it: deadlock freedom, bisimulation equivalence, type safety (via session types). A Gizmo agent's "program" is a natural-language boot frame interpreted by an LLM. You cannot prove anything about it. The same boot frame can produce different behavior on different runs, or with different models, or even on the same model with different temperatures.
@@ -2293,7 +2294,7 @@ Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + bo
   inset: 3pt,
   table.header([*Op*], [*Syntax*], [*Blk?*], [*Binds*], [*Notes*]),
   [`send`], [`{"op":"send", "mailbox":"id", "msg":{...}}`], [No], [---], [Fire-and-forget. `msg` is a JSON object. Both fields interpolated.],
-  [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `idle` (bool), `disown` (bool, false), `name`/`model` (string, inherit).],
+  [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `disown` (bool, false), `name`/`model` (string, inherit).],
   [`trap`], [`{"op":"trap", "pattern":"regex", "frames":[...]}`], [No], [---], [Interrupt handler. Empty `frames` clears. Sets `_interrupt`/`_interrupt_source`.],
 )
 
@@ -2360,7 +2361,6 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   [`--init <f>`], [Write starter template and exit.],
   [`--each`], [One agent per positional file.],
   table.cell(colspan: 2, fill: luma(240), [_Modes_]),
-  [`--idle`], [Restore boot frame on frame exhaust (daemon).],
   [`--watchdog <ms>`], [Send `"tick"` (from `"watchdog"`) every N ms.],
   [`--max-cycles <N>`], [Cycle limit (default 50, 0 = unlimited).],
   [`--bash-timeout <ms>`], [Bash timeout (default 60000, 0 = none).],
@@ -2384,10 +2384,11 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
 - *Service call:* `send`, continuation frame, `${_msg}` next cycle.
 - *`@0` loop:* `frames: ["@0"]` re-executes. Beware replaying setup.
 - *Self-renewing loop:* send to `${_self}` or schedule a watchdog tick, then continue on the next wakeup.
+- *Lease renewal:* send to `keep_alive` in every turn that should survive.
 - *Binding-conditional FSM:* "if `${x}` is in bindings" branches.
 - *Named sections:* `@@step1`...`@@end`, transition via `["@step2"]`.
 - *Interactive:* `send` to `human_input`, `${_msg}` next cycle, `@0`.
-- *Idle daemon:* `--idle`, frames drain, boot restores, wait.
+- *Exhaustion handler:* renew, return `[]`, then trap `stack_exhausted` to rebuild work.
 #colbreak()
 
 === Pitfalls

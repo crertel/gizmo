@@ -8,7 +8,14 @@ defmodule Gizmo.RuntimeOptionsTest do
       chat_fn = fn _system, _messages, _opts ->
         :counters.add(cycle, 1, 1)
         {:ok,
-         %{ops: [{:send, "${_self}", %{"text" => "next"}}], frames: ["keep going"], notes: %{}}}
+         %{
+           ops: [
+             {:send, "keep_alive", %{"text" => "renew"}},
+             {:send, "${_self}", %{"text" => "next"}}
+           ],
+           frames: ["keep going"],
+           notes: %{}
+         }}
       end
 
       {:ok, _mb, pid} =
@@ -39,7 +46,14 @@ defmodule Gizmo.RuntimeOptionsTest do
           {:ok, %{ops: [], frames: [], notes: %{}}}
         else
           {:ok,
-           %{ops: [{:send, "${_self}", %{"text" => "next"}}], frames: ["keep going"], notes: %{}}}
+           %{
+             ops: [
+               {:send, "keep_alive", %{"text" => "renew"}},
+               {:send, "${_self}", %{"text" => "next"}}
+             ],
+             frames: ["keep going"],
+             notes: %{}
+           }}
         end
       end
 
@@ -61,8 +75,8 @@ defmodule Gizmo.RuntimeOptionsTest do
     end
   end
 
-  describe "quit_on_exhaust" do
-    test "default (quit_on_exhaust: true) terminates on empty frames" do
+  describe "keep_alive lifecycle" do
+    test "default turn without keep_alive terminates on empty frames" do
       cycle = :counters.new(1, [:atomics])
       test_mb = Gizmo.TestSupport.register_test_mailbox("qoe_test")
 
@@ -97,32 +111,53 @@ defmodule Gizmo.RuntimeOptionsTest do
       Gizmo.Mailbox.unregister(test_mb)
     end
 
-    test "idle mode (quit_on_exhaust: false) restores boot frame" do
+    test "renewed empty stack triggers stack_exhausted on next turn" do
+      test_mb = Gizmo.TestSupport.register_test_mailbox("stack_exhausted_test")
       cycle = :counters.new(1, [:atomics])
-      test_mb = Gizmo.TestSupport.register_test_mailbox("idle_test")
 
-      chat_fn = fn _system, _messages, _opts ->
-        c = :counters.add(cycle, 1, 1) || :counters.get(cycle, 1)
+      chat_fn = fn system, _messages, _opts ->
+        sys = Gizmo.TestSupport.flatten_system(system)
+        c = :counters.get(cycle, 1)
+        :counters.add(cycle, 1, 1)
 
-        {:ok,
-         %{
-           ops: [
-             {:send, test_mb, %{"text" => "cycle-#{c}"}},
-             {:send, "${_self}", %{"text" => "again"}}
-           ],
-           frames: [],
-           notes: %{}
-         }}
+        cond do
+          c == 0 ->
+            {:ok,
+             %{
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:trap, "^stack_exhausted$", ["stack exhausted handler"]}
+               ],
+               frames: [],
+               notes: %{}
+             }}
+
+          String.contains?(sys, "stack exhausted handler") ->
+            {:ok,
+             %{
+               ops: [{:send, test_mb, %{"text" => "${_msg}/${_msg_source}"}}],
+               frames: [],
+               notes: %{}
+             }}
+
+          true ->
+            {:ok, %{ops: [], frames: [], notes: %{}}}
+        end
       end
 
       {:ok, _mb, pid} =
-        Gizmo.Agent.start(["idle mode boot frame"],
-          chat_fn: chat_fn,
-          max_cycles: 3,
-          quit_on_exhaust: false
-        )
+        Gizmo.Agent.start(["renew-and-exhaust test"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
+
+      result =
+        receive do
+          {:mailbox_msg, ^test_mb, {_from, msg}} -> msg
+        after
+          5_000 -> :no_message
+        end
+
+      assert result == %{"text" => "stack_exhausted/runtime"}
 
       receive do
         {:DOWN, ^ref, :process, ^pid, _} -> :ok
@@ -130,7 +165,7 @@ defmodule Gizmo.RuntimeOptionsTest do
         5_000 -> :timeout
       end
 
-      assert :counters.get(cycle, 1) == 3
+      assert :counters.get(cycle, 1) == 2
       Gizmo.Mailbox.unregister(test_mb)
     end
   end

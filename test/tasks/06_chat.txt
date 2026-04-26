@@ -12,8 +12,11 @@ arrived as ${_msg}. Check it now:
   frames: []
   notes: {}
 - Otherwise: think of a helpful, conversational response to what the user
-  said. Then issue EXACTLY ONE op:
-  ops: [{"op":"send","mailbox":"human_input","msg":{"prompt":"gizmo-chat: <your response>\nyou> "}}]
+  said. Then issue EXACTLY TWO ops, in this order:
+  ops: [
+    {"op":"send","mailbox":"keep_alive","msg":{"text":"renew"}},
+    {"op":"send","mailbox":"human_input","msg":{"prompt":"gizmo-chat: <your response>\nyou> "}}
+  ]
   frames: ["@loop"]
   notes: {}
   Combine your response text and the "you> " prompt into a single send
@@ -22,6 +25,7 @@ arrived as ${_msg}. Check it now:
 
 This is setup (${_msg} is "init"). Your response MUST be:
 ops: [
+  {"op":"send","mailbox":"keep_alive","msg":{"text":"renew"}},
   {"op":"send","mailbox":"human_input","msg":{"prompt":"gizmo-chat: Hey! I'm gizmo-chat. Ask me anything, or type 'quit' to exit.\nyou> "}}
 ]
 frames: ["@loop"]

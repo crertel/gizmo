@@ -58,16 +58,6 @@ defmodule Gizmo.OpsTest do
       assert match?({:error, {:invalid_op, "spawn", _}}, Gizmo.LLM.normalize_eval(bad_spawn2))
     end
 
-    test "spawn with idle: true" do
-      spawn_idle = %{
-        "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c", "idle" => true}],
-        "frames" => []
-      }
-
-      {:ok, result} = Gizmo.LLM.normalize_eval(spawn_idle)
-      assert hd(result.ops) == {:spawn, ["f"], "c", %{idle: true}}
-    end
-
     test "spawn with no opts gives empty map" do
       spawn_no_opts = %{
         "ops" => [%{"op" => "spawn", "frames" => ["f"], "dest" => "c"}],

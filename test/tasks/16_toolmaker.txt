@@ -5,6 +5,7 @@ tools at runtime via the factory service.
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 Factory tool handlers are Elixir anonymous functions:
   fn msg, state -> {reply_map, new_state} end
@@ -18,9 +19,11 @@ Your ONLY task here is to route the message. Do NOT send to 'human'.
 
 If ${_msg_source} is "human_input":
   Send {"action": "read", "key": "chat_memory"} to 'blackboard'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["User: ${_msg}\n@got-memory"].
 
 Otherwise (stale confirmation from blackboard/factory/tool — silently ignore):
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@loop"].
 Do NOT send to 'human'. Do NOT send to 'human_input'.
 @@end
@@ -40,26 +43,31 @@ Determine intent and act:
    - Write the Elixir handler fn (see examples in boot frame)
    - Send {"action": "create", "name": "<name>", "code": "<fn>", "state": <init>} to 'factory'
    - Append this turn to memory, send {"action": "write", "key": "chat_memory", "value": "<updated>"} to 'blackboard'
+   - Send {"text": "renew"} to 'keep_alive'
    - Return frames: ["@wait-factory"].
 
 3. LIST TOOLS: user asks what tools exist.
    - Send {"action": "list"} to 'factory'
+   - Send {"text": "renew"} to 'keep_alive'
    - Return frames: ["@wait-factory"].
 
 4. DESTROY TOOL: user wants to remove a tool (e.g. "destroy counter").
    - Send {"action": "destroy", "name": "<name>"} to 'factory'
    - Append turn to memory, send {"action": "write", "key": "chat_memory", "value": "<updated>"} to 'blackboard'
+   - Send {"text": "renew"} to 'keep_alive'
    - Return frames: ["@wait-factory"].
 
 5. USE TOOL: user wants to invoke an existing tool (e.g. "increment the counter").
    - Send the appropriate action message to '<tool_name>'
    - Append turn to memory, send {"action": "write", "key": "chat_memory", "value": "<updated>"} to 'blackboard'
+   - Send {"text": "renew"} to 'keep_alive'
    - Return frames: ["@wait-tool"].
 
 6. CHAT: normal conversation.
    - Respond using memory for context. Send {"text": "<response>"} to 'human'.
    - Append turn to memory, send {"action": "write", "key": "chat_memory", "value": "<updated>"} to 'blackboard'
    - Send {"prompt": "you> "} to 'human_input'.
+   - Send {"text": "renew"} to 'keep_alive'
    - Return frames: ["@loop"].
 
 Memory format: "User: ...\nBot: ..." per turn. Keep concise; summarize if > 20 turns.
@@ -68,28 +76,31 @@ Memory format: "User: ...\nBot: ..." per turn. Keep concise; summarize if > 20 t
 @@wait-factory
 Waiting for factory response. ${_msg} from ${_msg_source}.
 
-If ${_msg_source} is "blackboard": stale confirmation — return frames: ["@0"].
+If ${_msg_source} is "blackboard": stale confirmation — send {"text": "renew"} to 'keep_alive' and return frames: ["@0"].
 
 If ${_msg_source} is "factory":
   Describe the result to the user. Send {"text": "<friendly summary of ${_msg}>"} to 'human'.
   Send {"prompt": "you> "} to 'human_input'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@loop"].
 
-Otherwise: return frames: ["@0"].
+Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@0"].
 @@end
 
 @@wait-tool
 Waiting for tool response. ${_msg} from ${_msg_source}.
 
-If ${_msg_source} is "blackboard": stale confirmation — return frames: ["@0"].
+If ${_msg_source} is "blackboard": stale confirmation — send {"text": "renew"} to 'keep_alive' and return frames: ["@0"].
 
 Otherwise (tool response):
   Describe the result. Send {"text": "<friendly summary of ${_msg}>"} to 'human'.
   Send {"prompt": "you> "} to 'human_input'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@loop"].
 @@end
 
 --- FIRST CYCLE ONLY (this section is NOT re-executed on later cycles) ---
 Send {"text": "Welcome! I'm a chatbot with memory and custom tools.\nChat with me, or ask me to create/use/list/destroy tools.\nSay 'quit' to exit."} to 'human'.
 Send {"prompt": "you> "} to 'human_input'.
+Send {"text": "renew"} to 'keep_alive'.
 Return frames: ["@loop"].

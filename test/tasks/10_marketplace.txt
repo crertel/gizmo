@@ -4,6 +4,7 @@ through the blackboard service directory.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@bank-program
 You are the bank. Operate in the normal message-driven model.
@@ -11,15 +12,18 @@ You are the bank. Operate in the normal message-driven model.
 If ${_msg} is "init":
   Register your mailbox by sending
   {"action": "write", "key": "bank_mb", "value": "${_self}"} to 'blackboard'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@bank-program"].
 
 If ${_msg} contains "balance_request":
   Parse ${_payload} as JSON, extract the "reply_to" field, and send
   {"text": "balance:42"} to that reply address.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@bank-program"].
 
 Otherwise:
   Ignore registration acknowledgements and unrelated messages.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@bank-program"].
 @@end
 
@@ -29,7 +33,8 @@ You are the store.
 If ${_msg} is "init":
   1. Send {"action": "write", "key": "store_mb", "value": "${_self}"} to 'blackboard'.
   2. Send {"text": "lookup_bank"} to ${_self}.
-  3. Return frames: ["@store-wait-bank"].
+  3. Send {"text": "renew"} to 'keep_alive'.
+  4. Return frames: ["@store-wait-bank"].
 
 Otherwise: return frames: ["@store-wait-bank"].
 @@end
@@ -39,15 +44,18 @@ You are looking for the bank. Message: ${_msg} from ${_msg_source}.
 
 If ${_msg_source} is ${_self} and ${_msg} is "lookup_bank":
   Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@store-wait-bank"].
 
 If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
   Send {"text": "balance_request", "reply_to": "${_self}"} to ${_msg}.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@store-wait-balance"].
 
 Otherwise:
   The bank is not registered yet, or this was just an acknowledgement.
   Send {"text": "lookup_bank"} to ${_self}.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@store-wait-bank"].
 @@end
 
@@ -56,9 +64,10 @@ Waiting for the bank reply. Message: ${_msg} from ${_msg_source}.
 
 If ${_msg} starts with "balance:":
   Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["Balance result: ${_msg}\n@store-wait-coordinator"].
 
-Otherwise: return frames: ["@store-wait-balance"].
+Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@store-wait-balance"].
 @@end
 
 @@store-wait-coordinator
@@ -72,6 +81,7 @@ If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
   Terminate with empty frames [].
 
 Otherwise: return frames: ["@0"].
+Also send {"text": "renew"} to 'keep_alive' whenever continuing to wait.
 @@end
 
 @@wait-result
@@ -84,12 +94,14 @@ If ${_msg} starts with "balance:":
 
 Otherwise:
   Ignore blackboard acknowledgements and unrelated messages.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@wait-result"].
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
 1. Send {"action": "write", "key": "coordinator_mb", "value": "${_self}"} to 'blackboard'.
 2. Send {"text": "Coordinator: spawning bank and store..."} to 'human'.
-3. Spawn a child with frames: ["@bank-program"], dest "bank_id", "disown": true, "idle": true.
-4. Spawn a child with frames: ["@store-program", "@store-wait-bank", "@store-wait-balance", "@store-wait-coordinator"], dest "store_id", "disown": true, "idle": true.
-5. Return frames: ["@wait-result"].
+3. Spawn a child with frames: ["@bank-program"], dest "bank_id", "disown": true.
+4. Spawn a child with frames: ["@store-program", "@store-wait-bank", "@store-wait-balance", "@store-wait-coordinator"], dest "store_id", "disown": true.
+5. Send {"text": "renew"} to 'keep_alive'.
+6. Return frames: ["@wait-result"].

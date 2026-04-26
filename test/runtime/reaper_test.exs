@@ -11,7 +11,12 @@ defmodule Gizmo.ReaperTest do
         sys = flatten_system(system)
 
         if String.contains?(sys, "reaper child frame") do
-          {:ok, %{ops: [], frames: ["reaper child frame"], notes: %{}}}
+          {:ok,
+           %{
+             ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+             frames: ["reaper child frame"],
+             notes: %{}
+           }}
         else
           c = :counters.get(parent_cycle, 1)
           :counters.add(parent_cycle, 1, 1)
@@ -20,10 +25,11 @@ defmodule Gizmo.ReaperTest do
             0 ->
               {:ok,
                %{
-                 ops: [
-                   {:spawn, ["reaper child frame"], "kid", %{}},
-                   {:send, "${_self}", %{"text" => "continue"}}
-                 ],
+                ops: [
+                  {:send, "keep_alive", %{"text" => "renew"}},
+                  {:spawn, ["reaper child frame"], "kid", %{}},
+                  {:send, "${_self}", %{"text" => "continue"}}
+                ],
                  frames: ["parent: send kill to reaper"],
                  notes: %{}
                }}
@@ -31,7 +37,10 @@ defmodule Gizmo.ReaperTest do
             1 ->
               {:ok,
                %{
-                 ops: [{:send, "reaper", %{"target" => "${kid}"}}],
+                 ops: [
+                   {:send, "keep_alive", %{"text" => "renew"}},
+                   {:send, "reaper", %{"target" => "${kid}"}}
+                 ],
                  frames: ["parent: forward death notification"],
                  notes: %{}
                }}
@@ -78,7 +87,12 @@ defmodule Gizmo.ReaperTest do
 
       # Start target agent — message-driven, so it idles waiting for messages
       target_chat_fn = fn _system, _messages, _opts ->
-        {:ok, %{ops: [], frames: ["deny target frame"], notes: %{}}}
+        {:ok,
+         %{
+           ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+           frames: ["deny target frame"],
+           notes: %{}
+         }}
       end
 
       {:ok, target_mb, target_pid} =
@@ -95,7 +109,10 @@ defmodule Gizmo.ReaperTest do
           0 ->
             {:ok,
              %{
-               ops: [{:send, "reaper", %{"target" => target_mb}}],
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:send, "reaper", %{"target" => target_mb}}
+               ],
                frames: ["attacker: done"],
                notes: %{}
              }}

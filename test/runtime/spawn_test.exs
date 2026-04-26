@@ -17,7 +17,12 @@ defmodule Gizmo.SpawnTest do
 
           case child_c do
             0 ->
-              {:ok, %{ops: [], frames: ["msg-child"], notes: %{}}}
+              {:ok,
+               %{
+                 ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+                 frames: ["msg-child"],
+                 notes: %{}
+               }}
 
             _ ->
               {:ok,
@@ -32,6 +37,7 @@ defmodule Gizmo.SpawnTest do
               {:ok,
                %{
                  ops: [
+                   {:send, "keep_alive", %{"text" => "renew"}},
                    {:spawn, ["msg-child"], "kid", %{}},
                    {:send, "${_self}", %{"text" => "continue"}}
                  ],
@@ -94,9 +100,7 @@ defmodule Gizmo.SpawnTest do
         end
       end
 
-      {:ok, mb, pid} = Gizmo.Agent.start(["parent: spawn child"], chat_fn: chat_fn)
-
-      Gizmo.Mailbox.route(mb, {"test", %{"text" => "start"}})
+      {:ok, _mb, pid} = Gizmo.Agent.start(["parent: spawn child"], chat_fn: chat_fn)
 
       ref = Process.monitor(pid)
 
@@ -109,6 +113,7 @@ defmodule Gizmo.SpawnTest do
 
       wait_for_exit_ref(ref, pid, 5_000)
       assert result["text"] == "worker child done"
+      refute Process.alive?(pid)
       Gizmo.Mailbox.unregister(test_mb)
     end
 
@@ -245,7 +250,12 @@ defmodule Gizmo.SpawnTest do
           end
 
         if String.contains?(sys, "collide-child") do
-          {:ok, %{ops: [], frames: ["collide-child"], notes: %{}}}
+          {:ok,
+           %{
+             ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+             frames: ["collide-child"],
+             notes: %{}
+           }}
         else
           c = :counters.get(parent_cycle, 1)
           :counters.add(parent_cycle, 1, 1)
@@ -254,10 +264,11 @@ defmodule Gizmo.SpawnTest do
             0 ->
               {:ok,
                %{
-                 ops: [
-                   {:spawn, ["collide-child"], "kid1", %{name: "unique_name"}},
-                   {:send, "${_self}", %{"text" => "continue"}}
-                 ],
+                ops: [
+                  {:send, "keep_alive", %{"text" => "renew"}},
+                  {:spawn, ["collide-child"], "kid1", %{name: "unique_name"}},
+                  {:send, "${_self}", %{"text" => "continue"}}
+                ],
                  frames: ["parent: spawn second"],
                  notes: %{}
                }}
@@ -265,10 +276,11 @@ defmodule Gizmo.SpawnTest do
             1 ->
               {:ok,
                %{
-                 ops: [
-                   {:send, "${_self}", %{"text" => "continue"}},
-                   {:spawn, ["collide-child"], "kid2", %{name: "unique_name"}}
-                 ],
+                ops: [
+                  {:send, "keep_alive", %{"text" => "renew"}},
+                  {:send, "${_self}", %{"text" => "continue"}},
+                  {:spawn, ["collide-child"], "kid2", %{name: "unique_name"}}
+                ],
                  frames: ["parent: check error"],
                  notes: %{}
                }}
@@ -424,6 +436,7 @@ defmodule Gizmo.SpawnTest do
             {:ok,
              %{
                ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
                  {:send, "blackboard",
                   %{"action" => "write", "key" => "server_mb", "value" => "${_self}"}}
                ],
@@ -432,7 +445,12 @@ defmodule Gizmo.SpawnTest do
              }}
 
           1 ->
-            {:ok, %{ops: [], frames: ["server: waiting"], notes: %{}}}
+            {:ok,
+             %{
+               ops: [{:send, "keep_alive", %{"text" => "renew"}}],
+               frames: ["server: waiting"],
+               notes: %{}
+             }}
 
           2 ->
             {:ok,
@@ -455,7 +473,10 @@ defmodule Gizmo.SpawnTest do
           0 ->
             {:ok,
              %{
-               ops: [{:send, "blackboard", %{"action" => "read", "key" => "server_mb"}}],
+               ops: [
+                 {:send, "keep_alive", %{"text" => "renew"}},
+                 {:send, "blackboard", %{"action" => "read", "key" => "server_mb"}}
+               ],
                frames: ["client: lookup"],
                notes: %{}
              }}

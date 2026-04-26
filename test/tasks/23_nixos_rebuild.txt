@@ -5,6 +5,7 @@ verify it works. You run in the normal message-driven model.
 MESSAGE-DRIVEN PATTERN: send one bash/editor/batch request, then return a
 continuation frame that handles the reply on the next cycle. Do not rely on
 implicit next-cycle bindings or loop-without-message behavior.
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 BASH TIMEOUT: The default bash timeout is 60 seconds. Long-running commands
 like nix-build take about 2 minutes. You MUST pass "timeout": 180000 in bash

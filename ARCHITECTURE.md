@@ -39,16 +39,17 @@ services.
 └─────────────────────────────┘
 ```
 
-By default, agents terminate when the context stack drains to `[]`. With
-`--idle`, the boot frame is restored instead and the agent waits for new
-messages.
+Agents are ephemeral by default. After every eval cycle, a gremlin dies unless
+that cycle sent a message to the `keep_alive` mailbox. If a renewed cycle
+returns `frames: []`, the runtime injects a synthetic `stack_exhausted`
+message at the front of the mailbox queue so traps can rebuild work.
 
 ## Ops
 
 | Op | JSON format | Behavior |
 |----|-------------|----------|
 | `send` | `{"op": "send", "mailbox": "...", "msg": {...}}` | Async message delivery to any mailbox. `msg` is always a JSON object. |
-| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create a child process. Store the child's mailbox ID in binding `dest`. Optional fields: `idle`, `disown`, `name`, `model`. |
+| `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create a child process. Store the child's mailbox ID in binding `dest`. Optional fields: `disown`, `name`, `model`. |
 | `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register an interrupt handler. On match, handler frames are prepended to the stack. Empty frames clear the trap. |
 
 Interpolation applies to op payloads and returned frames before ops execute.
@@ -62,6 +63,7 @@ mailbox endpoints, not special opcodes.
 |---------|---------|---------|
 | `blackboard` | `"blackboard"` | Key-value store. |
 | `bash` | `"bash"` | Shell command execution with optional timeout/mode. |
+| `keep_alive` | `"keep_alive"` | Per-turn lease renewal. Payload ignored. |
 | `human` | `"human"` | Terminal output. |
 | `human_input` | `"human_input"` | Terminal input. |
 | `exception` | `"exception"` | Error notification sink. |
@@ -94,15 +96,15 @@ Per-agent runtime state:
 6. Interpolate returned frames and op payloads
 7. Execute ops sequentially
 8. Replace context stack with returned frames
-9. If stack is empty:
-   - default: terminate
-   - with --idle: restore boot frame and wait again
-10. Repeat
+9. If the cycle did not send to `keep_alive`, terminate
+10. If the cycle did send to `keep_alive` and stack is empty:
+    - enqueue `{"text":"stack_exhausted","type":"stack_exhausted"}` at mailbox front
+11. Repeat
 ```
 
 The stack is self-reducing:
 
-- `frames: []` means the current work is done.
+- `frames: []` means the current stack is exhausted.
 - One returned frame is a continuation.
 - Multiple returned frames represent queued future work.
 
@@ -158,15 +160,16 @@ Gizmo now has one execution model only: message-driven wakeups.
   `watchdog`.
 - Autonomous continuation is explicit: self-send or watchdog scheduling.
 
-## Idle Mode
+## Lease Renewal
 
-`--idle` and `"idle": true` on `spawn` control only one thing: what happens
-when frames drain to `[]`.
+Long-lived workers are explicit rather than mode-driven.
 
-- Default: terminate.
-- Idle: restore the boot frame and wait for more messages.
-
-This is the runtime's long-lived worker/daemon mechanism.
+- If a cycle omits `keep_alive`, the gremlin dies after that turn.
+- If a cycle sends `keep_alive` and returns non-empty `frames`, it survives and
+  waits for a normal mailbox wakeup.
+- If a cycle sends `keep_alive` and returns `frames: []`, the runtime injects
+  `stack_exhausted` at the front of the mailbox queue so a trap can rebuild
+  work.
 
 ## Trap
 
@@ -195,7 +198,9 @@ Clear a trap by returning:
 - `gizmo --boot sys.txt task.txt` → `sys.txt` is boot frame, `task.txt` is stacked on top
 - `gizmo --each a.txt b.txt` → one independent agent per file
 
-With `--idle`, the boot frame is what gets restored on exhaust.
+The boot frame is just the initial stack and a convenient place to define named
+sections. Persistence is handled by `keep_alive`, not by restoring boot frames
+implicitly.
 
 ## Agent Naming
 

@@ -45,10 +45,10 @@ runtime itself.
 4. Interpolation runs before ops execute.
 5. Ops execute sequentially.
 6. Returned frames replace the current stack.
-7. If frames is []:
-   - default: terminate
-   - with --idle: restore the boot frame and wait for another message
-8. Otherwise, wait for the next mailbox wakeup and repeat.
+7. If the cycle did not send to `keep_alive`, the gremlin dies after the turn.
+8. If the cycle did send to `keep_alive` and returned `frames: []`, the runtime
+   injects a front-queued `stack_exhausted` message for the next wakeup.
+9. Otherwise, wait for the next mailbox wakeup and repeat.
 ```
 
 **Key timing rule:** interpolation happens before the current cycle's ops run.
@@ -194,17 +194,18 @@ Otherwise:
   Return frames: ["@wait-result"].
 @@end
 
-1. Spawn a child with frames: ["@bank"], dest "bank_id", "disown": true, "idle": true, "name": "bank".
+1. Spawn a child with frames: ["@bank"], dest "bank_id", "disown": true, "name": "bank".
 2. Return frames: ["@wait-result"].
 ```
 
-### Idle workers
+### Long-lived workers
 
-`idle` means: when frames drain to `[]`, restore the boot frame and wait for
-another message. This is the right pattern for long-lived children.
+Long-lived children must renew explicitly by sending to `keep_alive` every turn
+they want to survive. If a renewed turn returns `frames: []`, trap
+`stack_exhausted` and rebuild work there.
 
 ```json
-{"op": "spawn", "frames": ["@worker"], "dest": "child", "idle": true}
+{"op": "spawn", "frames": ["@worker"], "dest": "child"}
 ```
 
 ### Watchdog wakes
@@ -250,8 +251,8 @@ message flow.
  "disown": true}
 ```
 
-If the parent itself is idle and you want the child to terminate rather than
-idle, set `"idle": false` explicitly.
+If the child should be one-shot, simply omit any `keep_alive` send in its own
+turns.
 
 ### Batch recon
 
@@ -396,7 +397,6 @@ Create and destroy stateful custom services at runtime.
 | `--test` | Run built-in smoke tests |
 | `--init <file>` | Generate a starter boot frame |
 | `--max-cycles N` | Max eval cycles before terminating |
-| `--idle` | Restore the boot frame on exhaust instead of terminating |
 | `--boot <file>` | Separate boot frame file |
 | `--watchdog <ms>` | Schedule periodic watchdog ticks for the root agent |
 | `--log-timings` | Show timing data per cycle |
@@ -424,6 +424,6 @@ The prompt discipline is simple:
 - send requests now
 - use continuation frames
 - use `${_msg}` on the next cycle
-- use `idle` for long-lived workers
+- use `keep_alive` for long-lived workers
 - use `watchdog` for timed wakes
 - use `trap` for asynchronous interruptions
