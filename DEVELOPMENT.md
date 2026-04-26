@@ -198,7 +198,7 @@ mailbox ID to the reaper.
 - [x] Kill via `Process.exit(pid, :shutdown)` — triggers existing child death monitor
 - [x] Parent receives `child_died:` notification as usual (no special case)
 - [x] Tests: parent kills child, sibling rejected (smoke tests in `--test`)
-- [x] Test frame: `test/08_lucky_number.txt` — grind child rolls dice, parent reaps on 1
+- [x] Historical test frame removed later — grind child rolled dice, parent reaped on 1
 
 ## Stage 19: Remove `receive`, Remove Grind, Collapse to One Execution Model
 

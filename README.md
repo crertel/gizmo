@@ -120,10 +120,10 @@ positional file becomes a separate independent agent.
 
 ```bash
 # Run the hello-world test frame (one-shot, terminates cleanly)
-elixir gizmo.exs test/01_hello.txt
+elixir gizmo.exs test/tasks/01_hello.txt
 
 # Run the echo-bot loop in verbose mode
-elixir gizmo.exs -v test/05_loop.txt
+elixir gizmo.exs -v test/tasks/05_loop.txt
 
 # Multi-file stack with separate boot frame
 elixir gizmo.exs --boot sys.txt task.txt
@@ -146,28 +146,32 @@ elixir gizmo.exs --max-cycles 10 task.txt
 ```
 gizmo.exs              # The entire runtime (single-file script)
 flake.nix              # Nix dev shell
-test/                  # Example boot frames
-  01_hello.txt         # One-shot greeter
-  02_bash.txt          # Shell command execution
-  03_blackboard.txt    # Key-value store usage
-  04_fork.txt          # Process spawning
-  05_loop.txt          # Echo-bot loop
-  06_chat.txt          # Multi-turn chatbot
-  07_reaper.txt        # Reaper service (parent kills child)
-  08_lucky_number.txt  # Legacy grind/receive experiment (historical)
-  09_lucky_number_idle.txt # Lease-renewed child + exhaustion trap (dice game variant)
-  10_marketplace.txt   # Disowned peers + blackboard discovery (marketplace)
-  11a_named_spawn.txt  # Named child spawn (custom mailbox ID)
-  11b_each_hello.txt   # Per-file agent for --each mode
-  12_pager.txt         # Interactive file pager (factory + session pattern)
-  13_eval.txt          # Eval calculator (math assistant)
-  14_batch.txt         # Batch system profiler (parallel info gathering)
-  15_factory.txt       # Factory service demo (runtime counter)
-  16_toolmaker.txt     # Chatbot with memory and runtime tool creation
-  17_animal_research.txt # Single-agent Wikipedia animal research
-  18_animal_expedition.txt # Multi-child expedition with factory wiki tool
-  19_contemplative_agent.txt # 7-cycle lifecycle: create, explore, reflect, exit
-  20_curious_explorer.txt # Autonomous infinite explorer (VM, runs until killed)
+test/
+  runtime/             # ExUnit runtime and service tests
+  tasks/               # Example boot frames / integration-style prompt corpus
+    01_hello.txt       # One-shot greeter
+    02_bash.txt        # Shell command execution
+    03_blackboard.txt  # Key-value store usage
+    04_fork.txt        # Process spawning
+    05_loop.txt        # Echo-bot loop
+    06_chat.txt        # Multi-turn chatbot
+    07_reaper.txt      # Reaper service (parent kills child)
+    09_lucky_number_idle.txt # Lease-renewed child + exhaustion trap (dice game variant)
+    10_marketplace.txt # Disowned peers + blackboard discovery (marketplace)
+    11a_named_spawn.txt # Named child spawn (custom mailbox ID)
+    11b_each_hello.txt # Per-file agent for --each mode
+    12_pager.txt       # Interactive file pager (factory + session pattern)
+    13_eval.txt        # Eval calculator (math assistant)
+    14_batch.txt       # Batch system profiler (parallel info gathering)
+    15_factory.txt     # Factory service demo (runtime counter)
+    16_toolmaker.txt   # Chatbot with memory and runtime tool creation
+    17_animal_research.txt # Single-agent Wikipedia animal research
+    18_animal_expedition.txt # Multi-child expedition with factory wiki tool
+    19_contemplative_agent.txt # 7-cycle lifecycle: create, explore, reflect, exit
+    20_curious_explorer.txt # Autonomous infinite explorer (VM, runs until killed)
+    21_migration.txt   # Live migration walkthrough
+    22_webserver.txt   # Message-driven webserver workflow
+    23_nixos_rebuild.txt # NixOS rebuild orchestration
 ARCHITECTURE.md        # Runtime design and process model
 DEVELOPMENT.md         # Development stages and roadmap
 PROMPTING.md           # Guide for writing boot frames

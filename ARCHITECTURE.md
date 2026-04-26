@@ -145,7 +145,7 @@ continuation frame that handles `${_msg}` on the next cycle.
 - `${_msg}`: text summary of the message that woke this cycle
 - `${_payload}`: full JSON payload of that message
 - `${_msg_source}`: sender mailbox ID
-- `${_interrupt}` / `${_interrupt_source}`: trap match details
+- `${_interrupt}` / `${_interrupt_event}` / `${_interrupt_source}`: trap match details
 - `${_op_error}` / `${_pending_ops}`: op recovery metadata
 
 Spawn adds one more binding: the child mailbox ID is stored under the op's
@@ -227,12 +227,15 @@ Gizmo.Supervision
 ├── Registry
 ├── blackboard
 ├── bash
+├── keep_alive
+├── runtime
 ├── human
 ├── human_input
 ├── exception
 ├── reaper
 ├── watchdog
 ├── pager
+├── editor
 ├── batch
 ├── eval
 ├── factory supervisor + factory

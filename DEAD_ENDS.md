@@ -540,7 +540,7 @@ the combined text, then block on `IO.gets`. Output ordering is guaranteed.
 
 ## Same-Cycle Receive + Interpolation in Grind Mode
 
-**Discovered:** Stage 13 (test frame 08_lucky_number.txt)
+**Discovered:** Stage 13 (historical lucky-number grind test frame, since removed)
 
 A grind-mode child that sent to `bash`, issued `receive("result")`, and then
 used `${result}` in subsequent ops in the *same* cycle — expecting the receive
