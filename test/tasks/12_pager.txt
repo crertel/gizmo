@@ -9,7 +9,6 @@ This is the first cycle (${_msg} is "init").
 @@got-path
 The user's input arrived as ${_msg}. It is a file path.
 Send {"action": "open", "path": "${_msg}"} to 'pager'. Return frames: ["@opened"].
-Do NOT issue a receive op.
 @@end
 
 @@opened
@@ -26,7 +25,6 @@ If ${_msg} starts with "opened:":
   (Replace <SESSION_ID> with the actual session ID you extracted.)
 Otherwise: Send {"text": "Unexpected response: ${_msg}"} to 'human'.
   Terminate with empty frames [].
-Do NOT issue a receive op.
 @@end
 
 @@browse
@@ -48,7 +46,6 @@ If ${_msg_source} is "human_input":
   If ${_msg} starts with "search ":
     Extract the pattern. Send {"action": "search", "pattern": "<pattern>"} to the pager session ID.
   Return frames: ["@0"].
-  Do NOT issue a receive op.
 
 If ${_msg_source} is your pager session ID:
   The pager sent page content. Display it:
@@ -56,10 +53,8 @@ If ${_msg_source} is your pager session ID:
   Then prompt for the next command: send {"prompt": "Command (next/prev/goto N/search PATTERN/q):"}
   to 'human_input'.
   Return frames: ["@0"].
-  Do NOT issue a receive op.
 
 Otherwise: Return frames: ["@0"].
-Do NOT issue a receive op.
 @@end
 
 @@closing
@@ -68,7 +63,6 @@ If ${_msg} is "closed":
   Send {"text": "Session closed. Goodbye!"} to 'human'.
   Terminate with empty frames [].
 Otherwise: Return frames: ["@closing"].
-Do NOT issue a receive op.
 @@end
 
 Step 1:

@@ -11,96 +11,105 @@ Wikipedia REST API: GET https://en.wikipedia.org/api/rest_v1/page/summary/{title
   Returns JSON with "title", "description", "extract" (plain text summary).
 
 @@ocean-researcher
-You are Dr. Marina Kelp, marine biologist. You run in grind mode.
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
+You are Dr. Marina Kelp, marine biologist.
 
-Check your current bindings to determine what to do:
+If ${_msg} is "init":
+  1. Send {"text": "Dr. Marina Kelp here! Submersible descending into the abyss... sonar pinging, bioluminescence everywhere..."} to 'human'.
+  2. Pick 2 fascinating deep-sea animals (for example giant isopod, vampire squid, barreleye fish, dumbo octopus, goblin shark, yeti crab).
+  3. Send {"text": "Researching: <animal1> and <animal2>"} to 'human'.
+  4. Send to 'batch':
+     {"requests": [
+       {"mailbox": "wiki", "msg": {"animal": "<animal1_wikipedia_title>"}},
+       {"mailbox": "wiki", "msg": {"animal": "<animal2_wikipedia_title>"}}
+     ], "timeout": 60000}
+  5. Return frames: ["Animals: <animal1>, <animal2>\n@ocean-report"].
 
-If ${batch_result} is in your bindings:
-  The batch results are ready. Parse ${batch_result_payload} as JSON. It has
-  a "results" array. Each entry has a "response" object with a "text" field
-  containing a Wikipedia extract.
-  Read the extracts and write a vivid, enthusiastic field report (3-4
-  sentences per animal) highlighting the most surprising facts and your
+Otherwise: return frames: ["@ocean-report"].
+@@end
+
+@@ocean-report
+The chosen animals are recorded at the top of this frame. Message: ${_msg} from ${_msg_source}.
+The full batch response is in ${_payload}.
+
+If ${_msg_source} is "batch":
+  Parse ${_payload} as JSON. It has a "results" array. Each entry has a
+  "response" object with a "text" field containing a Wikipedia extract.
+  Read the extracts and write a vivid, enthusiastic field report with 3-4
+  sentences per animal, highlighting the most surprising facts and your
   personal observations as a marine biologist.
   Send {"text": "<your complete field report>"} to ${_parent}.
   Send {"text": "Dr. Marina Kelp signing off from the deep!"} to 'human'.
   Terminate with empty frames [].
 
-Otherwise (first cycle, no ${batch_result} yet):
-  1. Send {"text": "Dr. Marina Kelp here! Submersible descending into the abyss... sonar pinging, bioluminescence everywhere..."} to 'human'.
-  2. Pick 2 fascinating deep-sea animals (e.g. giant isopod, vampire squid,
-     barreleye fish, dumbo octopus, goblin shark, yeti crab).
+Otherwise: return frames: ["@0"].
+@@end
+
+@@forest-researcher
+You are Dr. Canopy Verde, tropical ecologist.
+
+If ${_msg} is "init":
+  1. Send {"text": "Dr. Canopy Verde here! Ascending into the cloud forest canopy... the biodiversity is staggering..."} to 'human'.
+  2. Pick 2 fascinating rainforest animals (for example glass frog, okapi, aye-aye, quetzal, harpy eagle, poison dart frog).
   3. Send {"text": "Researching: <animal1> and <animal2>"} to 'human'.
-  4. Send a batch request to 'batch':
+  4. Send to 'batch':
      {"requests": [
        {"mailbox": "wiki", "msg": {"animal": "<animal1_wikipedia_title>"}},
        {"mailbox": "wiki", "msg": {"animal": "<animal2_wikipedia_title>"}}
      ], "timeout": 60000}
-  5. Issue receive("batch_result").
-  6. Return frames: ["@0"].
+  5. Return frames: ["Animals: <animal1>, <animal2>\n@forest-report"].
+
+Otherwise: return frames: ["@forest-report"].
 @@end
 
-@@forest-researcher
-You are Dr. Canopy Verde, tropical ecologist. You run in grind mode.
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
+@@forest-report
+The chosen animals are recorded at the top of this frame. Message: ${_msg} from ${_msg_source}.
+The full batch response is in ${_payload}.
 
-Check your current bindings to determine what to do:
-
-If ${batch_result} is in your bindings:
-  The batch results are ready. Parse ${batch_result_payload} as JSON. It has
-  a "results" array. Each entry has a "response" object with a "text" field
-  containing a Wikipedia extract.
-  Read the extracts and write a vivid, enthusiastic field report (3-4
-  sentences per animal) highlighting the most surprising facts and your
+If ${_msg_source} is "batch":
+  Parse ${_payload} as JSON. It has a "results" array. Each entry has a
+  "response" object with a "text" field containing a Wikipedia extract.
+  Read the extracts and write a vivid, enthusiastic field report with 3-4
+  sentences per animal, highlighting the most surprising facts and your
   personal observations as a tropical ecologist.
   Send {"text": "<your complete field report>"} to ${_parent}.
   Send {"text": "Dr. Canopy Verde signing off from the canopy!"} to 'human'.
   Terminate with empty frames [].
 
-Otherwise (first cycle, no ${batch_result} yet):
-  1. Send {"text": "Dr. Canopy Verde here! Ascending into the cloud forest canopy... the biodiversity is staggering..."} to 'human'.
-  2. Pick 2 fascinating rainforest animals (e.g. glass frog, okapi, aye-aye,
-     quetzal, harpy eagle, poison dart frog).
+Otherwise: return frames: ["@0"].
+@@end
+
+@@arctic-researcher
+You are Dr. Frost Bjornsen, polar biologist.
+
+If ${_msg} is "init":
+  1. Send {"text": "Dr. Frost Bjornsen here! Traversing the Arctic sea ice... wind chill is brutal but the wildlife is magnificent..."} to 'human'.
+  2. Pick 2 fascinating arctic animals (for example narwhal, arctic fox, snowy owl, beluga whale, wolverine, musk ox).
   3. Send {"text": "Researching: <animal1> and <animal2>"} to 'human'.
-  4. Send a batch request to 'batch':
+  4. Send to 'batch':
      {"requests": [
        {"mailbox": "wiki", "msg": {"animal": "<animal1_wikipedia_title>"}},
        {"mailbox": "wiki", "msg": {"animal": "<animal2_wikipedia_title>"}}
      ], "timeout": 60000}
-  5. Issue receive("batch_result").
-  6. Return frames: ["@0"].
+  5. Return frames: ["Animals: <animal1>, <animal2>\n@arctic-report"].
+
+Otherwise: return frames: ["@arctic-report"].
 @@end
 
-@@arctic-researcher
-You are Dr. Frost Bjornsen, polar biologist. You run in grind mode.
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
+@@arctic-report
+The chosen animals are recorded at the top of this frame. Message: ${_msg} from ${_msg_source}.
+The full batch response is in ${_payload}.
 
-Check your current bindings to determine what to do:
-
-If ${batch_result} is in your bindings:
-  The batch results are ready. Parse ${batch_result_payload} as JSON. It has
-  a "results" array. Each entry has a "response" object with a "text" field
-  containing a Wikipedia extract.
-  Read the extracts and write a vivid, enthusiastic field report (3-4
-  sentences per animal) highlighting the most surprising facts and your
+If ${_msg_source} is "batch":
+  Parse ${_payload} as JSON. It has a "results" array. Each entry has a
+  "response" object with a "text" field containing a Wikipedia extract.
+  Read the extracts and write a vivid, enthusiastic field report with 3-4
+  sentences per animal, highlighting the most surprising facts and your
   personal observations as a polar biologist.
   Send {"text": "<your complete field report>"} to ${_parent}.
   Send {"text": "Dr. Frost Bjornsen signing off from the Arctic!"} to 'human'.
   Terminate with empty frames [].
 
-Otherwise (first cycle, no ${batch_result} yet):
-  1. Send {"text": "Dr. Frost Bjornsen here! Traversing the Arctic sea ice... wind chill is brutal but the wildlife is magnificent..."} to 'human'.
-  2. Pick 2 fascinating arctic animals (e.g. narwhal, arctic fox, snowy owl,
-     beluga whale, wolverine, musk ox).
-  3. Send {"text": "Researching: <animal1> and <animal2>"} to 'human'.
-  4. Send a batch request to 'batch':
-     {"requests": [
-       {"mailbox": "wiki", "msg": {"animal": "<animal1_wikipedia_title>"}},
-       {"mailbox": "wiki", "msg": {"animal": "<animal2_wikipedia_title>"}}
-     ], "timeout": 60000}
-  5. Issue receive("batch_result").
-  6. Return frames: ["@0"].
+Otherwise: return frames: ["@0"].
 @@end
 
 @@deploy
@@ -114,67 +123,57 @@ If ${_msg} starts with "error:":
   Send a corrected create request to 'factory' with name "wiki".
   Return frames: ["@deploy", "@collect-1", "@journal", "@credits"].
 
-Otherwise (tool created successfully):
-  Deploy the expedition team:
+Otherwise:
   1. Send {"text": "Splendid! Our wiki research tool is operational. Now then, let us dispatch our intrepid researchers to the far corners of the natural world..."} to 'human'.
-  2. Spawn a child with frames: ["@ocean-researcher"], dest "ocean_kid", "grind": true.
-  3. Spawn a child with frames: ["@forest-researcher"], dest "forest_kid", "grind": true.
-  4. Spawn a child with frames: ["@arctic-researcher"], dest "arctic_kid", "grind": true.
+  2. Spawn a child with frames: ["@ocean-researcher", "@ocean-report"], dest "ocean_kid", "idle": true.
+  3. Spawn a child with frames: ["@forest-researcher", "@forest-report"], dest "forest_kid", "idle": true.
+  4. Spawn a child with frames: ["@arctic-researcher", "@arctic-report"], dest "arctic_kid", "idle": true.
   5. Return frames: ["@collect-1", "@journal", "@credits"].
-Do NOT issue a receive op.
 @@end
 
 @@collect-1
 The first field report has arrived!
 ${_msg} from ${_msg_source}.
 
-Do ALL of these:
 1. React with dramatic Attenborough-style narration about the findings.
    Reference specific animals and facts from ${_msg}.
-   Send {"text": "<your dramatic narration>"} to 'human'.
-2. Return frames: ["@collect-2", "@journal", "@credits"].
-Do NOT issue a receive op.
+2. Send {"text": "<your dramatic narration>"} to 'human'.
+3. Return frames: ["@collect-2", "@journal", "@credits"].
 @@end
 
 @@collect-2
 The second field report has arrived!
 ${_msg} from ${_msg_source}.
 
-Do ALL of these:
 1. React with dramatic Attenborough-style narration about the findings.
    Reference specific animals and facts from ${_msg}.
-   Send {"text": "<your dramatic narration>"} to 'human'.
-2. Return frames: ["@collect-3", "@journal", "@credits"].
-Do NOT issue a receive op.
+2. Send {"text": "<your dramatic narration>"} to 'human'.
+3. Return frames: ["@collect-3", "@journal", "@credits"].
 @@end
 
 @@collect-3
 The third and final field report has arrived!
 ${_msg} from ${_msg_source}.
 
-Do ALL of these:
 1. React with dramatic Attenborough-style narration about the findings.
    Reference specific animals and facts from ${_msg}.
-   Send {"text": "<your dramatic narration>"} to 'human'.
-2. Send {"text": "All three reports are in. Magnificent!"} to 'human'.
-3. Send {"text": "continue"} to '${_self}'.
-4. Return frames: ["@journal", "@credits"].
-Do NOT issue a receive op.
+2. Send {"text": "<your dramatic narration>"} to 'human'.
+3. Send {"text": "All three reports are in. Magnificent!"} to 'human'.
+4. Send {"text": "continue"} to '${_self}'.
+5. Return frames: ["@journal", "@credits"].
 @@end
 
 @@journal
 All three field reports are in. The self-message arrived: ${_msg}.
 
-Do ALL of these:
 1. Compile a beautifully formatted expedition journal. You narrated each
-   researcher's findings as they arrived — now weave all three expeditions
+   researcher's findings as they arrived. Now weave all three expeditions
    (Deep Ocean, Rainforest, Arctic) into a cohesive narrative about the
    wonders of biodiversity. Reference the animals your researchers studied
    and add your own Attenborough-style reflections.
 2. Send {"text": "<the complete expedition journal>"} to 'human'.
 3. Destroy the wiki tool: send {"action": "destroy", "name": "wiki"} to 'factory'.
 4. Return frames: ["@credits"].
-Do NOT issue a receive op.
 @@end
 
 @@credits
@@ -182,7 +181,6 @@ The factory confirmed cleanup: ${_msg} from ${_msg_source}.
 
 Send {"text": "And so concludes our extraordinary expedition across the natural world. From the crushing depths of the abyss, through the emerald cathedral of the rainforest, to the frozen frontier of the Arctic — nature never ceases to amaze. Until next time... this is Sir David Attenborough, wishing you wonder."} to 'human'.
 Terminate with empty frames [].
-Do NOT issue a receive op.
 @@end
 
 Step 1 (first cycle only):
@@ -195,4 +193,3 @@ Step 1 (first cycle only):
    `fn` needs its own `end` keyword when writing single-line Elixir.
 3. Send the create request to 'factory' with name "wiki" and your handler code.
 4. Return frames: ["@deploy", "@collect-1", "@journal", "@credits"].
-Do NOT issue a receive op.

@@ -8,23 +8,20 @@ This is the first cycle (${_msg} is "init").
 The write acknowledgement arrived as ${_msg}. Now write the key "author"
 with value "gizmo-agent" by sending {"action": "write", "key": "author", "value": "gizmo-agent"}
 to 'blackboard'. Return frames: ["@step3"]
-Do NOT issue a receive op.
 @@end
 
 @@step3
 The second write acknowledgement arrived as ${_msg}. Now read back the
 "greeting" key by sending {"action": "read", "key": "greeting"} to 'blackboard'.
 Return frames: ["@step4"]
-Do NOT issue a receive op.
 @@end
 
 @@step4
 The blackboard value arrived as ${_msg}. Send {"text": "Blackboard says: ${_msg}"}
 to 'human', then terminate with an empty frames array [].
-Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
 by sending {"action": "write", "key": "greeting", "value": "Hello from the blackboard!"}
 to 'blackboard'. Return frames: ["@step2"]
-Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.
+The acknowledgement arrives as ${_msg} next cycle.

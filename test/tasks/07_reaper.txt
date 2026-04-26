@@ -21,24 +21,21 @@ A message arrived as ${_msg} from ${_msg_source}. Check it now:
 - If ${_msg} starts with "child_died:": the worker was already killed.
   Go to @report.
 Otherwise, return frames: ["@wait-for-ack"] to keep waiting.
-Do NOT issue a receive op.
 @@end
 
 @@wait-for-death
 The reaper was asked to kill the worker. A message arrived as ${_msg}.
 - If ${_msg} starts with "child_died:": the worker is dead. Go to @report.
 - Otherwise: keep waiting. Return frames: ["@wait-for-death"].
-Do NOT issue a receive op.
 @@end
 
 @@report
 The worker was killed by the reaper. Send {"text": "Supervisor: worker timed out,
 killed via reaper. Death notice: ${_msg}"} to 'human'. Then terminate with
 an empty frames array [].
-Do NOT issue a receive op.
 @@end
 
 Step 1:
 1. Send {"text": "Supervisor: spawning slow worker..."} to 'human'.
-2. Spawn a child with frames: ["@worker"], dest "child", "grind": true, "idle": true.
+2. Spawn a child with frames: ["@worker"], dest "child", "idle": true.
 3. Return frames: ["@wait-for-ack"]

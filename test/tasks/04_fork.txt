@@ -10,7 +10,7 @@ You are a child worker process. Messages arrive between cycles as ${_msg}.
 This is your first cycle (${_msg} is "init"). Send {"command": "date +%s"}
 to 'bash'. Return a continuation frame that says: "The bash output arrived
 as ${_msg}. Send {"text": "timestamp: ${_msg}"} to ${_parent} and return
-empty frames []. Do NOT issue a receive op."
+empty frames []."
 Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
@@ -18,7 +18,6 @@ Do NOT send to ${_parent} yet — you need the bash result first.
 The child sent its result, which arrived as ${_msg}. Send {"text": "Supervisor:
 child reported: ${_msg}"} to 'human', then terminate with an empty frames
 array [].
-Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1:

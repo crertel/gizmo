@@ -15,7 +15,6 @@ Otherwise:
   Send {"text": "Counter service created. Commands: inc, get, quit"} to 'human'.
   Send {"prompt": "counter> "} to 'human_input'.
   Return frames: ["@loop"].
-Do NOT issue a receive op.
 @@end
 
 @@loop
@@ -41,7 +40,6 @@ If ${_msg_source} is "my_counter":
 
 Otherwise:
   Return frames: ["@0"].
-Do NOT issue a receive op.
 @@end
 
 @@got-reply
@@ -52,14 +50,12 @@ Parse ${_payload} as JSON. If it has a "count" field, display it.
 Send {"text": "Counter: ${_msg}"} to 'human'.
 Send {"prompt": "counter> "} to 'human_input'.
 Return frames: ["@loop"].
-Do NOT issue a receive op.
 @@end
 
 @@destroyed
 The factory replied as ${_msg} from ${_msg_source}.
 Send {"text": "Counter destroyed. Goodbye!"} to 'human'.
 Terminate with empty frames [].
-Do NOT issue a receive op.
 @@end
 
 Step 1:

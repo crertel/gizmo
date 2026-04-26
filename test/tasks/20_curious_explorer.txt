@@ -42,7 +42,6 @@ Send a batch of 8 reconnaissance commands to get your bearings:
   ]}
 
 Return frames: ["@orient"].
-Do NOT issue a receive op.
 @@end
 
 @@orient
@@ -68,7 +67,6 @@ Tell the human what tool you're building and why.
 
 Send the create request to 'factory' with name, code, and initial state.
 Return frames: ["@deploy"].
-Do NOT issue a receive op.
 @@end
 
 @@deploy
@@ -91,7 +89,6 @@ Send a batch that combines your new tool with bash commands to explore:
   ]}
 
 Return frames: ["@explore"].
-Do NOT issue a receive op.
 @@end
 
 @@explore
@@ -126,5 +123,4 @@ You must ALWAYS send at least one request (to batch, bash, factory, or a tool).
 You NEVER terminate. You NEVER return empty frames. If you run out of ideas
 in one area, pivot to something completely different — there is always more to
 discover in a running system.
-Do NOT issue a receive op.
 @@end

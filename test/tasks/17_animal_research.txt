@@ -36,7 +36,6 @@ Pick 5 animals you find fascinating — choose unusual or lesser-known ones.
 Send {"text": "<announce which animals you picked>"} to 'human'.
 Send the batch request to 'batch' with timeout 60000.
 Return frames: ["@got-results"].
-Do NOT issue a receive op.
 @@end
 
 @@got-results
@@ -57,14 +56,12 @@ facts in a readable way.
 Send {"text": "<the formatted output>"} to 'human'.
 Then clean up: send {"action": "destroy", "name": "<your tool name>"} to 'factory'.
 Return frames: ["@cleanup"].
-Do NOT issue a receive op.
 @@end
 
 @@cleanup
 The factory replied as ${_msg} from ${_msg_source}.
 Send {"text": "Research complete! Tool cleaned up."} to 'human'.
 Terminate with empty frames [].
-Do NOT issue a receive op.
 @@end
 
 Step 1 (first cycle only):
@@ -74,4 +71,3 @@ Step 1 (first cycle only):
    The tool is just a data fetcher — YOU will do the analysis later.
 3. Send the create request to 'factory' with your handler code.
 4. Return frames: ["@tool-created"].
-Do NOT issue a receive op.

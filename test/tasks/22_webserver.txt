@@ -13,8 +13,9 @@ Read this during recon to see what's already done. Append milestones as you
 complete them (e.g., "HTTP_DONE", "MAIL_DONE"). If the agent restarts after
 a nixos-rebuild, the checkpoint tells you what to skip.
 
-SPAWNING CHILDREN: Use grind: true, idle: false. The "idle: false" is CRITICAL
-— without it, children loop forever instead of terminating on empty frames.
+SPAWNING CHILDREN: Use the normal message-driven model. Child workers should
+do one bounded step per wake, send a request, then return continuation frames
+that handle the reply on the next cycle.
 
 TIPS FOR CHILDREN (include in their boot frame):
 - Persistent services: use systemd units, nixos-rebuild, or background
@@ -31,7 +32,7 @@ The @@sections below are definitions. On your first cycle (when ${_msg} is
 
 @@http-worker
 Set up a web server on port 8080 serving a system status page. You run as
-root in grind mode inside a NixOS VM.
+root in a NixOS VM.
 
 USE NIXOS CONFIGURATION. Edit /etc/nixos/configuration.nix to enable nginx
 and create a status page. Then run nixos-rebuild switch. Example additions:
@@ -46,14 +47,10 @@ Write an HTML status page to /var/www/index.html with system info (hostname,
 kernel, uptime, disk, memory, network). nixos-rebuild will start nginx
 automatically.
 
-GRIND PATTERN: You loop with frames: ["@0"]. Each cycle, check your bindings
-to see what's already done. Send bash/batch commands AND a receive op to
-capture the result into a binding. The result appears in your bindings on
-the NEXT cycle.
-
-IMPORTANT: Every cycle that sends to bash/batch MUST also issue a receive op.
-Without receive, you never see the result and loop forever. Always return
-frames: ["@0"] until you're done.
+MESSAGE-DRIVEN PATTERN: Each wake should do one step, send any needed
+bash/batch/editor request, and return continuation frames that examine
+the reply on the next cycle. Keep going until the service is configured
+and verified.
 
 When verified (curl localhost:8080 shows the status page):
   1. Send {"text": "PASS: web server on port 8080"} to 'human'.
@@ -65,7 +62,7 @@ On failure, send error details to 'human' and retry. Don't give up.
 
 @@mail-worker
 Set up an SMTP server on port 25 that accepts and stores incoming email.
-You run as root in grind mode inside a NixOS VM.
+You run as root in a NixOS VM.
 
 The host sends mail via:
   curl smtp://localhost:2525 --mail-from user@host --mail-rcpt root@gizmo-vm -T - <<< "Subject: hello"
@@ -82,14 +79,10 @@ Then run nixos-rebuild switch. Example additions:
 nixos-rebuild will start postfix automatically. Mail goes to /var/mail/ or
 /var/spool/mail/ depending on configuration.
 
-GRIND PATTERN: You loop with frames: ["@0"]. Each cycle, check your bindings
-to see what's already done. Send bash/batch commands AND a receive op to
-capture the result into a binding. The result appears in your bindings on
-the NEXT cycle.
-
-IMPORTANT: Every cycle that sends to bash/batch MUST also issue a receive op.
-Without receive, you never see the result and loop forever. Always return
-frames: ["@0"] until you're done.
+MESSAGE-DRIVEN PATTERN: Each wake should do one step, send any needed
+bash/batch/editor request, and return continuation frames that examine
+the reply on the next cycle. Keep going until postfix is configured
+and verified.
 
 When verified (test email found in mail storage):
   1. Send {"text": "PASS: mail server on port 25"} to 'human'.
@@ -116,7 +109,7 @@ STEP: Boot.
      {"mailbox": "bash", "msg": {"command": "cat /tmp/shared/progress.txt 2>/dev/null || echo NONE"}}
    ]}
 3. Return frames: ["@dispatch"].
-Do NOT issue a receive op. Do NOT spawn children.
+Do not spawn children here.
 @@end
 
 @@dispatch
@@ -130,10 +123,9 @@ sequentially — start HTTP first, then mail after HTTP succeeds.
 
 - Need HTTP? Spawn worker, return ["@child-report", "@child-report", "@monitor"].
 - HTTP done, need mail? Spawn worker, return ["@child-report", "@monitor"].
-- Both done? Start watchdog ({"interval": 10000} to 'watchdog'),
+- Both done? Start watchdog ({"action": "every", "ms": 10000} to 'watchdog'),
   return ["@monitor"].
-
-Do NOT send to 'bash'. Do NOT issue a receive op.
+Do not send to 'bash' from this frame.
 @@end
 
 @@child-report
@@ -141,16 +133,16 @@ STEP: Child reported. ${_msg} from ${_msg_source}.
 
 If ${_msg} contains "HTTP_OK": Phase 1 complete.
   Tell the human the web server is live (curl localhost:8080/status.html).
-  Spawn a mail worker child (grind: true, idle: false) for Phase 2.
+  Spawn a mail worker child for Phase 2 using continuation frames.
 
 If ${_msg} contains "MAIL_OK": Phase 2 complete.
   Tell the human the mail server is live and show the curl SMTP command.
-  Start watchdog: send {"interval": 10000} to 'watchdog'.
+  Start watchdog: send {"action": "every", "ms": 10000} to 'watchdog'.
 
 Otherwise: unexpected message. Tell the human what arrived. Put @child-report
   back at the front of your frame stack to catch the real report.
 
-Do NOT send to 'bash'. Do NOT issue a receive op.
+Do not send to 'bash' from this frame.
 @@end
 
 @@monitor
@@ -163,5 +155,5 @@ Daemon mode. Handle by source:
   update the status page. Return ["@monitor"].
 Other: ignore. Return ["@monitor"]. No ops.
 
-Do NOT issue a receive op. Do NOT spawn anything.
+Do not spawn anything from this frame.
 @@end

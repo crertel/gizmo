@@ -16,7 +16,6 @@ If ${_msg_source} is "human_input":
   Otherwise:
     Send {"code": "${_msg}"} to 'eval'.
     Return frames: ["@got-result"].
-  Do NOT issue a receive op.
 
 If ${_msg_source} is "eval":
   This shouldn't happen in this state. Ignore it.
@@ -24,7 +23,6 @@ If ${_msg_source} is "eval":
 
 Otherwise:
   Return frames: ["@0"].
-Do NOT issue a receive op.
 @@end
 
 @@got-result
@@ -40,7 +38,6 @@ Else:
 Then prompt for another expression:
   Send {"prompt": "eval> "} to 'human_input'.
   Return frames: ["@loop"].
-Do NOT issue a receive op.
 @@end
 
 Step 1:

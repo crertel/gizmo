@@ -1,91 +1,95 @@
 You are a marketplace coordinator. You spawn two independent peer agents
-— a bank and a store — using "disown": true. They discover each other
-and you through the blackboard service directory.
+using "disown": true: a bank and a store. They discover each other and you
+through the blackboard service directory.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 
 @@bank-program
-You are the bank. You run in grind mode (cycle continuously).
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
+You are the bank. Operate in the normal message-driven model.
 
-Check your current bindings to determine what to do:
+If ${_msg} is "init":
+  Register your mailbox by sending
+  {"action": "write", "key": "bank_mb", "value": "${_self}"} to 'blackboard'.
+  Return frames: ["@bank-program"].
 
-If ${req} is in your bindings:
-  ${req} is the text summary of the message. ${req_payload} is the full JSON.
-  If ${req} contains "balance_request":
-    Parse ${req_payload} to extract the "reply_to" field.
-    Send {"text": "balance:42"} to that reply address.
-    Terminate with empty frames [].
-  Otherwise: Issue receive("req"). Return frames: ["@0"].
+If ${_msg} contains "balance_request":
+  Parse ${_payload} as JSON, extract the "reply_to" field, and send
+  {"text": "balance:42"} to that reply address.
+  Return frames: ["@bank-program"].
 
-If ${ack} is in your bindings but ${req} is NOT:
-  You registered. Now block for a request.
-  Issue receive("req").
-  Return frames: ["@0"].
-
-Otherwise (first cycle, no ${ack} yet):
-  Register: send {"action": "write", "key": "bank_mb", "value": "${_self}"} to 'blackboard'.
-  Issue receive("ack").
-  Return frames: ["@0"].
+Otherwise:
+  Ignore registration acknowledgements and unrelated messages.
+  Return frames: ["@bank-program"].
 @@end
 
 @@store-program
-You are the store. You run in grind mode (cycle continuously).
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
+You are the store.
 
-Check your current bindings to determine what to do:
+If ${_msg} is "init":
+  1. Send {"action": "write", "key": "store_mb", "value": "${_self}"} to 'blackboard'.
+  2. Send {"text": "lookup_bank"} to ${_self}.
+  3. Return frames: ["@store-wait-bank"].
 
-If ${coord} is in your bindings:
-  Deliver the result.
-  Send {"action": "write", "key": "marketplace_result", "value": "${bal}"} to 'blackboard'.
-  Send {"text": "${bal}"} to ${coord}.
+Otherwise: return frames: ["@store-wait-bank"].
+@@end
+
+@@store-wait-bank
+You are looking for the bank. Message: ${_msg} from ${_msg_source}.
+
+If ${_msg_source} is ${_self} and ${_msg} is "lookup_bank":
+  Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
+  Return frames: ["@store-wait-bank"].
+
+If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
+  Send {"text": "balance_request", "reply_to": "${_self}"} to ${_msg}.
+  Return frames: ["@store-wait-balance"].
+
+Otherwise:
+  The bank is not registered yet, or this was just an acknowledgement.
+  Send {"text": "lookup_bank"} to ${_self}.
+  Return frames: ["@store-wait-bank"].
+@@end
+
+@@store-wait-balance
+Waiting for the bank reply. Message: ${_msg} from ${_msg_source}.
+
+If ${_msg} starts with "balance:":
+  Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
+  Return frames: ["Balance result: ${_msg}\n@store-wait-coordinator"].
+
+Otherwise: return frames: ["@store-wait-balance"].
+@@end
+
+@@store-wait-coordinator
+The balance result is stored at the top of this frame as "Balance result:".
+Message: ${_msg} from ${_msg_source}.
+
+If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
+  Read the stored balance result from this frame.
+  Send {"action": "write", "key": "marketplace_result", "value": "<that balance text>"} to 'blackboard'.
+  Send {"text": "<that balance text>"} to ${_msg}.
   Terminate with empty frames [].
 
-If ${bal} is in your bindings but ${coord} is NOT:
-  You got the bank's reply. Look up the coordinator.
-  Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
-  Issue receive("coord").
-  Return frames: ["@0"].
-
-If ${bank} is in your bindings but ${bal} is NOT:
-  You have the bank's address. Send it a request.
-  If ${bank} starts with "agent_":
-    Send {"text": "balance_request", "reply_to": "${_self}"} to ${bank}.
-    Issue receive("bal").
-    Return frames: ["@0"].
-  Otherwise (bank not registered yet, retry):
-    Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
-    Issue receive("bank").
-    Return frames: ["@0"].
-
-If ${reg} is in your bindings but ${bank} is NOT:
-  You registered. Now look up the bank.
-  Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
-  Issue receive("bank").
-  Return frames: ["@0"].
-
-Otherwise (first cycle, no ${reg} yet):
-  Register: send {"action": "write", "key": "store_mb", "value": "${_self}"} to 'blackboard'.
-  Issue receive("reg").
-  Return frames: ["@0"].
+Otherwise: return frames: ["@0"].
 @@end
 
 @@wait-result
 You are the coordinator. You already spawned the bank and store.
 A message arrived as ${_msg} from ${_msg_source}.
-Do NOT spawn any agents. Do NOT send to blackboard.
+
 If ${_msg} starts with "balance:":
   Send {"text": "Marketplace result: ${_msg}"} to 'human'.
   Terminate with empty frames [].
+
 Otherwise:
-  Ignore this message. Return frames: ["@wait-result"].
-  Do NOT issue any ops.
+  Ignore blackboard acknowledgements and unrelated messages.
+  Return frames: ["@wait-result"].
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
 1. Send {"action": "write", "key": "coordinator_mb", "value": "${_self}"} to 'blackboard'.
 2. Send {"text": "Coordinator: spawning bank and store..."} to 'human'.
-3. Spawn a child with frames: ["@bank-program"], dest "bank_id", "grind": true, "disown": true.
-4. Spawn a child with frames: ["@store-program"], dest "store_id", "grind": true, "disown": true.
+3. Spawn a child with frames: ["@bank-program"], dest "bank_id", "disown": true, "idle": true.
+4. Spawn a child with frames: ["@store-program", "@store-wait-bank", "@store-wait-balance", "@store-wait-coordinator"], dest "store_id", "disown": true, "idle": true.
 5. Return frames: ["@wait-result"].

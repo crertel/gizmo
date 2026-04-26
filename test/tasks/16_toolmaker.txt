@@ -22,7 +22,7 @@ If ${_msg_source} is "human_input":
 
 Otherwise (stale confirmation from blackboard/factory/tool — silently ignore):
   Return frames: ["@loop"].
-Do NOT issue a receive op. Do NOT send to 'human'. Do NOT send to 'human_input'.
+Do NOT send to 'human'. Do NOT send to 'human_input'.
 @@end
 
 @@got-memory
@@ -63,7 +63,6 @@ Determine intent and act:
    - Return frames: ["@loop"].
 
 Memory format: "User: ...\nBot: ..." per turn. Keep concise; summarize if > 20 turns.
-Do NOT issue a receive op.
 @@end
 
 @@wait-factory
@@ -77,7 +76,6 @@ If ${_msg_source} is "factory":
   Return frames: ["@loop"].
 
 Otherwise: return frames: ["@0"].
-Do NOT issue a receive op.
 @@end
 
 @@wait-tool
@@ -89,7 +87,6 @@ Otherwise (tool response):
   Describe the result. Send {"text": "<friendly summary of ${_msg}>"} to 'human'.
   Send {"prompt": "you> "} to 'human_input'.
   Return frames: ["@loop"].
-Do NOT issue a receive op.
 @@end
 
 --- FIRST CYCLE ONLY (this section is NOT re-executed on later cycles) ---

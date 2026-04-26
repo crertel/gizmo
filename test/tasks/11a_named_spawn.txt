@@ -10,5 +10,5 @@ Send {"text": "hello from ${_self}"} to 'human', then terminate with empty frame
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
 1. Send {"text": "Spawning named worker..."} to 'human'.
-2. Spawn a child with frames: ["@worker"], dest "kid", "grind": true, "name": "myworker".
+2. Spawn a child with frames: ["@worker"], dest "kid", "name": "myworker".
 3. Return frames: []. Terminate immediately after spawning.

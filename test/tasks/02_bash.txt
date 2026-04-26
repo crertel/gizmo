@@ -8,11 +8,10 @@ This is the first cycle (${_msg} is "init").
 The output of 'uname -a' arrived as ${_msg}.
 Send {"text": "System info: ${_msg}"} to 'human'.
 Then terminate with an empty frames array [].
-Do NOT issue a receive op.
 @@end
 
 1. Send {"command": "uname -a"} to the 'bash' mailbox.
 2. Return frames: ["@step2"] to continue to the next step.
 
-Do NOT issue a receive op — the bash output arrives automatically as ${_msg}
-on the next cycle. Do NOT try to send the result to 'human' in this cycle.
+The bash output arrives automatically as ${_msg} on the next cycle.
+Do NOT try to send the result to 'human' in this cycle.

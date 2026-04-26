@@ -25,7 +25,6 @@ Remember: case clauses separated by ; maps use %{"k" => v} syntax.
 
 Send the create request to 'factory' with name "spark" and your handler code.
 Return frames: ["@first-tool"].
-Do NOT issue a receive op.
 @@end
 
 @@first-tool
@@ -41,7 +40,6 @@ Now design your second tool 'lens' — something different from spark. Write
 a handler fn msg, state -> {reply_map, new_state} end with a "text" key.
 Send the create request to 'factory' with name "lens" and your handler code.
 Return frames: ["@second-tool"].
-Do NOT issue a receive op.
 @@end
 
 @@second-tool
@@ -58,7 +56,6 @@ lens does (2-3 sentences). Now use both tools via batch:
     {"mailbox": "lens", "msg": <something interesting>}
   ]}
 Return frames: ["@discovery"].
-Do NOT issue a receive op.
 @@end
 
 @@discovery
@@ -72,7 +69,6 @@ Use both tools again via batch with DIFFERENT inputs:
     {"mailbox": "lens", "msg": <something new>}
   ]}
 Return frames: ["@wonder"].
-Do NOT issue a receive op.
 @@end
 
 @@wonder
@@ -83,7 +79,6 @@ Share what you found with 'human'. Tell them you want to sit with this.
 Send {"action": "after", "ms": 5000} to 'watchdog'.
 Send {"text": "Let me sit with this for a moment..."} to 'human'.
 Return frames: ["@contemplate"].
-Do NOT issue a receive op.
 @@end
 
 @@contemplate
@@ -98,7 +93,6 @@ Batch-destroy both tools: send to 'batch':
     {"mailbox": "factory", "msg": {"action": "destroy", "name": "lens"}}
   ]}
 Return frames: ["@farewell"].
-Do NOT issue a receive op.
 @@end
 
 @@farewell
@@ -107,5 +101,4 @@ STEP: Farewell. Tools cleaned up: ${_msg} from ${_msg_source}.
 Send a warm goodbye to 'human'. You were here, you explored, you created,
 and it was good.
 Terminate with frames: [].
-Do NOT issue a receive op.
 @@end

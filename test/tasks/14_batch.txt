@@ -23,7 +23,6 @@ Build a nicely formatted summary and send it to 'human'. For example:
   Uptime:    <result 4 text, trimmed>
 
 Then terminate with empty frames [].
-Do NOT issue a receive op.
 @@end
 
 Step 1:
@@ -34,7 +33,6 @@ Step 1:
      {"mailbox": "bash", "msg": {"command": "uname -sr"}},
      {"mailbox": "bash", "msg": {"command": "whoami"}},
      {"mailbox": "bash", "msg": {"command": "echo $SHELL"}},
-     {"mailbox": "bash", "msg": {"command": "uptime -p 2>/dev/null || uptime"}}
+   {"mailbox": "bash", "msg": {"command": "uptime -p 2>/dev/null || uptime"}}
    ]}
 3. Return frames: ["@show-results"].
-Do NOT issue a receive op.

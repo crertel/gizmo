@@ -119,8 +119,8 @@
   #block(width: 80%, inset: 1em, stroke: 0.5pt + luma(180), radius: 4pt)[
     #set text(size: 10pt)
     Gizmo is a minimal runtime for LLM agents modeled on process calculus and the BEAM.
-    An agent is a process with a context stack, a mailbox, and four ops:
-    `send`, `receive`, `spawn`, `trap`.
+    An agent is a process with a context stack, a mailbox, and three ops:
+    `send`, `spawn`, `trap`.
     Everything else --- tool use, memory, multi-agent coordination, human interaction ---
     is built on top as mailbox-backed services.
   ]
@@ -146,13 +146,13 @@ Gizmo is built on a small number of core principles:
 
 + *Eval is the loop, not an operation.* The runtime calls the LLM in a loop. The LLM is the rewrite rule; the context stack is the string being rewritten. There is no "think" or "plan" step---every LLM call is an eval cycle that produces ops to execute and frames to continue with.
 
-+ *Four ops only.* `send`, `receive`, `spawn`, `trap`. There are no special-cased tool calling, memory, or orchestration primitives. Every capability is built on top of message passing.
++ *Three ops only.* `send`, `spawn`, `trap`. There are no special-cased tool calling, memory, or orchestration primitives. Every capability is built on top of message passing.
 
 + *Everything is a mailbox.* A shell, a key-value store, a human, another agent---all are addressed the same way. An agent sends a message to a mailbox ID and doesn't know or care what's behind it.
 
 + *The context stack is the prompt.* Frames (strings) are concatenated bottom-up and sent to the LLM as the system prompt. The boot frame is always the first frame, enabling prompt caching. The LLM returns replacement frames each cycle, so the context stack is self-modifying.
 
-+ *Interpolation before ops.* Bindings like `${name}` in the ops and frames returned by the LLM are resolved _before_ ops execute. This means a `receive` in cycle N produces a binding that is available for interpolation in cycle N+1, not in cycle N's own ops.
++ *Interpolation before ops.* Bindings like `${name}` in the ops and frames returned by the LLM are resolved _before_ ops execute. If an op schedules future work or causes a service to reply, the resulting message is observed on the _next_ wakeup as `${_msg}`, not in the current cycle's own ops.
 
 These ideas combine to produce a system where the LLM is the program counter: it reads the current context (frames), decides what to do (ops), and rewrites its own future instructions (replacement frames).
 
@@ -161,14 +161,11 @@ These ideas combine to produce a system where the LLM is the program counter: it
 graph TD
   A{First cycle?}
   A -- Yes --> B[\"Bind _msg=init<br/>_msg_source=runtime\"]
-  A -- No --> C{Grind mode?}
-  C -- Yes --> D[Skip wait]
-  C -- No --> E[Block for message]
+  A -- No --> E[Block for message]
   E --> F{Trap match?}
   F -- Yes --> G[Prepend handler frames]
   F -- No --> H[Continue]
   B --> H
-  D --> H
   G --> H
   H[Build prompt from stack] --> I[Call LLM]
   I --> J[Interpolate response]
@@ -196,7 +193,7 @@ This is by design. The runtime is a research tool for exploring what LLM agents 
 
 - *Do not run untrusted boot frames.* A boot frame is arbitrary instructions to an LLM with shell access.
 - *Do not expose Gizmo to the internet.* There is no authentication, no rate limiting, no input sanitization.
-- *Monitor your API spend.* A grind-mode agent with `--max-cycles 0` will call the LLM as fast as it can, forever.
+- *Monitor your API spend.* An agent that self-messages aggressively or schedules dense watchdog ticks can still burn through cycles quickly.
 - *Read the boot frame before running it.* Understand what the agent will do before you let it do it.
 
 Future work on pledge-for-address and pledge-for-content (@future-pledges) may eventually constrain agent capabilities, but today, agents have full access to everything the runtime provides.
@@ -375,9 +372,8 @@ Each agent process carries the following state through its eval loop:
   [`context_stack`], [List of frame strings. Concatenated bottom-up as the system prompt.],
   [`mailbox_id`], [This agent's address for receiving messages (e.g., `"agent_1"`).],
   [`parent_id`], [The spawning agent's mailbox ID, or `nil` for root/disowned agents.],
-  [`bindings`], [Map of named values from `receive`, `spawn`, and the runtime (`_self`, `_parent`, `_msg`, `_msg_source`).],
+  [`bindings`], [Map of named values from `spawn` and the runtime (`_self`, `_parent`, `_msg`, `_msg_source`, `_payload`).],
   [`trap`], [A `{regex, handler_frames}` tuple, or `nil`. Single-slot interrupt handler.],
-  [`grind`], [Boolean. If `true`, hot-loops without waiting for messages between cycles.],
   [`idle`], [Boolean. If `true`, restores boot frame (instead of terminating) when frames drain to `[]`.],
   [`messages_queue`], [A per-agent `MessagesQueue` GenServer. Currently unused in the runtime path (retained for test assertions).],
 )
@@ -390,28 +386,32 @@ The *runtime bindings* are always available:
 - `${_msg_source}` --- the sender's mailbox ID. `"runtime"` on cycle 0.
 - `${_payload}` --- full JSON of the wake message. `"{}"` on cycle 0.
 
-=== Grind and Idle: The Two Axes
+=== Message-Driven Wakeups and Idle Restore
 
-The `grind` and `idle` flags control two orthogonal aspects of agent behavior. *Grind* controls _cycle pacing_: does the agent wait for a message between cycles (message-driven, the default) or hot-loop continuously? *Idle* controls _frame-exhaust behavior_: does the agent terminate when frames drain to `[]` (the default) or restore the boot frame and wait for more work?
+Current Gizmo has a single pacing model: *message-driven wakeups*. Every cycle
+after cycle 0 begins by blocking for a mailbox message. The message that woke
+the cycle is bound as `${_msg}`, `${_msg_source}`, and `${_payload}`.
+
+`idle` controls only frame-exhaust behavior:
 
 #table(
-  columns: (auto, 1fr, 1fr),
-  align: (left, left, left),
+  columns: (auto, 1fr),
+  align: (left, left),
   stroke: 0.5pt + luma(200),
   inset: 6pt,
   table.header(
-    [], [*Terminate on exhaust* (default)], [*Idle on exhaust* (`--idle`)],
+    [*Mode*], [*Behavior*],
   ),
-  [*Message-driven* (default)], [One-shot / request-response. Agent wakes on message, does work, terminates when frames drain to `[]`.], [Daemon. Agent wakes on message, does work, idles back to boot frame to wait for more.],
-  [*Grind* (`--grind`)], [Worker loop. Agent hot-loops with explicit `receive` ops, terminates when frames drain to `[]`.], [Hot-loop daemon. Agent hot-loops, restores boot frame on exhaust. Bindings reset. Rare.],
+  [Default], [Agent wakes on a message, does work, and terminates when frames drain to `[]`.],
+  [`idle: true` / `--idle`], [Agent wakes on a message, does work, then restores the boot frame instead of terminating when frames drain to `[]`. Bindings reset to `{_self, _parent}` plus fresh wake bindings.],
 )
 
-Key invariants across the grid:
+Key invariants:
 
-- *`_msg` binding:* Updated from the mailbox each cycle in message-driven mode. Stays `"init"` in grind mode (only the first cycle gets the wake message).
-- *Bindings:* Accumulate across cycles from `receive`/`spawn`. On idle restore, bindings reset to `{_self, _parent}` only.
-- *Trap:* Fires between cycles in message-driven mode only. Grind mode has no inter-cycle message check, so traps do not fire.
-- *Performance:* Grind skips the inter-cycle mailbox wait, yielding ~2x faster cycle throughput.
+- *`_msg` binding:* Updated from the mailbox on every cycle after cycle 0.
+- *Bindings from `spawn`:* Persist until the stack drains. On idle restore, only identity bindings and the new wake message remain.
+- *Trap:* Fires between cycles, before prompt construction, when the wake message matches the regex.
+- *Autonomous continuation:* If an agent needs to wake itself later, it must schedule a watchdog tick or send a message to `${_self}`.
 
 == In-Depth on Interpolation
 
@@ -472,21 +472,20 @@ The key timing: interpolation of the entire LLM response (ops _and_ frames) happ
 {
   "ops": [
     {"op": "send", "mailbox": "bash", "msg": {"command": "echo hello"}},
-    {"op": "receive", "dest": "result"},
-    {"op": "send", "mailbox": "human", "msg": {"text": "Got: ${result}"}}
+    {"op": "send", "mailbox": "human", "msg": {"text": "Got: ${_msg}"}}
   ]
 }
 ```
 
-In the third op, `${result}` is interpolated _before_ the `receive` in the second op runs. The binding `result` doesn't exist yet (or holds a stale value from a previous cycle). This is the most common source of confusion.
+In the second op, `${_msg}` still refers to the message that woke _this_ cycle, not the future bash response. This is the most common source of confusion.
 
 #admonition(title: "Rule of thumb")[
-  If you need data from a `receive` or from a service response, you cannot use it in the same cycle's ops. Return a continuation frame and use the data in the next cycle, where it will be available as a binding.
+  If you need data from a service response, you cannot use it in the same cycle's ops. Return a continuation frame and use the data on the next cycle, where it will arrive as `${_msg}`.
 ]
 
 == In-Depth on Opcodes
 
-Gizmo has exactly four opcodes. Every agent capability is built from these primitives.
+Gizmo has exactly three opcodes. Every agent capability is built from these primitives.
 
 === `send` --- Fire-and-Forget Message Delivery
 
@@ -498,22 +497,6 @@ Delivers `msg` to the mailbox identified by `mailbox`. Non-blocking---the sender
 
 The `msg` field must be a JSON object. It is interpolated (recursively, including nested values) before delivery, so `${_self}` in the message becomes the sender's mailbox ID.
 
-=== `receive` --- Blocking Message Wait
-
-```json
-{"op": "receive", "dest": "<binding_name>"}
-```
-
-Blocks the agent process until a message arrives in its mailbox. Two bindings are created: `${dest}` holds the text summary (the `"text"` field of the JSON message, or the full JSON if no `"text"` key), and `${dest_payload}` holds the full JSON encoding. This mirrors `_msg` / `_payload`.
-
-The binding is available for interpolation starting in the _next_ cycle (because interpolation runs before ops execute).
-
-#admonition(title: "Important")[
-  In default message-driven mode, you usually _don't_ need `receive`. Messages arrive automatically as `${_msg}` between cycles. The `receive` op is primarily for *grind-mode* agents that need to explicitly block mid-cycle.
-
-  Using `receive` in message-driven mode consumes the message from the queue, causing the inter-cycle message wait to block forever. The agent hangs. See @pitfalls.
-]
-
 === `spawn` --- Create a Child Process
 
 ```json
@@ -521,7 +504,6 @@ The binding is available for interpolation starting in the _next_ cycle (because
   "op": "spawn",
   "frames": ["<child frame 1>", ...],
   "dest": "<binding_name>",
-  "grind": true,
   "idle": true,
   "disown": true,
   "name": "worker",
@@ -551,7 +533,6 @@ Optional fields:
   table.header(
     [*Field*], [*Effect*],
   ),
-  [`grind`], [Child runs in hot-loop mode (no inter-cycle message wait).],
   [`idle`], [Child restores boot frame on empty frames instead of terminating.],
   [`disown`], [No `${_parent}` binding, no death monitor. Fully independent peer.],
   [`name`], [Custom mailbox ID instead of auto-generated `agent_N`. Must be unique.],
@@ -1071,7 +1052,7 @@ Send {"text": "System info: ${_msg}"} to 'human', then terminate with [].
 - `${_msg}` in cycle 1 was `"init"`; in cycle 2 it was the bash output. The binding updates between cycles.
 - The `@step2` reference was resolved during interpolation in cycle 1. The `${_msg}` _inside_ the section stayed literal (quoted verbatim).
 - In cycle 2, `${_msg}` in the ops was resolved because it was a top-level reference (not inside injected section text).
-- No `receive` op was needed---in message-driven mode, responses arrive as `${_msg}`.
+- No extra blocking step was needed---in message-driven mode, responses arrive as `${_msg}`.
 
 The context stack's evolution:
 
@@ -1140,58 +1121,48 @@ graph TD
 
 *Caveat:* If the frame contains one-time setup instructions, `@0` replays those too. Separate setup from loop body using named sections.
 
-=== The Two-Cycle Roll (Grind + Receive)
+=== Self-Renewing Service Loops
 
-This pattern uses the *grind + terminate* combination from the 2#sym.times;2 grid above. For grind-mode agents that call a service and use the result:
+If an agent needs to keep working without external input, it must schedule its
+next wakeup explicitly. There are two common patterns:
+
+- *Self-message:* send a message to `${_self}` before returning.
+- *Watchdog tick:* ask the `"watchdog"` service to deliver a future `"tick"`.
 
 #diagram-box[
   #set text(size: 9pt, font: "DejaVu Sans Mono")
   ```
-  Cycle N (no ${roll} yet):     Cycle N+1 (${roll} = "3"):
-  ┌───────────────────────┐     ┌───────────────────────┐
-  │ 1. (skip — no roll)   │     │ 1. Report: "rolled:3" │
-  │ 2. send(bash, "shuf") │     │ 2. send(bash, "shuf") │
-  │ 3. receive("roll")    │     │ 3. receive("roll")    │
-  │    → blocks, gets "3" │     │    → blocks, gets "5" │
-  │ 4. return ["@0"]      │     │ 4. return ["@0"]      │
-  └───────────────────────┘     └───────────────────────┘
-
-  Key: receive in cycle N binds ${roll}.
-       ${roll} in cycle N+1 resolves to "3" BEFORE ops run.
-       The new receive overwrites ${roll} with "5" for cycle N+2.
+  Cycle N (_msg = "tick"):         Cycle N+1 (_msg = bash result):
+  ┌─────────────────────────┐      ┌─────────────────────────────┐
+  │ 1. send(bash, "shuf")   │      │ 1. report "rolled:${_msg}"  │
+  │ 2. return ["@wait-roll"]│      │ 2. send(self, {"text":"roll"}) │
+  └─────────────────────────┘      │ 3. return ["@wait-command"] │
+                                   └─────────────────────────────┘
   ```
 ]
 
-The agent always reports the _previous_ result and starts the _next_ one in the same cycle.
+The important difference from the removed grind/`receive` pattern is that the
+agent never blocks mid-cycle. It always waits by ending the cycle and waking
+later on a real mailbox message.
 
-=== Binding-Conditional State Machines
+=== Message-Conditional State Machines
 
-For agents that need multi-phase behavior in a single frame (especially spawned children that can't inherit parent sections):
+For agents that need multi-phase behavior in a single section, branch on the
+current wake reason and explicit state markers:
 
 ```
-Check your bindings to determine what to do:
+If ${_msg_source} is "bash":
+  Do phase 2 work. Send {"text": "continue"} to ${_self}. Return ["@phase-3"].
 
-If ${phase3_data} is in your bindings:
-  Do phase 3 stuff. Terminate.
+If ${_msg} is "continue":
+  Do phase 3 work. Terminate.
 
-If ${phase2_data} is in your bindings but NOT ${phase3_data}:
-  Do phase 2 stuff. receive("phase3_data"). Return ["@0"].
-
-Otherwise (first cycle):
-  Do phase 1 stuff. receive("phase2_data"). Return ["@0"].
+Otherwise:
+  Start phase 1. Send request to 'bash'. Return ["@phase-2"].
 ```
 
-Check most-advanced-phase first. Bindings accumulate across grind-mode cycles, so the agent progresses by acquiring new bindings via `receive`.
-
-#figure(
-  mermaid("
-graph TD
-  A[Phase 1: bindings _self] -->|receive| B[Phase 2: + phase2_data]
-  B -->|receive| C[Phase 3: + phase3_data]
-  C --> D[Terminate]
-"),
-  caption: [Binding-conditional state machine: each `receive` advances the phase],
-)
+The state progression comes from returned frames plus real wake messages, not
+from acquiring hidden mid-cycle bindings.
 
 == Idioms <idioms>
 
@@ -1276,7 +1247,7 @@ Each peer writes its address to the blackboard and reads others' addresses to co
     [*Flag*], [*Shows*],
   ),
   [`-v`], [Lifecycle events, cycle headers, frames summary],
-  [`-vv`], [+ ops per cycle (send, receive, spawn, trap)],
+  [`-vv`], [+ ops per cycle (send, spawn, trap)],
   [`-vvv`], [+ bindings, full frame content],
   [`--log-timings`], [LLM call time, cycle time, wall-clock time, cache stats],
   [`--log-full-prompts`], [Full system prompt and user message each cycle],
@@ -1348,17 +1319,20 @@ Runs built-in unit tests for interpolation, response parsing, op validation, and
 
 If your frame says "greet the user, then loop," `@0` re-greets every cycle. Use a `@@loop` section.
 
-=== Pitfall 4: `receive` in message-driven mode
+=== Pitfall 4: Using `${_msg}` for work you just triggered
 
-The `receive` op consumes the message. Then the inter-cycle wait blocks forever---nothing left to read. Agent hangs.
+If you send to `bash` and then use `${_msg}` later in the same cycle, `${_msg}`
+still refers to the message that woke the cycle, not the future bash result.
 
-Don't use `receive` in message-driven mode. Responses arrive as `${_msg}`.
+Return a continuation frame and handle the bash result on the next wakeup.
 
-=== Pitfall 5: Same-cycle receive + interpolation
+=== Pitfall 5: Autonomous loops with no wakeup source
 
-`${roll}` in `send("human", {"text": "You rolled ${roll}"})` resolves _before_ `receive("roll")` executes. The binding is stale or unresolved.
+`frames: ["@0"]` does not create progress by itself. After the cycle ends, the
+agent sleeps until some message wakes it.
 
-Use the two-cycle roll pattern.
+If you want a self-renewing loop, schedule the next wakeup explicitly with
+`send("${_self}", ...)` or the watchdog service.
 
 === Pitfall 6: Child referencing parent sections
 
@@ -1537,14 +1511,13 @@ This is the first cycle (${_msg} is "init").
 The output of 'uname -a' arrived as ${_msg}.
 Send {"text": "System info: ${_msg}"} to 'human'.
 Then terminate with an empty frames array [].
-Do NOT issue a receive op.
 @@end
 
 1. Send {"command": "uname -a"} to the 'bash' mailbox.
 2. Return frames: ["@step2"] to continue to the next step.
 
-Do NOT issue a receive op — the bash output arrives automatically as ${_msg}
-on the next cycle. Do NOT try to send the result to 'human' in this cycle.
+The bash output arrives automatically as ${_msg} on the next cycle. Do not try
+to send the result to 'human' in this cycle.
 ```
 
 === What to Learn
@@ -1557,11 +1530,11 @@ The canonical service-call pattern:
 Also demonstrates:
 - Named sections (`@@step2 ... @@end`) for organizing multi-step logic.
 - `@step2` as a frame reference that resolves to the section content.
-- Explicit "do NOT" instructions to prevent the LLM from making common mistakes (issuing `receive`, using `${_msg}` prematurely).
+- Explicit continuation framing to prevent common timing mistakes with `${_msg}`.
 
 === Questions for Reflection
 
-+ Why does the boot frame explicitly say "Do NOT issue a receive op" twice? What would happen if the LLM did issue one?
++ Why is it useful to say positively that the bash result arrives as `${_msg}` on the next cycle?
 + On cycle 2, the system prompt contains both the boot frame text (with `@@step2` visible) _and_ the resolved step2 frame. Does this confuse the LLM? Why or why not?
 + What happens if `bash` takes 30 seconds to respond? Does the agent spin, or does it sleep?
 
@@ -1586,26 +1559,23 @@ This is the first cycle (${_msg} is "init").
 The write acknowledgement arrived as ${_msg}. Now write the key "author"
 with value "gizmo-agent" by sending {"action": "write", "key": "author", "value": "gizmo-agent"}
 to 'blackboard'. Return frames: ["@step3"]
-Do NOT issue a receive op.
 @@end
 
 @@step3
 The second write acknowledgement arrived as ${_msg}. Now read back the
 "greeting" key by sending {"action": "read", "key": "greeting"} to 'blackboard'.
 Return frames: ["@step4"]
-Do NOT issue a receive op.
 @@end
 
 @@step4
 The blackboard value arrived as ${_msg}. Send {"text": "Blackboard says: ${_msg}"}
 to 'human', then terminate with an empty frames array [].
-Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1: Write the key "greeting" with value "Hello from the blackboard!"
 by sending {"action": "write", "key": "greeting", "value": "Hello from the blackboard!"}
 to 'blackboard'. Return frames: ["@step2"]
-Do NOT issue a receive op — the acknowledgement arrives as ${_msg} next cycle.
+The acknowledgement arrives as ${_msg} next cycle.
 ```
 
 === What to Learn
@@ -1644,7 +1614,7 @@ You are a child worker process. Messages arrive between cycles as ${_msg}.
 This is your first cycle (${_msg} is "init"). Send {"command": "date +%s"}
 to 'bash'. Return a continuation frame that says: "The bash output arrived
 as ${_msg}. Send {"text": "timestamp: ${_msg}"} to ${_parent} and return
-empty frames []. Do NOT issue a receive op."
+empty frames []."
 Do NOT send to ${_parent} yet — you need the bash result first.
 @@end
 
@@ -1652,7 +1622,6 @@ Do NOT send to ${_parent} yet — you need the bash result first.
 The child sent its result, which arrived as ${_msg}. Send {"text": "Supervisor:
 child reported: ${_msg}"} to 'human', then terminate with an empty frames
 array [].
-Do NOT issue a receive op — just send and terminate.
 @@end
 
 Step 1:
@@ -1693,7 +1662,7 @@ You are an echo-bot. This is the first cycle (setup).
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
-Do NOT issue receive ops — input arrives automatically as ${_msg}.
+Input arrives automatically as ${_msg}.
 
 @@loop
 You are an echo-bot in the main loop. The user's most recent message
@@ -1709,7 +1678,6 @@ arrived as ${_msg}. Check it now:
   ]
   frames: ["@loop"]
   notes: {}
-  Do NOT issue a receive op.
 @@end
 
 This is setup (${_msg} is "init"). Your response MUST be exactly:
@@ -1719,7 +1687,6 @@ ops: [
 ]
 frames: ["@loop"]
 notes: {}
-Do NOT issue a receive op.
 ```
 
 === What to Learn
@@ -1751,7 +1718,7 @@ You are a friendly chatbot called "gizmo-chat". This is the first cycle (setup).
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
-Do NOT issue receive ops — input arrives automatically as ${_msg}.
+Input arrives automatically as ${_msg}.
 
 @@loop
 You are gizmo-chat, a friendly conversational chatbot. The user's input
@@ -1823,27 +1790,24 @@ A message arrived as ${_msg} from ${_msg_source}. Check it now:
 - If ${_msg} starts with "child_died:": the worker was already killed.
   Go to @report.
 Otherwise, return frames: ["@wait-for-ack"] to keep waiting.
-Do NOT issue a receive op.
 @@end
 
 @@wait-for-death
 The reaper was asked to kill the worker. A message arrived as ${_msg}.
 - If ${_msg} starts with "child_died:": the worker is dead. Go to @report.
 - Otherwise: keep waiting. Return frames: ["@wait-for-death"].
-Do NOT issue a receive op.
 @@end
 
 @@report
 The worker was killed by the reaper. Send {"text": "Supervisor: worker timed out,
 killed via reaper. Death notice: ${_msg}"} to 'human'. Then terminate with
 an empty frames array [].
-Do NOT issue a receive op.
 @@end
 
 Step 1:
 1. Send {"text": "Supervisor: spawning slow worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "child",
-   "grind": true, "idle": true.
+   "idle": true.
 3. Return frames: ["@wait-for-ack"]
 ```
 
@@ -1853,13 +1817,13 @@ Step 1:
 - Ancestry check: only ancestors can kill descendants (no peer-to-peer kills).
 - The kill #sym.arrow death-notification flow: reaper kills the child, the monitor sends `child_died:` to the parent.
 - Multi-phase parent state machine: spawn #sym.arrow wait-for-ack #sym.arrow wait-for-death #sym.arrow report.
-- Child spawned with `grind: true` and `idle: true`---a hot-looping daemon that restores its frame on empty stack.
+- Child spawned with `idle: true`---a daemon that restores its frame on empty stack and wakes on real messages.
 
 === Questions for Reflection
 
 + Why is there a `@wait-for-death` phase between sending to reaper and reporting? Could you skip it?
 + What if the child sends its status message _after_ the parent sends to the reaper but _before_ the child actually dies? Is there a race condition?
-+ The worker is spawned with both `grind: true` and `idle: true`. What does each flag contribute?
++ What does `idle: true` contribute to the worker's lifecycle?
 
 === Extension Projects
 
@@ -1867,94 +1831,29 @@ Step 1:
 - *Timeout via watchdog:* Instead of using the first worker message as the timeout signal, set a watchdog timer and reap when it ticks.
 - *Pool of workers:* Spawn 3 workers, kill whichever finishes last.
 
-== 08: Lucky Number --- Grind Mode
+== 08: Lucky Number --- Historical Removed Pattern
 
-=== Listing
-
-```
-You are a supervisor running a number-guessing game. You spawn a child
-that rolls random numbers autonomously. If the child rolls a 1, you
-kill it via the reaper. Otherwise the child keeps rolling on its own.
-
-Messages arrive between cycles as ${_msg} from ${_msg_source}.
-All messages are JSON objects. The msg field in send ops must be a JSON object.
-This is the first cycle (${_msg} is "init").
-
-@@roller
-You are the roller child. You autonomously roll random numbers in a
-tight loop (grind mode — you cycle continuously without waiting for
-messages between cycles).
-
-EVERY cycle, do ALL of these steps in order:
-1. If ${roll} is in your bindings: send {"text": "rolled:${roll}"} to ${_parent}
-   and send {"text": "Child: I rolled ${roll}"} to 'human'.
-2. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
-3. Issue receive("roll") to block until bash responds.
-4. Return frames: ["@0"].
-
-On the first cycle ${roll} is not yet bound, so skip step 1.
-On every subsequent cycle ${roll} holds the previous bash result.
-@@end
-
-@@check-roll
-A message arrived as ${_msg} from ${_msg_source}.
-
-If ${_msg} starts with "rolled:":
-  Send {"text": "Parent: child ${_msg}"} to 'human'.
-  Extract the number after "rolled:" and trim whitespace.
-  If the number is "1":
-    Send {"target": "${child}"} to 'reaper' to kill the child.
-    Return frames: ["@wait-for-death"].
-  Otherwise:
-    Return frames: ["@check-roll"].
-
-If ${_msg} starts with "child_died:":
-  Send {"text": "Parent: child died! ${_msg}"} to 'human'.
-  Terminate with empty frames [].
-
-Otherwise: return frames: ["@check-roll"].
-Do NOT issue a receive op.
-@@end
-
-@@wait-for-death
-The reaper was asked to kill the child. A message arrived as ${_msg}.
-If ${_msg} starts with "child_died:":
-  Send {"text": "Parent: child was reaped! ${_msg}"} to 'human'.
-  Terminate with empty frames [].
-Otherwise: return frames: ["@wait-for-death"].
-Do NOT issue a receive op.
-@@end
-
-Step 1:
-1. Send {"text": "Parent: spawning roller child..."} to 'human'.
-2. Spawn a child with frames: ["@roller"], dest "child", "grind": true.
-3. Return frames: ["@check-roll"].
-```
+The old guide used this slot for a grind + `receive` dice roller. That program
+is intentionally no longer reproduced here because both grind mode and the
+`receive` op were removed from the runtime.
 
 === What to Learn
 
-This is the canonical demonstration of the *two-cycle roll* pattern:
-
-- Grind-mode child calling bash and using the result across cycle boundaries.
-- `receive("roll")` blocks mid-cycle; `${roll}` is available next cycle.
-- Parent in message-driven mode reacting to child's reports.
-- Reaper used to terminate the child on a condition.
-
-Performance note: this pattern achieves ~2 cycles per roll, ~5 seconds per roll. Compare with test 09.
+- Why the old runtime surface was confusing enough to remove.
+- Why current Gizmo requires explicit wakeups (`${_self}` or watchdog) instead of hidden hot-loop progress.
+- Why test 09 is now the canonical dice example.
 
 === Questions for Reflection
 
-+ Why does the child skip step 1 on the first cycle? What would happen if it didn't check?
-+ The child uses `@0` to loop. The parent uses named sections. Why the different strategies?
-+ What happens to messages the child sent to the parent that haven't been processed when the parent reaps the child?
++ Which parts of the old pattern were actual agent logic, and which parts were workarounds for the removed execution model?
++ Does removing grind make the language easier to prompt correctly, even if some autonomous loops take more cycles?
 
 === Extension Projects
 
-- *Best of N:* Don't kill on 1---instead, track the highest roll and kill after 10 rolls, reporting the maximum.
-- *Two dice:* Roll two dice per cycle. This requires two bash calls per cycle---how do you structure the receives?
-- *Race:* Spawn two roller children. Kill both when either rolls a 1. Report which one won.
+- Rebuild the same autonomous roller using only message-driven wakeups.
+- Compare a self-message loop against a watchdog-driven loop.
 
-== 09: Lucky Number --- Idle Mode
+== 09: Lucky Number --- Idle + Trap
 
 === Listing
 
@@ -2019,14 +1918,14 @@ Return frames: [].
 
 === What to Learn
 
-The _alternative_ to the grind+receive pattern:
+The current supported autonomous-roll pattern:
 
 - Child in message-driven mode with `idle: true` and a watchdog timer.
 - Watchdog ticks trigger rolls; child goes idle between ticks.
 - Parent uses `trap` for death handling instead of checking in every section.
 - Multi-frame spawn: `["@roller", "@wait-roll"]` gives the child a two-frame stack.
 
-Key structural comparison with test 08:
+Structural summary:
 
 #table(
   columns: (auto, 1fr, 1fr),
@@ -2034,17 +1933,16 @@ Key structural comparison with test 08:
   stroke: 0.5pt + luma(200),
   inset: 6pt,
   table.header(
-    [], [*08 (Grind + Receive)*], [*09 (Idle + Trap)*],
+    [*Aspect*], [*09 (Idle + Trap)*], [*Why it matters*],
   ),
-  [Child loop], [grind mode, `receive` op], [message-driven, `${_msg}`],
-  [Child pacing], [autonomous hot loop], [parent-driven via watchdog],
-  [Death handling], [explicit check per section], [trap fires anywhere],
-  [Cycles/roll], [~2 (~5s)], [~4 (~11s)],
+  [Child loop], [message-driven, `${_msg}`], [One semantics everywhere in the runtime],
+  [Child pacing], [watchdog-driven], [Real mailbox wakeups; no hidden progress],
+  [Death handling], [trap fires anywhere], [No need to special-case `child_died:` in every frame],
+  [Cycles/roll], [more than the removed hot-loop pattern], [Simpler semantics were chosen over shaving cycles],
 )
 
 === Questions for Reflection
 
-+ Why is test 09 roughly twice as slow as test 08? Trace the cycle count per roll.
 + The child is spawned with `["@roller", "@wait-roll"]`---two frames. What happens to `@wait-roll` when the child returns `frames: []` after setup?
 + What happens if a watchdog tick arrives while the child is waiting for bash? Does the tick get lost?
 
@@ -2052,115 +1950,15 @@ Key structural comparison with test 08:
 
 - *Adaptive timing:* Start the watchdog at 2000ms. After each roll, halve the interval. How fast can you go before ticks start racing the LLM?
 - *One-shot timer:* Replace `{"action": "every", "ms": 2000}` with `{"action": "after", "ms": 2000}` and have the child request a new timer after each roll. Compare behavior.
-- *Hybrid:* Start in idle mode, switch to grind mode after 3 rolls (the parent sends a "go fast" message, the child adjusts).
+- *Self-message variant:* Replace watchdog ticks with explicit `send` to `${_self}` after each roll.
 
 == 10: Marketplace
-
-=== Listing
-
-```
-You are a marketplace coordinator. You spawn two independent peer agents
-— a bank and a store — using "disown": true. They discover each other
-and you through the blackboard service directory.
-
-Messages arrive between cycles as ${_msg} from ${_msg_source}.
-All messages are JSON objects. The msg field in send ops must be a JSON object.
-
-@@bank-program
-You are the bank. You run in grind mode (cycle continuously).
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
-
-Check your current bindings to determine what to do:
-
-If ${req} is in your bindings:
-  ${req} is the text summary of the message. ${req_payload} is the full JSON.
-  If ${req} contains "balance_request":
-    Parse ${req_payload} to extract the "reply_to" field.
-    Send {"text": "balance:42"} to that reply address.
-    Terminate with empty frames [].
-  Otherwise: Issue receive("req"). Return frames: ["@0"].
-
-If ${ack} is in your bindings but ${req} is NOT:
-  You registered. Now block for a request.
-  Issue receive("req").
-  Return frames: ["@0"].
-
-Otherwise (first cycle, no ${ack} yet):
-  Register: send {"action": "write", "key": "bank_mb", "value": "${_self}"}
-  to 'blackboard'.
-  Issue receive("ack").
-  Return frames: ["@0"].
-@@end
-
-@@store-program
-You are the store. You run in grind mode (cycle continuously).
-Use receive ops to block for messages. Return frames: ["@0"] to loop.
-
-Check your current bindings to determine what to do:
-
-If ${coord} is in your bindings:
-  Deliver the result.
-  Send {"action": "write", "key": "marketplace_result", "value": "${bal}"}
-  to 'blackboard'.
-  Send {"text": "${bal}"} to ${coord}.
-  Terminate with empty frames [].
-
-If ${bal} is in your bindings but ${coord} is NOT:
-  You got the bank's reply. Look up the coordinator.
-  Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
-  Issue receive("coord").
-  Return frames: ["@0"].
-
-If ${bank} is in your bindings but ${bal} is NOT:
-  You have the bank's address. Send it a request.
-  If ${bank} starts with "agent_":
-    Send {"text": "balance_request", "reply_to": "${_self}"} to ${bank}.
-    Issue receive("bal").
-    Return frames: ["@0"].
-  Otherwise (bank not registered yet, retry):
-    Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
-    Issue receive("bank").
-    Return frames: ["@0"].
-
-If ${reg} is in your bindings but ${bank} is NOT:
-  You registered. Now look up the bank.
-  Send {"action": "read", "key": "bank_mb"} to 'blackboard'.
-  Issue receive("bank").
-  Return frames: ["@0"].
-
-Otherwise (first cycle, no ${reg} yet):
-  Register: send {"action": "write", "key": "store_mb", "value": "${_self}"}
-  to 'blackboard'.
-  Issue receive("reg").
-  Return frames: ["@0"].
-@@end
-
-@@wait-result
-You are the coordinator. You already spawned the bank and store.
-A message arrived as ${_msg} from ${_msg_source}.
-Do NOT spawn any agents. Do NOT send to blackboard.
-If ${_msg} starts with "balance:":
-  Send {"text": "Marketplace result: ${_msg}"} to 'human'.
-  Terminate with empty frames [].
-Otherwise:
-  Ignore this message. Return frames: ["@wait-result"].
-  Do NOT issue any ops.
-@@end
-
-This is the first cycle (${_msg} is "init"). Do all of these steps:
-1. Send {"action": "write", "key": "coordinator_mb", "value": "${_self}"}
-   to 'blackboard'.
-2. Send {"text": "Coordinator: spawning bank and store..."} to 'human'.
-3. Spawn with frames: ["@bank-program"], dest "bank_id",
-   "grind": true, "disown": true.
-4. Spawn with frames: ["@store-program"], dest "store_id",
-   "grind": true, "disown": true.
-5. Return frames: ["@wait-result"].
-```
+This example previously used grind-mode peers that blocked internally with
+`receive`. That version is now historical and has been removed from the guide.
 
 === What to Learn
 
-The most complex test. Demonstrates:
+The current lessons still stand:
 
 - *Disowned peers:* `disown: true` creates fully independent agents with no `${_parent}`.
 - *Blackboard as service directory:* each agent writes its address, others read it to discover peers.
@@ -2199,7 +1997,7 @@ Send {"text": "hello from ${_self}"} to 'human', then terminate with empty frame
 This is the first cycle (${_msg} is "init"). Do all of these steps:
 1. Send {"text": "Spawning named worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "kid",
-   "grind": true, "name": "myworker".
+   "name": "myworker".
 3. Return frames: []. Terminate immediately after spawning.
 ```
 
@@ -2264,7 +2062,7 @@ These are approaches tried during Gizmo's development that didn't work. Understa
 
 The original design pushed `receive` and `fork` results onto a positional stack. `$1` was the most recent, `$2` the one before that. Indices shifted on every push, the LLM had to count backwards to track provenance, and the stack grew without bound.
 
-*Replaced by:* Named bindings via `dest`. `receive("output")` stores the result as `${output}`. Named, stable, self-documenting.
+*Replaced by:* Named bindings via `dest` on `spawn` plus runtime wake bindings like `${_msg}`. Named, stable, self-documenting.
 
 == Text-Based `<ops>`/`<frames>` Parsing
 
@@ -2288,7 +2086,7 @@ The original op set was `send`, `receive`, `fork`, `join`. `join(msg)` sent a me
 
 The eval loop originally hot-looped: call LLM, execute ops, loop immediately. A one-shot agent burned 50 LLM calls spinning on an idle boot frame before the cycle limit killed it.
 
-*Replaced by:* Message-driven eval loop (default). Agents sleep between cycles, wake on messages. Grind mode is opt-in for workers that need continuous cycling.
+*Replaced by:* Message-driven eval loop. Agents sleep between cycles and wake on messages. Autonomous repetition now requires an explicit self-message or watchdog tick.
 
 == Idle-by-Default
 
@@ -2312,13 +2110,13 @@ Returning `frames: ["@quit"]` in message-driven mode blocks on the inter-cycle w
 
 Children defined as `@@sections` in the parent tried to use `["@step2"]` to transition phases. Children don't inherit parent sections---the reference stays literal.
 
-*Fix:* Binding-conditional single-frame pattern with `@0` loops. All phases in one frame.
+*Fix:* Single-frame or section-based state machines driven by `${_msg}` and explicit continuation frames.
 
 == Checking `${_msg}` in Grind-Mode Children
 
 Grind-mode children expected `${_msg}` to update between cycles. It doesn't---`_msg` is only bound by the inter-cycle message wait, which grind mode skips.
 
-*Fix:* Use explicit `receive("dest")` ops in grind mode. Check the named binding, not `${_msg}`.
+*Removed entirely:* the runtime no longer has grind mode, so `${_msg}` now follows one semantics everywhere.
 
 // ============================================================================
 // Appendix C: How Gizmo Compares
@@ -2340,8 +2138,8 @@ OpenClaw is a batteries-included AI agent framework: gateway routing across chat
 
 The key architectural differences:
 
-- *Scope.* OpenClaw is a full-featured personal assistant with 100+ skills and multi-channel integration. Gizmo is a minimal runtime with four ops.
-- *Agent composition.* OpenClaw runs a single agent with modular skills. Gizmo supports hierarchical and peer-to-peer multi-agent coordination via `spawn`, `send`, and `receive`.
+- *Scope.* OpenClaw is a full-featured personal assistant with 100+ skills and multi-channel integration. Gizmo is a minimal runtime with three ops.
+- *Agent composition.* OpenClaw runs a single agent with modular skills. Gizmo supports hierarchical and peer-to-peer multi-agent coordination via `spawn`, `send`, and mailbox wakeups.
 - *Control flow.* OpenClaw's ReAct loop is sequential---one thought, one action, one observation. Gizmo agents run concurrently on the BEAM, communicating via mailboxes.
 - *State.* OpenClaw externalizes state to Markdown files on disk. Gizmo keeps state in per-process bindings and the context stack, with the blackboard as optional shared memory.
 - *Memory.* OpenClaw has a sophisticated memory system with temporal decay and deduplication. Gizmo has no built-in memory beyond bindings and the blackboard.
@@ -2357,7 +2155,7 @@ Gizmo differs structurally:
 - *Concurrency.* ReAct is single-threaded. One agent, one loop, one tool call at a time. Gizmo agents are concurrent BEAM processes that communicate via message passing. A parent can spawn children that run in parallel.
 - *State representation.* ReAct keeps all state in the context window---the growing concatenation of thoughts, actions, and observations. Gizmo separates concerns: bindings for named values, the context stack for the prompt, and messages for inter-process communication.
 - *Control flow.* ReAct's control flow is emergent from token prediction. The LLM "decides" what to do by generating text that a harness parses. Gizmo's control flow is explicit: the LLM returns structured JSON with typed ops, and the runtime dispatches them deterministically.
-- *Composition.* ReAct has no native mechanism for agent-to-agent communication. Multi-agent setups require external orchestration. Gizmo's `spawn`/`send`/`receive` make multi-agent coordination a first-class concern.
+- *Composition.* ReAct has no native mechanism for agent-to-agent communication. Multi-agent setups require external orchestration. Gizmo's `spawn`/`send` plus mailbox-driven wakeups make multi-agent coordination a first-class concern.
 - *Error handling.* ReAct hopes the LLM notices when something goes wrong. Gizmo has supervision trees, death monitors, the `trap` op for structured failure handling, and op error recovery (`_op_error`/`_pending_ops` bindings) for LLM-generated bad ops.
 
 ReAct is simple to implement and reason about for single-agent tasks. Gizmo is what you reach for when agents need to coordinate, fail gracefully, or run in parallel.
@@ -2414,7 +2212,7 @@ Gizmo's op set maps onto the #sym.pi\-calculus surprisingly directly:
     [*#sym.pi\-calculus*], [*Gizmo*], [*Notes*],
   ),
   [#math.overline($x$)#math.chevron.l $y$ #math.chevron.r (send $y$ on $x$)], [`send(mailbox, msg)`], [Fire-and-forget to a named mailbox],
-  [$x(y)$ (receive $y$ from $x$)], [`receive(dest)` / `${_msg}`], [Block until a message arrives],
+  [$x(y)$ (receive $y$ from $x$)], [`${_msg}` on the next wakeup], [Mailbox-driven wakeup rather than an explicit receive op],
   [#sym.nu $x$ (create channel $x$)], [`spawn(dest: "x")`], [New process = new mailbox ID],
   [$P | Q$ (parallel composition)], [`spawn` creates concurrent processes], [Agents run on the BEAM],
   [$!P$ (replication)], [`@0` loop / idle restore], [Persistent behavior],
@@ -2470,9 +2268,9 @@ The pattern's power is in what it _doesn't_ do:
 
 Compared to Gizmo:
 
-- *The Ralph Loop is a degenerate case of Gizmo.* A single grind-mode agent with one frame and `@0` return is structurally similar: the runtime re-invokes the LLM each cycle, and the frame persists. The difference is that Gizmo keeps bindings and messages in-process, while the Ralph Loop offloads everything to the filesystem.
+- *The Ralph Loop overlaps with one Gizmo idiom.* A self-renewing agent that keeps reusing one frame is structurally similar: the runtime re-invokes the LLM each cycle, and the frame persists. The difference is that Gizmo keeps bindings and messages in-process, while the Ralph Loop offloads everything to the filesystem.
 - *Context freshness.* Ralph Loops get a clean context window each iteration, eliminating "context rot." Gizmo agents accumulate bindings and the context stack grows and shrinks across cycles---which is powerful for multi-step tasks but can degrade over long runs.
-- *Composition.* The Ralph Loop is deliberately non-compositional. It solves one task at a time. Gizmo's `spawn`/`send`/`receive` exist precisely because interesting problems require multiple agents coordinating. The Ralph Loop's answer to coordination is "don't."
+- *Composition.* The Ralph Loop is deliberately non-compositional. It solves one task at a time. Gizmo's `spawn`/`send` plus mailbox wakeups exist precisely because interesting problems require multiple agents coordinating. The Ralph Loop's answer to coordination is "don't."
 - *Termination.* Ralph Loops use external verification (test suites, linters, string matching). Gizmo agents self-terminate via `frames: []`. Neither trusts the LLM's self-assessment, but they enforce it differently: external script vs. runtime semantics.
 
 The Ralph Loop is what you use when the problem is "keep hammering until the tests pass." Gizmo is what you use when the problem is "coordinate multiple agents that need to talk to each other."
@@ -2484,8 +2282,8 @@ The Ralph Loop is what you use when the problem is "keep hammering until the tes
 
 == Eval Cycle
 
-Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + boot + frames) #sym.arrow LLM #sym.arrow interpolate ops & frames #sym.arrow execute ops #sym.arrow replace frames #sym.arrow sleep (or loop if grind). \
-*Interpolation happens BEFORE ops execute.* A `receive()` binding is not available via `${name}` until the next cycle.
+Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + boot + frames) #sym.arrow LLM #sym.arrow interpolate ops & frames #sym.arrow execute ops #sym.arrow replace frames #sym.arrow sleep until the next mailbox message. \
+*Interpolation happens BEFORE ops execute.* If an op triggers a future response, that response is seen on the next cycle as `${_msg}`.
 
 == Ops
 #table(
@@ -2495,8 +2293,7 @@ Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + bo
   inset: 3pt,
   table.header([*Op*], [*Syntax*], [*Blk?*], [*Binds*], [*Notes*]),
   [`send`], [`{"op":"send", "mailbox":"id", "msg":{...}}`], [No], [---], [Fire-and-forget. `msg` is a JSON object. Both fields interpolated.],
-  [`receive`], [`{"op":"receive", "dest":"name"}`], [Yes], [`name`, `name_payload`], [Blocks until message arrives. `name` = text summary, `name_payload` = full JSON.],
-  [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `grind`/`idle` (bool, inherit), `disown` (bool, false), `name`/`model` (string, inherit).],
+  [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `idle` (bool), `disown` (bool, false), `name`/`model` (string, inherit).],
   [`trap`], [`{"op":"trap", "pattern":"regex", "frames":[...]}`], [No], [---], [Interrupt handler. Empty `frames` clears. Sets `_interrupt`/`_interrupt_source`.],
 )
 
@@ -2523,7 +2320,7 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   table.header([*Name*], [*Set By*], [*Description*]),
   [`_self`], [always], [This agent's mailbox ID],
   [`_parent`], [if spawned], [Parent's mailbox ID],
-  [`_msg`], [each cycle], [Text summary of wake message. `"init"` on cycle 0. Not re-bound in grind after cycle 0.],
+  [`_msg`], [each cycle], [Text summary of wake message. `"init"` on cycle 0.],
   [`_msg_source`], [each cycle], [Sender ID. `"runtime"` on cycle 0.],
   [`_payload`], [each cycle], [Full JSON of wake message. `"{}"` on cycle 0.],
   [`_interrupt`], [trap fire], [Matched message content],
@@ -2563,7 +2360,6 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   [`--init <f>`], [Write starter template and exit.],
   [`--each`], [One agent per positional file.],
   table.cell(colspan: 2, fill: luma(240), [_Modes_]),
-  [`--grind`], [Hot-loop: no inter-cycle message wait.],
   [`--idle`], [Restore boot frame on frame exhaust (daemon).],
   [`--watchdog <ms>`], [Send `"tick"` (from `"watchdog"`) every N ms.],
   [`--max-cycles <N>`], [Cycle limit (default 50, 0 = unlimited).],
@@ -2587,7 +2383,7 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
 - *One-shot:* No ops, `frames: []`. Simplest agent.
 - *Service call:* `send`, continuation frame, `${_msg}` next cycle.
 - *`@0` loop:* `frames: ["@0"]` re-executes. Beware replaying setup.
-- *Two-cycle roll:* `send`+`receive`, use binding next cycle, `@0`.
+- *Self-renewing loop:* send to `${_self}` or schedule a watchdog tick, then continue on the next wakeup.
 - *Binding-conditional FSM:* "if `${x}` is in bindings" branches.
 - *Named sections:* `@@step1`...`@@end`, transition via `["@step2"]`.
 - *Interactive:* `send` to `human_input`, `${_msg}` next cycle, `@0`.
@@ -2598,8 +2394,8 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
 + `${_msg}` is not a future --- it's this cycle's wake message.
 + Terse continuations (`"step2"`) lose context. Be explicit.
 + `@0` replays _everything_ in the frame. Use `@@loop` sections.
-+ `receive` in msg-driven mode hangs (consumes wake message).
-+ Same-cycle `receive` + `${}` fails (interpolation is first).
++ Same-cycle `${_msg}` is stale for work you just triggered.
++ `@0` does not create progress on its own; a real wakeup message is required.
 + Children can't see parent `@@sections`. Use conditionals + `@0`.
 + Boot frame re-executes every cycle. Wrap setup in `@@section`.
 + `frames: ["@quit"]` hangs in msg-driven. Inline + `[]` instead.
