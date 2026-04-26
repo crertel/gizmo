@@ -56,6 +56,6 @@ Return frames: [].
 
 1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller", "@wait-roll"], dest "child".
-3. Register a trap: pattern "^child_died:", frames ["@death-handler"].
+3. Register a trap: event "child_died", description "report child death", frames ["@death-handler"].
 4. Send {"text": "renew"} to 'keep_alive'.
 5. Return frames: ["@check-roll"].

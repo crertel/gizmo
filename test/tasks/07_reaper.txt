@@ -20,14 +20,14 @@ A message arrived as ${_msg} from ${_msg_source}. Check it now:
 - If ${_msg} starts with "worker:": the worker is still running. This is
   your timeout signal — it has taken too long. Send {"target": "${child}"}
   to 'reaper' to kill it. Send {"text": "renew"} to 'keep_alive'. Return frames: ["@wait-for-death"].
-- If ${_msg} starts with "child_died:": the worker was already killed.
+- If ${_msg_source} is "runtime" and ${_msg} starts with "child_died:": the worker was already killed.
   Go to @report.
 Otherwise, send {"text": "renew"} to 'keep_alive' and return frames: ["@wait-for-ack"] to keep waiting.
 @@end
 
 @@wait-for-death
 The reaper was asked to kill the worker. A message arrived as ${_msg}.
-- If ${_msg} starts with "child_died:": the worker is dead. Go to @report.
+- If ${_msg_source} is "runtime" and ${_msg} starts with "child_died:": the worker is dead. Go to @report.
 - Otherwise: keep waiting. Send {"text": "renew"} to 'keep_alive'. Return frames: ["@wait-for-death"].
 @@end
 

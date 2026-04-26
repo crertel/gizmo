@@ -373,7 +373,7 @@ Each agent process carries the following state through its eval loop:
   [`mailbox_id`], [This agent's address for receiving messages (e.g., `"agent_1"`).],
   [`parent_id`], [The spawning agent's mailbox ID, or `nil` for root/disowned agents.],
   [`bindings`], [Map of named values from `spawn` and the runtime (`_self`, `_parent`, `_msg`, `_msg_source`, `_payload`).],
-  [`trap`], [A `{regex, handler_frames}` tuple, or `nil`. Single-slot interrupt handler.],
+  [`traps`], [Map from event key to `{description, handler_frames}`. One-shot interrupt handlers.],
   [`messages_queue`], [A per-agent `MessagesQueue` GenServer. Currently unused in the runtime path (retained for test assertions).],
 )
 
@@ -410,7 +410,7 @@ Key invariants:
 
 - *`_msg` binding:* Updated from the mailbox on every cycle after cycle 0.
 - *Bindings from `spawn`:* Persist until the agent dies.
-- *Trap:* Fires between cycles, before prompt construction, when the wake message matches the regex.
+- *Trap:* Fires between cycles, before prompt construction, when the wake message's event key matches a registered trap.
 - *Autonomous continuation:* If an agent needs to wake itself later, it must schedule a watchdog tick or send a message to `${_self}`.
 
 == In-Depth on Interpolation
@@ -542,18 +542,18 @@ A `Process.monitor` watches non-disowned children. If a child crashes, a `child_
 === `trap` --- Interrupt Handler
 
 ```json
-{"op": "trap", "pattern": "<PCRE regex>", "frames": ["<handler frame>", ...]}
+{"op": "trap", "event": "<event_key>", "description": "<why this trap exists>", "frames": ["<handler frame>", ...]}
 ```
 
-Registers a single-slot interrupt handler. Between eval cycles, when a message arrives that matches the PCRE regex `pattern`, the handler frames are _prepended_ to the context stack and the cycle proceeds immediately. The bindings `${_interrupt}` and `${_interrupt_source}` are set.
+Registers a one-shot interrupt handler. Between eval cycles, when a message arrives whose event key matches `event`, the handler frames are _prepended_ to the context stack and the cycle proceeds immediately. The bindings `${_interrupt}`, `${_interrupt_event}`, and `${_interrupt_source}` are set.
 
-Only one trap can be active. A new `trap` replaces the old one. Clear the trap with empty frames:
+Multiple traps can be active at once, keyed by exact event name. Clear one trap with empty frames:
 
 ```json
-{"op": "trap", "pattern": ".*", "frames": []}
+{"op": "trap", "event": "<event_key>", "frames": []}
 ```
 
-The trap persists across cycles. This is useful for handling child death notifications: register a trap for `"^child_died:"` once, and it fires whenever a child dies.
+Traps auto-clear after firing once. If you want to keep listening, re-register the trap explicitly. This is useful for handling child death notifications or exhaustion recovery without carrying stale handlers forever.
 
 #figure(
   mermaid("
@@ -561,13 +561,13 @@ sequenceDiagram
   participant P as Parent
   participant RT as Runtime
   participant CH as Child
-  P->>RT: trap child_died
+  P->>RT: trap event=child_died
   Note over P: cycles pass
   CH->>RT: crash
   RT->>P: child_died message
   Note over P: handler fires
 "),
-  caption: [Trap fires when an inter-cycle message matches the pattern],
+  caption: [Trap fires when an inter-cycle message matches the exact event key],
 )
 
 == In-Depth on Well-Known Services
@@ -1214,11 +1214,11 @@ Child died: ${_interrupt}. Report and terminate.
 @@end
 
 1. Spawn child with frames: ["@worker"], dest "child".
-2. trap("^child_died:", ["@death-handler"]).
+2. trap("child_died", "report child failure and stop", ["@death-handler"]).
 3. Return frames: ["@wait-for-result"].
 ```
 
-The trap fires on `child_died:` regardless of which frame the parent is currently executing.
+The trap fires on `child_died` regardless of which frame the parent is currently executing.
 
 === Disowned Peers with Blackboard Discovery
 
@@ -1625,7 +1625,7 @@ array [].
 Step 1:
 1. Send {"text": "Supervisor: spawning worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], and dest "child".
-3. Register a trap for "^child_died:" with handler frames:
+3. Register a trap for `child_died` with handler frames:
    ["The child crashed: ${_interrupt}. Send {"text": "error: ${_interrupt}"} to 'human'
     and terminate with empty frames."]
 4. Return frames: ["@got-result"]
@@ -1635,14 +1635,14 @@ Step 1:
 
 - The `spawn` op: creating a child with frames and storing its mailbox ID in a binding.
 - `${_parent}` binding in the child---how children send results back.
-- `trap` for `"^child_died:"` as a safety net for child crashes.
+- `trap` for `child_died` as a safety net for child crashes.
 - The parent sleeping in `@got-result` until the child's message arrives as `${_msg}`.
 - That the child writes its _own_ continuation frame as a string literal---it doesn't use parent sections.
 
 === Questions for Reflection
 
 + The child's continuation frame is written as a string inside the `@@worker` section. Could you use a nested `@@section` instead? Why or why not?
-+ What happens if the child crashes before sending to `${_parent}`? Trace the `child_died:` path.
++ What happens if the child crashes before sending to `${_parent}`? Trace the `child_died` path.
 + The trap handler frames mention `${_interrupt}`. When is this binding set?
 
 === Extension Projects
@@ -1912,7 +1912,7 @@ Return frames: [].
 1. Send {"text": "Parent: spawning roller child..."} to 'human'.
 2. Spawn a child with frames: ["@roller", "@wait-roll"],
    dest "child".
-3. Register a trap: pattern "^child_died:", frames ["@death-handler"].
+3. Register a trap: event `child_died`, description "report child death", frames ["@death-handler"].
 4. Send {"text": "renew"} to 'keep_alive'.
 5. Return frames: ["@check-roll"].
 ```
@@ -2295,7 +2295,7 @@ Wake #sym.arrow bind `_msg`/`_msg_source` #sym.arrow build prompt (preamble + bo
   table.header([*Op*], [*Syntax*], [*Blk?*], [*Binds*], [*Notes*]),
   [`send`], [`{"op":"send", "mailbox":"id", "msg":{...}}`], [No], [---], [Fire-and-forget. `msg` is a JSON object. Both fields interpolated.],
   [`spawn`], [`{"op":"spawn", "frames":[...], "dest":"name", ...}`], [No], [`name`], [Child starts with `_msg="init"`. Options: `disown` (bool, false), `name`/`model` (string, inherit).],
-  [`trap`], [`{"op":"trap", "pattern":"regex", "frames":[...]}`], [No], [---], [Interrupt handler. Empty `frames` clears. Sets `_interrupt`/`_interrupt_source`.],
+  [`trap`], [`{"op":"trap", "event":"name", "description":"...", "frames":[...]}`], [No], [---], [One-shot interrupt handler. Empty `frames` clears that event's trap. Sets `_interrupt`/`_interrupt_event`/`_interrupt_source`.],
 )
 
 #columns(2, gutter: 8pt)[
@@ -2325,6 +2325,7 @@ Sections: `@@name`...`@@end` in boot frame. Non-greedy (first `@@end`). Keep fla
   [`_msg_source`], [each cycle], [Sender ID. `"runtime"` on cycle 0.],
   [`_payload`], [each cycle], [Full JSON of wake message. `"{}"` on cycle 0.],
   [`_interrupt`], [trap fire], [Matched message content],
+  [`_interrupt_event`], [trap fire], [Matched event key],
   [`_interrupt_source`], [trap fire], [Matched message sender],
 )
 ]

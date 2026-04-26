@@ -203,7 +203,12 @@ defmodule Gizmo.LLM do
           %{op: String.t(), mailbox: String.t(), msg: String.t()}
           | %{op: String.t(), dest: String.t()}
           | %{op: String.t(), frames: [String.t()], dest: String.t()}
-          | %{op: String.t(), pattern: String.t(), frames: [String.t()]}
+          | %{
+              op: String.t(),
+              event: String.t(),
+              description: String.t(),
+              frames: [String.t()]
+            }
 
   @type eval_response :: %{ops: [op()], frames: [String.t()], notes: map()}
 
@@ -233,9 +238,13 @@ defmodule Gizmo.LLM do
                 enum: ["send", "spawn", "trap"],
                 description: "The op to invoke."
               },
-              pattern: %{
+              event: %{
                 type: "string",
-                description: "Regex pattern for trap interrupt matching."
+                description: "Exact event key for trap interrupt matching."
+              },
+              description: %{
+                type: "string",
+                description: "Short human-readable description of why this trap is active."
               },
               mailbox: %{
                 type: "string",
@@ -341,9 +350,10 @@ defmodule Gizmo.LLM do
   end
 
   defp validate_op(%{"op" => "trap"} = op) do
-    with :ok <- require_string(op, "pattern", "trap"),
-         :ok <- require_list(op, "frames", "trap") do
-      {:ok, {:trap, op["pattern"], op["frames"]}}
+    with :ok <- require_string(op, "event", "trap"),
+         :ok <- require_list(op, "frames", "trap"),
+         {:ok, description} <- validate_trap_description(op) do
+      {:ok, {:trap, op["event"], description, op["frames"]}}
     end
   end
 
@@ -373,6 +383,16 @@ defmodule Gizmo.LLM do
       nil -> {:ok, opts}
       v when is_binary(v) -> {:ok, Map.put(opts, atom_key, v)}
       _ -> {:error, {:invalid_op, "spawn", "#{json_key} must be a string"}}
+    end
+  end
+
+  defp validate_trap_description(%{"frames" => []}), do: {:ok, nil}
+
+  defp validate_trap_description(op) do
+    case op["description"] do
+      v when is_binary(v) and v != "" -> {:ok, v}
+      nil -> {:error, {:invalid_op, "trap", "missing required field: description"}}
+      _ -> {:error, {:invalid_op, "trap", "description must be a non-empty string"}}
     end
   end
 
@@ -423,8 +443,11 @@ defmodule Gizmo.LLM do
           {:spawn, Enum.map(spawn_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections)),
            dest, spawn_opts}
 
-        {:trap, pattern, handler_frames} ->
-          {:trap, pattern,
+        {:trap, event, nil, []} ->
+          {:trap, event, nil, []}
+
+        {:trap, event, description, handler_frames} ->
+          {:trap, event, Gizmo.Interpolation.resolve(description, bindings, sections),
            Enum.map(handler_frames, &Gizmo.Interpolation.resolve(&1, bindings, sections))}
 
         other ->
@@ -908,6 +931,84 @@ defmodule Gizmo.Services.KeepAlive do
   def handle_info({:mailbox_msg, _to, {_from, _msg}}, state) do
     {:noreply, state}
   end
+end
+
+defmodule Gizmo.Services.Runtime do
+  use GenServer
+
+  def start_link(mailbox_id \\ "runtime") do
+    GenServer.start_link(__MODULE__, mailbox_id, name: __MODULE__)
+  end
+
+  def register_agent(pid, mailbox_id), do: GenServer.call(__MODULE__, {:register_agent, pid, mailbox_id})
+  def unregister_agent(mailbox_id), do: GenServer.call(__MODULE__, {:unregister_agent, mailbox_id})
+  def update_traps(mailbox_id, traps), do: GenServer.call(__MODULE__, {:update_traps, mailbox_id, traps})
+
+  @impl true
+  def init(mailbox_id) do
+    Gizmo.Mailbox.register(mailbox_id)
+    {:ok, %{mailbox_id: mailbox_id, agents: %{}}}
+  end
+
+  @impl true
+  def handle_call({:register_agent, pid, mailbox_id}, _from, state) do
+    {:reply, :ok, put_in(state.agents[mailbox_id], %{pid: pid, traps: %{}})}
+  end
+
+  def handle_call({:unregister_agent, mailbox_id}, _from, state) do
+    {:reply, :ok, %{state | agents: Map.delete(state.agents, mailbox_id)}}
+  end
+
+  def handle_call({:update_traps, mailbox_id, traps}, _from, state) do
+    agent = Map.get(state.agents, mailbox_id, %{pid: nil, traps: %{}})
+    {:reply, :ok, put_in(state.agents[mailbox_id], %{agent | traps: traps})}
+  end
+
+  def handle_call(:snapshot, _from, state) do
+    snapshot =
+      Map.new(state.agents, fn {mailbox_id, %{traps: traps}} ->
+        {mailbox_id, %{traps: traps}}
+      end)
+
+    {:reply, %{agents: snapshot}, state}
+  end
+
+  @impl true
+  def handle_info(
+        {:mailbox_msg, _mailbox_id, {reply_to, %{"action" => "list_traps"} = msg}},
+        state
+      ) do
+    target = Map.get(msg, "agent", reply_to)
+    traps = get_in(state.agents, [target, :traps]) || %{}
+
+    trap_list =
+      traps
+      |> Enum.sort_by(fn {event, _} -> event end)
+      |> Enum.map(fn {event, %{description: description, frames: frames}} ->
+        %{"event" => event, "description" => description, "frames" => length(frames)}
+      end)
+
+    summary =
+      case trap_list do
+        [] ->
+          "active traps: none"
+
+        list ->
+          "active traps: " <>
+            Enum.map_join(list, "; ", fn %{"event" => event, "description" => description} ->
+              "#{event}=#{description}"
+            end)
+      end
+
+    Gizmo.Mailbox.route(
+      reply_to,
+      {state.mailbox_id, %{"text" => summary, "agent" => target, "traps" => trap_list}}
+    )
+
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 end
 
 # -----------------------------------------------------------------------------
@@ -3354,7 +3455,7 @@ defmodule Gizmo.Migration.Snapshot do
       persisted_sections: loop.persisted_sections,
       bindings: loop.bindings,
       binding_notes: loop.binding_notes,
-      trap: serialize_trap(loop.trap),
+      traps: serialize_traps(loop.traps),
       awaiting_exhaustion: Map.get(loop, :awaiting_exhaustion, false),
       init_bindings: loop.init_bindings,
       init_notes: loop.init_notes,
@@ -3373,7 +3474,8 @@ defmodule Gizmo.Migration.Snapshot do
       blackboard: snapshot_service("blackboard", :snapshot),
       watchdog: snapshot_service("watchdog", :snapshot),
       factory: snapshot_service("factory", :snapshot),
-      bash: snapshot_service("bash", :snapshot)
+      bash: snapshot_service("bash", :snapshot),
+      runtime: snapshot_service("runtime", :snapshot)
     }
   end
 
@@ -3385,19 +3487,26 @@ defmodule Gizmo.Migration.Snapshot do
   end
 
   @doc """
-  Convert a trap (regex + frames) to a serializable form.
+  Convert a trap table to a serializable form.
   """
-  def serialize_trap(nil), do: nil
-  def serialize_trap({%Regex{source: source}, frames}), do: {source, frames}
+  def serialize_traps(traps) when traps == %{}, do: %{}
+
+  def serialize_traps(traps) do
+    Map.new(traps, fn {event, %{description: description, frames: frames}} ->
+      {event, %{description: description, frames: frames}}
+    end)
+  end
 
   @doc """
-  Restore a trap from its serialized form.
+  Restore traps from their serialized form.
   """
-  def deserialize_trap(nil), do: nil
+  def deserialize_traps(nil), do: %{}
+  def deserialize_traps(traps) when traps == %{}, do: %{}
 
-  def deserialize_trap({pattern_string, frames}) do
-    {:ok, regex} = Regex.compile(pattern_string)
-    {regex, frames}
+  def deserialize_traps(traps) do
+    Map.new(traps, fn {event, trap} ->
+      {event, %{description: trap.description, frames: trap.frames}}
+    end)
   end
 
   @doc """
@@ -3459,7 +3568,7 @@ defmodule Gizmo.Migration.Snapshot do
           persisted_sections: agent_snap.persisted_sections,
           bindings: agent_snap.bindings,
           binding_notes: agent_snap.binding_notes,
-          trap: deserialize_trap(agent_snap.trap),
+          traps: deserialize_traps(agent_snap[:traps] || %{}),
           awaiting_exhaustion: agent_snap[:awaiting_exhaustion] || false,
           init_bindings: agent_snap.init_bindings,
           init_notes: agent_snap.init_notes
@@ -3525,6 +3634,8 @@ defmodule Gizmo.Agent.Wrapper do
       runtime_preamble: runtime_preamble
     }
 
+    :ok = Gizmo.Services.Runtime.register_agent(self(), mailbox_id)
+
     Gizmo.Trace.emit(trace_outputs, %{
       event: "agent_start",
       agent: mailbox_id,
@@ -3570,6 +3681,7 @@ defmodule Gizmo.Agent.Wrapper do
     })
 
     # Cleanup
+    Gizmo.Services.Runtime.unregister_agent(mailbox_id)
     GenServer.stop(msgs_queue)
     Gizmo.Mailbox.unregister(mailbox_id)
   end
@@ -3588,6 +3700,7 @@ defmodule Gizmo.Supervision do
       {Gizmo.Services.Blackboard, "blackboard"},
       {Gizmo.Services.Bash, {"bash", bash_timeout}},
       {Gizmo.Services.KeepAlive, "keep_alive"},
+      {Gizmo.Services.Runtime, "runtime"},
       {Gizmo.Services.Human, "human"},
       {Gizmo.Services.HumanInput, "human_input"},
       {Gizmo.Services.Exception, "exception"},
@@ -3663,10 +3776,11 @@ defmodule Gizmo.Agent do
     ## Messages are JSON objects
 
     Every message in the system is a JSON object (not a string). The "text"
-    key is the conventional human-readable summary. When a message arrives:
+    key is the conventional human-readable summary. The "type" key is the
+    canonical event name for trap matching when present. When a message arrives:
     - ${_msg} = message["text"] if present, otherwise the full JSON encoding.
     - ${_payload} = the full JSON encoding of the message, always.
-    - Trap regex matching operates against the ${_msg} string.
+    - Traps match on message["type"] when present, otherwise on ${_msg}.
 
     ## Ops
 
@@ -3688,14 +3802,15 @@ defmodule Gizmo.Agent do
         "name": "<id>" — custom mailbox ID (must be unique; duplicate triggers op error).
         "model": "<model_id>" — LLM model for the child (default: inherit parent's model).
 
-    - trap: Register an interrupt handler. When a message whose "text" field
-      matches the PCRE regex "pattern" arrives between cycles, the handler
-      frames are prepended to your context stack. The message text is bound
-      to ${_interrupt} and the sender to ${_interrupt_source}. Only one trap
-      can be active; a new trap replaces the old one.
-      {"op": "trap", "pattern": "<pcre_regex>", "frames": ["<handler>"]}
-      To clear a trap, pass an empty frames array:
-      {"op": "trap", "pattern": ".*", "frames": []}
+    - trap: Register a one-shot interrupt handler for an exact event key.
+      Provide a short human-readable description so the runtime can show you
+      what you are waiting for. When the event arrives between cycles, the
+      handler frames are prepended to your context stack, the trap auto-clears,
+      ${_interrupt} is bound to the message text, ${_interrupt_event} to the
+      event key, and ${_interrupt_source} to the sender.
+      {"op": "trap", "event": "<event_key>", "description": "<why this matters>", "frames": ["<handler>"]}
+      To clear a trap, pass an empty frames array for that event:
+      {"op": "trap", "event": "<event_key>", "frames": []}
 
     To stay alive after this cycle, send any JSON message to the "keep_alive"
     mailbox. If you do not send keep_alive during a cycle, you die after that
@@ -3713,7 +3828,8 @@ defmodule Gizmo.Agent do
       field of the JSON message, or the full JSON encoding if no "text" key).
     - ${_msg_source}: The mailbox ID of the sender of the last message.
     - ${_payload}: Full JSON encoding of the last received message.
-    - ${_op_error}: Set when an op fails (e.g. bad regex in trap, name
+    - ${_interrupt_event}: Set when a trap fires. Contains the matched event key.
+    - ${_op_error}: Set when an op fails (e.g. malformed trap registration, name
       collision in spawn). Contains a description of the failure. Remaining
       ops are skipped. Check this binding to detect and recover from errors.
     - ${_pending_ops}: Set alongside _op_error. Summarizes the ops that
@@ -3798,8 +3914,13 @@ defmodule Gizmo.Agent do
       Schedule one-shot: {"op": "send", "mailbox": "watchdog", "msg": {"action": "after", "ms": 5000}}
       Cancel all:        {"op": "send", "mailbox": "watchdog", "msg": {"action": "cancel"}}
       List timers:       {"op": "send", "mailbox": "watchdog", "msg": {"action": "list"}}
-      Tick message: {"text": "tick", "tick": true} from source "watchdog".
+      Tick message: {"text": "tick", "type": "tick", "tick": true} from source "watchdog".
       List response: {"text": "<summary>", "timers": [...]}
+
+    - runtime: Runtime introspection service.
+      List your active traps: {"op": "send", "mailbox": "runtime", "msg": {"action": "list_traps"}}
+      List another agent's traps: {"op": "send", "mailbox": "runtime", "msg": {"action": "list_traps", "agent": "<mailbox_id>"}}
+      Response: {"text": "active traps: ...", "agent": "<mailbox_id>", "traps": [{"event": "...", "description": "...", "frames": N}, ...]}
 
     - pager: Document pager for reading large files page by page.
       Open: {"op": "send", "mailbox": "pager", "msg": {"action": "open", "path": "/path/to/file"}}
@@ -3920,19 +4041,16 @@ defmodule Gizmo.Agent do
 
     ## Trap (interrupt handler)
 
-    Register an interrupt handler via the trap op. When a message whose
-    "text" field matches the PCRE regex pattern arrives between cycles:
+    Register interrupt handlers via the trap op. Each trap listens for one
+    exact event key. The event key is message["type"] when present, otherwise
+    the message's ${_msg} text. When a trapped event arrives between cycles:
     - The handler frames are prepended to your context stack.
-    - ${_interrupt} and ${_interrupt_source} are bound to the message text.
+    - ${_interrupt}, ${_interrupt_event}, and ${_interrupt_source} are bound.
     - ${_msg} and ${_msg_source} are also bound as usual.
+    - The trap auto-clears after firing once.
 
-    The trap persists across cycles — it fires again on the next matching
-    message. Handler frames are consumed normally by the eval cycle (you
-    return new frames which replace them). The original stack frames
-    underneath resurface as handler frames drain.
-
-    Clear a trap by passing an empty frames array:
-      {"op": "trap", "pattern": ".*", "frames": []}
+    Re-register a trap explicitly if you want to keep listening for the same
+    event again later.
 
     ## Important timing rule
 
@@ -4005,7 +4123,7 @@ defmodule Gizmo.Agent do
     Long-lived worker with explicit renewal:
       {"ops": [
          {"op": "send", "mailbox": "keep_alive", "msg": {"text": "renew"}},
-         {"op": "trap", "pattern": "^stack_exhausted$", "frames": ["@boot"]}
+         {"op": "trap", "event": "stack_exhausted", "description": "reload boot behavior when the stack runs dry", "frames": ["@boot"]}
        ],
        "frames": [], "notes": {}}
     """
@@ -4071,7 +4189,7 @@ defmodule Gizmo.Agent do
       persisted_sections: %{},
       bindings: init_bindings,
       binding_notes: init_notes,
-      trap: nil,
+      traps: %{},
       awaiting_exhaustion: false,
       init_bindings: init_bindings,
       init_notes: init_notes
@@ -4090,7 +4208,7 @@ defmodule Gizmo.Agent do
   end
 
   # Inter-cycle message wait: first cycle synthesizes init, later cycles block for a mailbox message.
-  defp maybe_wait_for_message(_state, %{cycles: 0}, bindings, binding_notes, context_stack) do
+  defp maybe_wait_for_message(_state, %{cycles: 0, traps: traps}, bindings, binding_notes, context_stack) do
     # First cycle: no wait, synthetic init message
     bindings =
       bindings
@@ -4104,11 +4222,12 @@ defmodule Gizmo.Agent do
       |> Map.put("_msg_source", "message source")
       |> Map.put("_payload", "full JSON payload")
 
-    {bindings, binding_notes, context_stack}
+    {bindings, binding_notes, context_stack, traps}
   end
 
-  defp maybe_wait_for_message(state, %{trap: trap} = loop, bindings, binding_notes, context_stack) do
+  defp maybe_wait_for_message(state, %{traps: traps} = loop, bindings, binding_notes, context_stack) do
     {msg_content, msg_source} = receive_next_message(state, loop, context_stack)
+    event_key = message_event_key(msg_content)
 
     # Extract _msg (summary text) and _payload (full JSON) from message content
     {msg_text, payload_text} =
@@ -4132,29 +4251,49 @@ defmodule Gizmo.Agent do
       |> Map.put("_msg_source", "message source")
       |> Map.put("_payload", "full JSON payload")
 
-    # Check trap against msg_text (the summary string)
-    case trap do
-      {regex, handler_frames} ->
-        if Regex.match?(regex, msg_text) do
-          # Trap fires: bind interrupt, prepend handler frames
+    case Map.pop(traps, event_key) do
+      {nil, traps} ->
+        {bindings, binding_notes, context_stack, traps}
+
+      {%{frames: handler_frames}, remaining_traps} ->
           bindings =
             bindings
             |> Map.put("_interrupt", msg_text)
             |> Map.put("_interrupt_source", msg_source)
+            |> Map.put("_interrupt_event", event_key)
 
           binding_notes =
             binding_notes
             |> Map.put("_interrupt", "trapped interrupt message")
             |> Map.put("_interrupt_source", "interrupt source")
+            |> Map.put("_interrupt_event", "trapped interrupt event")
 
-          {bindings, binding_notes, handler_frames ++ context_stack}
-        else
-          {bindings, binding_notes, context_stack}
-        end
-
-      _ ->
-        {bindings, binding_notes, context_stack}
+        {bindings, binding_notes, handler_frames ++ context_stack, remaining_traps}
     end
+  end
+
+  defp message_event_key(message) when is_map(message) do
+    cond do
+      is_binary(message["type"]) and message["type"] != "" -> message["type"]
+      is_binary(message["text"]) and message["text"] != "" -> message["text"]
+      true -> Jason.encode!(message)
+    end
+  end
+
+  defp message_event_key(message) when is_binary(message), do: message
+
+  defp format_active_traps(traps) when map_size(traps) == 0 do
+    "Active traps:\n(none)"
+  end
+
+  defp format_active_traps(traps) do
+    trap_lines =
+      traps
+      |> Enum.sort_by(fn {event, _} -> event end)
+      |> Enum.map(fn {event, %{description: description}} -> "- #{event}: #{description}" end)
+      |> Enum.join("\n")
+
+    "Active traps:\n" <> trap_lines
   end
 
   defp receive_next_message(state, loop, context_stack) do
@@ -4235,6 +4374,7 @@ defmodule Gizmo.Agent do
            persisted_sections: persisted_sections,
            bindings: bindings,
            binding_notes: binding_notes,
+           traps: _traps,
            awaiting_exhaustion: awaiting_exhaustion
          } = loop
        ) do
@@ -4258,8 +4398,10 @@ defmodule Gizmo.Agent do
     end
 
     # Inter-cycle message wait: block until a message arrives (except cycle 0)
-    {bindings, binding_notes, context_stack} =
+    {bindings, binding_notes, context_stack, traps} =
       maybe_wait_for_message(state, loop, bindings, binding_notes, context_stack)
+
+    :ok = Gizmo.Services.Runtime.update_traps(state.mailbox_id, traps)
 
     if awaiting_exhaustion and context_stack == [] do
       :ok
@@ -4303,9 +4445,9 @@ defmodule Gizmo.Agent do
       Logger.warning(Gizmo.Format.cycle_header(id, length(context_stack), cycles + 1))
       Logger.debug(Gizmo.Format.bindings_line(id, bindings, binding_notes))
 
-      user_content =
+      binding_block =
         if map_size(bindings) == 0 do
-          "Begin."
+          "Current bindings:\n(none)"
         else
           binding_lines =
             bindings
@@ -4318,8 +4460,10 @@ defmodule Gizmo.Agent do
             end)
             |> Enum.join("\n")
 
-          "Begin.\n\nCurrent bindings:\n#{binding_lines}"
+          "Current bindings:\n#{binding_lines}"
         end
+
+      user_content = "Begin.\n\n#{binding_block}\n\n#{format_active_traps(traps)}"
 
       if state.log_full_prompts do
         Logger.flush()
@@ -4345,11 +4489,11 @@ defmodule Gizmo.Agent do
               {:spawn, cf, dest, _opts} ->
                 Logger.info(Gizmo.Format.op_spawn(id, cf, dest))
 
-              {:trap, _pattern, []} ->
+              {:trap, _event, _description, []} ->
                 Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m (clear)")
 
-              {:trap, pattern, _} ->
-                Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m pattern=#{pattern}")
+              {:trap, event, _description, _} ->
+                Logger.info("#{Gizmo.Format.agent_tag(id)}   \e[35mtrap\e[0m event=#{event}")
             end
           end
 
@@ -4359,9 +4503,9 @@ defmodule Gizmo.Agent do
           new_binding_notes = Map.merge(binding_notes, interpolated.notes)
 
           ops_result =
-            execute_ops(interpolated.ops, interpolated.frames, state, bindings, loop.trap)
+            execute_ops(interpolated.ops, interpolated.frames, state, bindings, traps)
 
-          {new_stack, new_bindings, new_trap, keep_alive_sent, new_retries, op_error} =
+          {new_stack, new_bindings, new_traps, keep_alive_sent, new_retries, op_error} =
             case ops_result do
               {:ok, stack, b, t, keep_alive_sent} ->
                 {stack, b, t, keep_alive_sent, 0, nil}
@@ -4410,9 +4554,11 @@ defmodule Gizmo.Agent do
 
           cond do
             not keep_alive_sent ->
+              :ok = Gizmo.Services.Runtime.update_traps(state.mailbox_id, new_traps)
               :ok
 
             new_stack == [] ->
+              :ok = Gizmo.Services.Runtime.update_traps(state.mailbox_id, new_traps)
               :ok =
                 Gizmo.Services.MessagesQueue.push_front(
                   state.msgs_queue,
@@ -4427,11 +4573,12 @@ defmodule Gizmo.Agent do
                   persisted_sections: sections,
                   bindings: new_bindings,
                   binding_notes: new_binding_notes,
-                  trap: new_trap,
+                  traps: new_traps,
                   awaiting_exhaustion: true
               })
 
             true ->
+              :ok = Gizmo.Services.Runtime.update_traps(state.mailbox_id, new_traps)
               eval_loop_inner(new_stack, state, %{
                 loop
                 | retries: new_retries,
@@ -4439,7 +4586,7 @@ defmodule Gizmo.Agent do
                   persisted_sections: sections,
                   bindings: new_bindings,
                   binding_notes: new_binding_notes,
-                  trap: new_trap,
+                  traps: new_traps,
                   awaiting_exhaustion: false
               })
           end
@@ -4488,7 +4635,8 @@ defmodule Gizmo.Agent do
     Enum.map(ops, fn
       {:send, mb, msg} -> %{op: "send", mailbox: mb, msg: msg}
       {:spawn, frames, dest, opts} -> %{op: "spawn", frames: frames, dest: dest, opts: opts}
-      {:trap, pattern, frames} -> %{op: "trap", pattern: pattern, frames: frames}
+      {:trap, event, description, frames} ->
+        %{op: "trap", event: event, description: description, frames: frames}
     end)
   end
 
@@ -4531,11 +4679,11 @@ defmodule Gizmo.Agent do
 
   defp op_name({:send, _, _}), do: "send"
   defp op_name({:spawn, _, _, _}), do: "spawn"
-  defp op_name({:trap, _, _}), do: "trap"
+  defp op_name({:trap, _, _, _}), do: "trap"
 
   defp op_summary({:send, mb, _}), do: "send(to='#{mb}')"
   defp op_summary({:spawn, _, dest, _}), do: "spawn(dest='#{dest}')"
-  defp op_summary({:trap, pattern, _}), do: "trap(pattern='#{pattern}')"
+  defp op_summary({:trap, event, _, _}), do: "trap(event='#{event}')"
 
   defp execute_op({:send, mailbox, msg}, frames, state, bindings, trap, keep_alive_sent) do
     Gizmo.Mailbox.route(mailbox, {state.mailbox_id, msg})
@@ -4631,26 +4779,20 @@ defmodule Gizmo.Agent do
     {:cont, frames, Map.put(bindings, dest, child_mb), trap, keep_alive_sent}
   end
 
-  defp execute_op({:trap, _pattern, []}, frames, _state, bindings, _trap, keep_alive_sent) do
-    # Empty handler frames = clear the trap
-    {:cont, frames, bindings, nil, keep_alive_sent}
+  defp execute_op({:trap, event, _description, []}, frames, _state, bindings, traps, keep_alive_sent) do
+    {:cont, frames, bindings, Map.delete(traps, event), keep_alive_sent}
   end
 
   defp execute_op(
-         {:trap, pattern, handler_frames},
+         {:trap, event, description, handler_frames},
          frames,
          _state,
          bindings,
-         _trap,
+         traps,
          keep_alive_sent
        ) do
-    case Regex.compile(pattern) do
-      {:ok, regex} ->
-        {:cont, frames, bindings, {regex, handler_frames}, keep_alive_sent}
-
-      {:error, {reason, _pos}} ->
-        raise "invalid regex pattern '#{pattern}': #{reason}"
-    end
+    new_traps = Map.put(traps, event, %{description: description, frames: handler_frames})
+    {:cont, frames, bindings, new_traps, keep_alive_sent}
   end
 end
 

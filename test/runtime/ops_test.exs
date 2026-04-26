@@ -7,7 +7,12 @@ defmodule Gizmo.OpsTest do
         "ops" => [
           %{"op" => "send", "mailbox" => "human", "msg" => %{"text" => "hello"}},
           %{"op" => "spawn", "frames" => ["f1", "f2"], "dest" => "child"},
-          %{"op" => "trap", "pattern" => "^alert:", "frames" => ["handler"]}
+          %{
+            "op" => "trap",
+            "event" => "alert",
+            "description" => "handle alert events",
+            "frames" => ["handler"]
+          }
         ],
         "frames" => ["frame1"],
         "notes" => %{"msg" => "received message"}
@@ -19,7 +24,7 @@ defmodule Gizmo.OpsTest do
       assert good_result.ops == [
                {:send, "human", %{"text" => "hello"}},
                {:spawn, ["f1", "f2"], "child", %{}},
-               {:trap, "^alert:", ["handler"]}
+               {:trap, "alert", "handle alert events", ["handler"]}
              ]
 
       assert good_result.notes == %{"msg" => "received message"}
@@ -129,32 +134,48 @@ defmodule Gizmo.OpsTest do
   describe "trap validation" do
     test "trap valid" do
       good_trap = %{
-        "ops" => [%{"op" => "trap", "pattern" => "^hello", "frames" => ["handler frame"]}],
+        "ops" => [
+          %{
+            "op" => "trap",
+            "event" => "hello",
+            "description" => "handle hello events",
+            "frames" => ["handler frame"]
+          }
+        ],
         "frames" => []
       }
 
       {:ok, result} = Gizmo.LLM.normalize_eval(good_trap)
-      assert result.ops == [{:trap, "^hello", ["handler frame"]}]
+      assert result.ops == [{:trap, "hello", "handle hello events", ["handler frame"]}]
     end
 
-    test "trap missing pattern" do
+    test "trap missing event" do
       bad_trap = %{"ops" => [%{"op" => "trap", "frames" => ["f"]}], "frames" => []}
       assert match?({:error, {:invalid_op, "trap", _}}, Gizmo.LLM.normalize_eval(bad_trap))
     end
 
+    test "trap missing description" do
+      bad_trap = %{
+        "ops" => [%{"op" => "trap", "event" => "hello", "frames" => ["f"]}],
+        "frames" => []
+      }
+
+      assert match?({:error, {:invalid_op, "trap", _}}, Gizmo.LLM.normalize_eval(bad_trap))
+    end
+
     test "trap missing frames" do
-      bad_trap2 = %{"ops" => [%{"op" => "trap", "pattern" => ".*"}], "frames" => []}
+      bad_trap2 = %{"ops" => [%{"op" => "trap", "event" => "hello"}], "frames" => []}
       assert match?({:error, {:invalid_op, "trap", _}}, Gizmo.LLM.normalize_eval(bad_trap2))
     end
 
     test "trap empty frames (clear)" do
       clear_trap = %{
-        "ops" => [%{"op" => "trap", "pattern" => ".*", "frames" => []}],
+        "ops" => [%{"op" => "trap", "event" => "hello", "frames" => []}],
         "frames" => []
       }
 
       {:ok, result} = Gizmo.LLM.normalize_eval(clear_trap)
-      assert result.ops == [{:trap, ".*", []}]
+      assert result.ops == [{:trap, "hello", nil, []}]
     end
   end
 

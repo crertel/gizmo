@@ -97,16 +97,21 @@ defmodule Gizmo.InterpolationTest do
                {:send, "human", %{"text" => "Hi Alice", "data" => %{"val" => "ok"}}}
     end
 
-    test "interpolates trap handler frames, leaves pattern as-is" do
+    test "interpolates trap descriptions and handler frames, leaves event as-is" do
       trap_resp = %{
-        ops: [{:trap, "^hello", ["handler for ${name}"]}, {:trap, ".*", []}],
+        ops: [
+          {:trap, "hello", "handle ${name}", ["handler for ${name}"]},
+          {:trap, "done", nil, []}
+        ],
         frames: ["frame"],
         notes: %{}
       }
 
       trap_interpolated = Gizmo.LLM.interpolate_response(trap_resp, %{"name" => "Alice"})
-      assert Enum.at(trap_interpolated.ops, 0) == {:trap, "^hello", ["handler for Alice"]}
-      assert Enum.at(trap_interpolated.ops, 1) == {:trap, ".*", []}
+      assert Enum.at(trap_interpolated.ops, 0) ==
+               {:trap, "hello", "handle Alice", ["handler for Alice"]}
+
+      assert Enum.at(trap_interpolated.ops, 1) == {:trap, "done", nil, []}
     end
   end
 end

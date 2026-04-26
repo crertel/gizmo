@@ -25,7 +25,7 @@ array [].
 Step 1:
 1. Send {"text": "Supervisor: spawning worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], and dest "child".
-3. Register a trap for "^child_died:" with handler frames:
+3. Register a trap for event "child_died" with description "report child failure and stop" and handler frames:
    ["The child crashed: ${_interrupt}. Send {"text": "error: ${_interrupt}"} to 'human' and terminate with empty frames."]
 4. Send {"text": "renew"} to 'keep_alive' because you are waiting for the child result.
 5. Return frames: ["@got-result"]

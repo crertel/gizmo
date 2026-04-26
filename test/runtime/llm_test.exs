@@ -9,9 +9,8 @@ defmodule Gizmo.LLMTest.Shared do
 
   - ops: a list of operations to execute, in order. Available ops:
     - send(mailbox, msg): send a message to a named mailbox
-    - receive(dest): block until a message arrives, store in ${dest}
     - spawn(frames, dest): create a child process, store child mailbox ID in ${dest}
-    - trap(pattern, frames): register interrupt handler for matching messages
+    - trap(event, description, frames): register a one-shot handler for an exact event
 
   - frames: replacement frames for your context stack. These define what you
     will see as your system prompt on the NEXT eval cycle. An empty array []

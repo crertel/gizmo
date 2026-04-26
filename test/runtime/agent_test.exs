@@ -125,7 +125,8 @@ defmodule Gizmo.AgentTest do
              %{
                ops: [
                  {:send, "keep_alive", %{"text" => "renew"}},
-                 {:trap, "^stack_exhausted$", ["stack exhausted handler"]}
+                 {:trap, "stack_exhausted", "handle stack exhaustion",
+                  ["stack exhausted handler"]}
                ],
                frames: [],
                notes: %{}

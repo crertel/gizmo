@@ -95,7 +95,7 @@ defmodule Gizmo.MessageDrivenTest do
   end
 
   describe "trap" do
-    test "trap fires on matching message" do
+    test "trap fires on matching event and auto-clears" do
       test_mb = register_test_mailbox("trap_test")
       cycle = :counters.new(1, [:atomics])
 
@@ -109,7 +109,7 @@ defmodule Gizmo.MessageDrivenTest do
              %{
                ops: [
                  {:send, "keep_alive", %{"text" => "renew"}},
-                 {:trap, "^alert:", ["Handle interrupt: ${_interrupt}"]}
+                 {:trap, "alert", "handle alert events", ["Handle interrupt: ${_interrupt}"]}
                ],
                frames: ["base frame"],
                notes: %{}
@@ -127,7 +127,7 @@ defmodule Gizmo.MessageDrivenTest do
       {:ok, agent_mb, pid} = Gizmo.Agent.start(["trap test frame"], chat_fn: chat_fn)
 
       Process.sleep(100)
-      Gizmo.Mailbox.route(agent_mb, {"alert_src", "alert:fire!"})
+      Gizmo.Mailbox.route(agent_mb, {"alert_src", %{"text" => "alert:fire!", "type" => "alert"}})
 
       ref = Process.monitor(pid)
 
@@ -143,7 +143,7 @@ defmodule Gizmo.MessageDrivenTest do
       Gizmo.Mailbox.unregister(test_mb)
     end
 
-    test "trap doesn't fire on non-matching message" do
+    test "trap doesn't fire on non-matching event" do
       test_mb = register_test_mailbox("notrap_test")
       cycle = :counters.new(1, [:atomics])
 
@@ -157,7 +157,7 @@ defmodule Gizmo.MessageDrivenTest do
              %{
                ops: [
                  {:send, "keep_alive", %{"text" => "renew"}},
-                 {:trap, "^alert:", ["handler frame"]}
+                 {:trap, "alert", "handle alert events", ["handler frame"]}
                ],
                frames: ["base frame"],
                notes: %{}

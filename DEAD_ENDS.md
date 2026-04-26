@@ -376,6 +376,50 @@ interrupt handler and `untrap()` to clear it.
 `trap(pattern, [])` with empty frames clears the trap. One op, no ambiguity.
 Empty handler frames = nothing to prepend = no trap.
 
+## Regex, Persistent, Single-Slot Traps
+
+**Introduced:** Stage 12
+**Removed:** after the keep-alive / `stack_exhausted` lifecycle rewrite
+
+For a while, `trap` meant "register one regex-matched interrupt handler that
+stays installed until something overwrites it." The runtime stored a single
+trap slot, matched against `${_msg}`, and reused the same handler across future
+cycles.
+
+### Why we removed it
+
+- **Regex was unnecessary policy surface.** Agents were not supposed to be
+  surprised by arbitrary message formats. In practice, the useful cases were
+  known event names such as `child_died`, `tick`, and `stack_exhausted`, so
+  regex matching only added ambiguity and failure modes.
+- **Single-slot traps forced unrelated concerns together.** As soon as
+  long-lived gremlins needed both exhaustion handling and child-death handling,
+  one trap total became awkward. Agents had to collapse multiple conditions
+  into one pattern and branch manually inside the handler.
+- **Persistent traps aged badly across phases.** A handler installed for one
+  stage of work could silently keep firing later unless the agent remembered to
+  clear it. That made the prompt context noisier and the control flow harder to
+  inspect.
+- **There was no good introspection story.** A regex and frame stack were
+  runtime state, but the agent could not easily see what it was currently
+  trapping for, which made debugging and continuation planning worse.
+
+### What replaced it
+
+- **Exact event traps.** `trap` now registers against one canonical event key:
+  `message["type"]` when present, otherwise the message text.
+- **Multiple traps at once.** Trap state is a map from event name to handler,
+  so independent concerns no longer fight over one slot.
+- **One-shot auto-clear semantics.** When a trap fires, it is removed
+  immediately. If the gremlin wants to keep listening, it must re-register the
+  trap explicitly.
+- **Trap descriptions and introspection.** Each trap includes a short
+  description, active traps are shown in the eval context, and the `runtime`
+  service can list them on demand.
+
+The result is a smaller and more legible model: traps are named event hooks,
+not ambient regex filters.
+
 ## `fork`/`join` as Process Calculus Primitives
 
 **Introduced:** Stage 8 (Fork and Join)

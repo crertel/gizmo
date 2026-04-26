@@ -26,11 +26,11 @@ services.
 │  context_stack: [frame]     │  ← prompt, bottom-up
 │  mailbox_id:    mb_id       │  ← receiving address
 │  parent_id:     mb_id|nil   │  ← ${_parent} binding
-│  trap:          {regex, frames}|nil
+│  traps:         %{event => %{description, frames}}
 │                             │
 │  eval loop:                 │
 │    wait for mailbox message │
-│    check trap               │
+│    fire one-shot trap       │
 │    build prompt             │
 │    LLM → {ops, frames}      │
 │    execute ops              │
@@ -50,7 +50,7 @@ message at the front of the mailbox queue so traps can rebuild work.
 |----|-------------|----------|
 | `send` | `{"op": "send", "mailbox": "...", "msg": {...}}` | Async message delivery to any mailbox. `msg` is always a JSON object. |
 | `spawn` | `{"op": "spawn", "frames": [...], "dest": "..."}` | Create a child process. Store the child's mailbox ID in binding `dest`. Optional fields: `disown`, `name`, `model`. |
-| `trap` | `{"op": "trap", "pattern": "...", "frames": [...]}` | Register an interrupt handler. On match, handler frames are prepended to the stack. Empty frames clear the trap. |
+| `trap` | `{"op": "trap", "event": "...", "description": "...", "frames": [...]}` | Register a one-shot interrupt handler for an exact event key. Empty frames clear that event's trap. |
 
 Interpolation applies to op payloads and returned frames before ops execute.
 
@@ -74,6 +74,7 @@ mailbox endpoints, not special opcodes.
 | `eval` | `"eval"` | Sandboxed Elixir expression evaluation. |
 | `factory` | `"factory"` | Runtime creation of custom stateful services. |
 | `migration` | `"migration"` | Live runtime migration. |
+| `runtime` | `"runtime"` | Runtime introspection, including active trap listing. |
 
 Per-agent runtime state:
 
@@ -173,23 +174,27 @@ Long-lived workers are explicit rather than mode-driven.
 
 ## Trap
 
-Trap is a single-slot interrupt handler:
+Trap is a one-shot exact-event handler:
 
 ```json
-{"op": "trap", "pattern": "^alert:", "frames": ["Handle ${_interrupt}"]}
+{"op": "trap", "event": "alert", "description": "handle alert events", "frames": ["Handle ${_interrupt}"]}
 ```
 
-When a matching message arrives between cycles:
+When a trapped event arrives between cycles:
 
-1. handler frames are prepended to the stack
-2. `${_interrupt}` and `${_interrupt_source}` are bound
+1. matching handler frames are prepended to the stack
+2. `${_interrupt}`, `${_interrupt_event}`, and `${_interrupt_source}` are bound
 3. `${_msg}` and `${_msg_source}` are also bound normally
+4. the trap auto-clears after firing once
 
-Clear a trap by returning:
+Clear one trap by returning:
 
 ```json
-{"op": "trap", "pattern": ".*", "frames": []}
+{"op": "trap", "event": "alert", "frames": []}
 ```
+
+If the agent wants to keep listening for the same event, it must re-register
+that trap explicitly in a later cycle.
 
 ## Boot Frame and Multi-File Stacks
 

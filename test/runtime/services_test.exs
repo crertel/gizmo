@@ -174,4 +174,38 @@ defmodule Gizmo.ServicesTest do
       assert elem(Gizmo.Mailbox.lookup("human_input"), 0) == :ok
     end
   end
+
+  describe "Runtime" do
+    test "list_traps returns active traps for the sender by default" do
+      reply_mb = Gizmo.Mailbox.generate_id("runtime_reply")
+      Gizmo.Mailbox.register(reply_mb)
+      pid = spawn(fn -> receive do after :infinity -> :ok end end)
+
+      :ok = Gizmo.Services.Runtime.register_agent(pid, reply_mb)
+
+      :ok =
+        Gizmo.Services.Runtime.update_traps(reply_mb, %{
+          "stack_exhausted" => %{description: "reload boot behavior", frames: ["@boot"]},
+          "child_died" => %{description: "handle child failure", frames: ["@child"]}
+        })
+
+      Gizmo.Mailbox.route("runtime", {reply_mb, %{"action" => "list_traps"}})
+
+      result =
+        receive do
+          {:mailbox_msg, ^reply_mb, {_from, msg}} -> msg
+        after
+          1_000 -> :timeout
+        end
+
+      assert result["agent"] == reply_mb
+      assert Enum.map(result["traps"], & &1["event"]) == ["child_died", "stack_exhausted"]
+      assert result["text"] =~ "child_died=handle child failure"
+      assert result["text"] =~ "stack_exhausted=reload boot behavior"
+
+      :ok = Gizmo.Services.Runtime.unregister_agent(reply_mb)
+      Gizmo.Mailbox.unregister(reply_mb)
+      Process.exit(pid, :kill)
+    end
+  end
 end

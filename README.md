@@ -155,7 +155,7 @@ test/                  # Example boot frames
   06_chat.txt          # Multi-turn chatbot
   07_reaper.txt        # Reaper service (parent kills child)
   08_lucky_number.txt  # Legacy grind/receive experiment (historical)
-  09_lucky_number_idle.txt # Idle child + trap (dice game variant)
+  09_lucky_number_idle.txt # Lease-renewed child + exhaustion trap (dice game variant)
   10_marketplace.txt   # Disowned peers + blackboard discovery (marketplace)
   11a_named_spawn.txt  # Named child spawn (custom mailbox ID)
   11b_each_hello.txt   # Per-file agent for --each mode

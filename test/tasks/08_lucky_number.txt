@@ -49,7 +49,7 @@ If ${_msg} starts with "rolled:":
     Send {"text": "renew"} to 'keep_alive'.
     Return frames: ["@check-roll"].
 
-If ${_msg} starts with "child_died:":
+If ${_msg_source} is "runtime" and ${_msg} starts with "child_died:":
   Send {"text": "Parent: child died! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 
@@ -58,7 +58,7 @@ Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@check-ro
 
 @@wait-for-death
 The reaper was asked to kill the child. A message arrived as ${_msg}.
-If ${_msg} starts with "child_died:":
+If ${_msg_source} is "runtime" and ${_msg} starts with "child_died:":
   Send {"text": "Parent: child was reaped! ${_msg}"} to 'human'.
   Terminate with empty frames [].
 Otherwise: return frames: ["@wait-for-death"].

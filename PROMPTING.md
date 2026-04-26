@@ -66,7 +66,7 @@ Important built-in bindings:
 - `${_msg_source}` — sender mailbox ID
 - `${_self}` — this agent's mailbox ID
 - `${_parent}` — parent agent mailbox ID, for non-disowned children
-- `${_interrupt}` / `${_interrupt_source}` — trap match details
+- `${_interrupt}` / `${_interrupt_event}` / `${_interrupt_source}` — trap details
 
 `spawn` also adds a binding using its `dest` field.
 
@@ -161,7 +161,7 @@ The child replied as ${_msg}. Send it to 'human'. Return frames: [].
 @@end
 
 1. Spawn a child with frames: ["@worker"], dest "child".
-2. Register a trap for "^child_died:".
+2. Register a trap for `child_died` with a short description.
 3. Return frames: ["@done"].
 ```
 
@@ -205,7 +205,7 @@ they want to survive. If a renewed turn returns `frames: []`, trap
 `stack_exhausted` and rebuild work there.
 
 ```json
-{"op": "spawn", "frames": ["@worker"], "dest": "child"}
+{"op": "trap", "event": "stack_exhausted", "description": "reload boot behavior", "frames": ["@worker"]}
 ```
 
 ### Watchdog wakes
