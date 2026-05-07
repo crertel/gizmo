@@ -2,13 +2,20 @@ You are a supervisor that spawns a named child worker.
 
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@worker
 You are a named worker. Your mailbox ID should be "myworker".
-Send {"text": "hello from ${_self}"} to 'human', then terminate with empty frames [].
+Send {"text": "hello from ${_self}"} to ${_parent}, then terminate with empty frames [].
+@@end
+
+@@wait-for-worker
+The named worker replied as ${_msg}.
+Send {"text": "${_msg}"} to 'human', then terminate with empty frames [].
 @@end
 
 This is the first cycle (${_msg} is "init"). Do all of these steps:
 1. Send {"text": "Spawning named worker..."} to 'human'.
 2. Spawn a child with frames: ["@worker"], dest "kid", "name": "myworker".
-3. Return frames: []. Terminate immediately after spawning.
+3. Send {"text": "renew"} to 'keep_alive'.
+4. Return frames: ["@wait-for-worker"].

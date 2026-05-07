@@ -170,6 +170,27 @@ Possible directions:
 - How to handle high-frequency grind-mode agents without overwhelming the display?
 - Separate tool or integrated into the runtime?
 
+## Integration Task Hardening
+
+Some of the `test/tasks` corpus has drifted toward "interesting demos" rather
+than reliable integration tests. The clearest current example is
+`test/tasks/16_toolmaker.txt`: it combines a chatbot persona, persistent
+memory, intent routing, runtime tool creation, and arbitrary code synthesis in
+one prompt. In practice that makes failures hard to localize and can stall in
+the LLM step even when the runtime is behaving correctly.
+
+Future cleanup should narrow tasks like this into deterministic,
+single-capability scenarios. For `16_toolmaker.txt`, the better shape is a
+small factory integration test:
+
+- create one tool from a clear request
+- wait for the factory reply
+- invoke that tool once
+- report the result
+
+Keep the broad "chatbot with memory and tools" version only if it is useful as
+a demo, not as a regression target in the integration corpus.
+
 ## Self-Modifying Runtime (Blue-Green Gizmo)
 
 **Status:** Core migration implemented (Stage 18). Steps 1-3 below are done.

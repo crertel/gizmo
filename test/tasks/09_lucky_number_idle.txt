@@ -12,15 +12,20 @@ Roller child. Messages arrive as ${_msg} from ${_msg_source}.
 
 If ${_msg} is "init":
   1. Send {"action": "every", "ms": 2000} to 'watchdog'.
-  2. Send {"text": "renew"} to 'keep_alive'.
-  3. Return frames: [].
+  2. Register a trap: event "stack_exhausted", description "reload the roller loop after each completed roll", frames ["@roller"].
+  3. Send {"text": "renew"} to 'keep_alive'.
+  4. Return frames: [].
+
+If ${_msg} is "stack_exhausted":
+  1. Send {"text": "renew"} to 'keep_alive'.
+  2. Return frames: ["@roller"].
 
 If ${_msg_source} is "watchdog":
   1. Send {"command": "printf \"%d\" $(shuf -i 1-6 -n 1)"} to 'bash'.
   2. Send {"text": "renew"} to 'keep_alive'.
-  3. Return frames: ["@1"].
+  3. Return frames: ["@wait-roll"].
 
-Otherwise: return frames: [].
+Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@roller"].
 @@end
 
 @@wait-roll
@@ -32,7 +37,7 @@ If ${_msg_source} is "bash":
   3. Send {"text": "renew"} to 'keep_alive'.
   4. Return frames: [].
 
-Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@0"].
+Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@wait-roll"].
 @@end
 
 @@check-roll

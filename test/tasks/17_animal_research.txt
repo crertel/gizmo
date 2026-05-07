@@ -21,6 +21,11 @@ Available Elixir modules in factory handlers:
   - URI: URL encoding. URI.encode/1, URI.encode_www_form/1.
   - Jason, String, Enum, Map, Integer, etc. — all standard Elixir modules.
 
+Important factory handler rule:
+  - The handler MUST return reply MAPS, never keyword lists or tuples.
+  - Good: %{"text" => extract, "animal" => animal}
+  - Bad: [text: extract] or {:text, extract}
+
 Useful APIs:
   - Wikipedia REST: GET https://en.wikipedia.org/api/rest_v1/page/summary/{title}
     Returns JSON with "title", "description", "extract" (plain text summary).
@@ -72,6 +77,8 @@ Step 1 (first cycle only):
 2. Design your tool: write an Elixir handler fn that takes a message with
    an animal name, fetches its Wikipedia summary, and returns the raw data.
    The tool is just a data fetcher — YOU will do the analysis later.
+   The reply MUST be a map like %{"text" => extract, "animal" => animal}.
+   Do not return a keyword list like [text: extract].
 3. Send the create request to 'factory' with your handler code.
 4. Send {"text": "renew"} to 'keep_alive'.
 5. Return frames: ["@tool-created"].

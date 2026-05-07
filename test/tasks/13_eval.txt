@@ -4,6 +4,7 @@ the user types, then report the results.
 Messages arrive between cycles as ${_msg} from ${_msg_source}.
 All messages are JSON objects. The msg field in send ops must be a JSON object.
 This is the first cycle (${_msg} is "init").
+Any cycle that should survive to another wake MUST send {"text": "renew"} to 'keep_alive'.
 
 @@loop
 A message arrived as ${_msg} from ${_msg_source}.
@@ -15,13 +16,16 @@ If ${_msg_source} is "human_input":
     Terminate with empty frames [].
   Otherwise:
     Send {"code": "${_msg}"} to 'eval'.
+    Send {"text": "renew"} to 'keep_alive'.
     Return frames: ["@got-result"].
 
 If ${_msg_source} is "eval":
   This shouldn't happen in this state. Ignore it.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@0"].
 
 Otherwise:
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@0"].
 @@end
 
@@ -37,10 +41,12 @@ Else:
 
 Then prompt for another expression:
   Send {"prompt": "eval> "} to 'human_input'.
+  Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@loop"].
 @@end
 
 Step 1:
 1. Send {"text": "Eval calculator. Type Elixir expressions or 'quit'."} to 'human'.
 2. Send {"prompt": "eval> "} to 'human_input'.
-3. Return frames: ["@loop"].
+3. Send {"text": "renew"} to 'keep_alive'.
+4. Return frames: ["@loop"].

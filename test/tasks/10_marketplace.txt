@@ -36,7 +36,9 @@ If ${_msg} is "init":
   3. Send {"text": "renew"} to 'keep_alive'.
   4. Return frames: ["@store-wait-bank"].
 
-Otherwise: return frames: ["@store-wait-bank"].
+Otherwise:
+  Send {"text": "renew"} to 'keep_alive'.
+  Return frames: ["@store-wait-bank"].
 @@end
 
 @@store-wait-bank
@@ -53,7 +55,7 @@ If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
   Return frames: ["@store-wait-balance"].
 
 Otherwise:
-  The bank is not registered yet, or this was just an acknowledgement.
+  The bank is not registered yet, or this was just an acknowledgement or stale self-message.
   Send {"text": "lookup_bank"} to ${_self}.
   Send {"text": "renew"} to 'keep_alive'.
   Return frames: ["@store-wait-bank"].
@@ -65,19 +67,19 @@ Waiting for the bank reply. Message: ${_msg} from ${_msg_source}.
 If ${_msg} starts with "balance:":
   Send {"action": "read", "key": "coordinator_mb"} to 'blackboard'.
   Send {"text": "renew"} to 'keep_alive'.
-  Return frames: ["Balance result: ${_msg}\n@store-wait-coordinator"].
+  Return frames: ["Deliver this exact text to the coordinator when its mailbox arrives: ${_msg}\n@store-wait-coordinator"].
 
 Otherwise: send {"text": "renew"} to 'keep_alive' and return frames: ["@store-wait-balance"].
 @@end
 
 @@store-wait-coordinator
-The balance result is stored at the top of this frame as "Balance result:".
+The exact balance text to deliver is stored at the top of this frame.
 Message: ${_msg} from ${_msg_source}.
 
 If ${_msg_source} is "blackboard" and ${_msg} starts with "agent_":
-  Read the stored balance result from this frame.
-  Send {"action": "write", "key": "marketplace_result", "value": "<that balance text>"} to 'blackboard'.
-  Send {"text": "<that balance text>"} to ${_msg}.
+  Read the stored balance text from this frame.
+  Send {"action": "write", "key": "marketplace_result", "value": "<that exact balance text>"} to 'blackboard'.
+  Send {"text": "<that exact balance text>"} to ${_msg}.
   Terminate with empty frames [].
 
 Otherwise: return frames: ["@0"].

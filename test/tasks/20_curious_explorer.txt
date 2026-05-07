@@ -69,35 +69,55 @@ Tell the human what tool you're building and why.
 
 Send the create request to 'factory' with name, code, and initial state.
 Send {"text": "renew"} to 'keep_alive'.
-Return frames: ["@deploy"].
+Return frames: ["Tool name: <your_tool_name>\n@deploy"].
 @@end
 
 @@deploy
-STEP: Tool deployment. Factory replied: ${_msg} from ${_msg_source}.
+STEP: Tool deployment. The active tool name is recorded at the top of this
+frame. Deployment reply: ${_msg} from ${_msg_source}.
 
-If ${_msg} starts with "error:" — read the error carefully. Fix the code.
-Common issues: missing end keywords, wrong map syntax, case clause separators.
-Tell the human what went wrong and what you're fixing (keep it brief).
-Send a corrected create request to 'factory' with the same tool name.
-Send {"text": "renew"} to 'keep_alive'.
-Return frames: ["@deploy"].
+If ${_msg_source} is "factory":
+  If ${_msg} starts with "error:" — read the error carefully. Fix the code.
+  Common issues: missing end keywords, wrong map syntax, case clause separators.
+  Tell the human what went wrong and what you're fixing (keep it brief).
+  Send a corrected create request to 'factory' with the SAME tool name recorded
+  at the top of this frame.
+  Send {"text": "renew"} to 'keep_alive'.
+  Return frames: ["@0"].
 
-If ${_msg} does NOT start with "error:" — the tool is ready! Celebrate
-briefly. Tell the human what you're going to try first.
+  If ${_msg} does NOT start with "error:" — the tool is ready! Celebrate
+  briefly. Tell the human what you're going to try first.
 
-Send a batch that combines your new tool with bash commands to explore:
-  Send to 'batch': {"requests": [
-    {"mailbox": "<your_tool_name>", "msg": <something interesting>},
-    {"mailbox": "bash", "msg": {"command": "<something related>"}},
-    {"mailbox": "bash", "msg": {"command": "<something else interesting>"}}
-  ]}
+  Send a batch that combines your ACTIVE tool with bash commands to explore:
+    Send to 'batch': {"requests": [
+      {"mailbox": "<the tool name recorded at the top of this frame>", "msg": <something interesting>},
+      {"mailbox": "bash", "msg": {"command": "<something related>"}},
+      {"mailbox": "bash", "msg": {"command": "<something else interesting>"}}
+    ]}
 
-Send {"text": "renew"} to 'keep_alive'.
-Return frames: ["@explore"].
+  Send {"text": "renew"} to 'keep_alive'.
+  Return frames: ["Active tool: <the tool name recorded at the top of this frame>\n@explore"].
+
+If ${_msg_source} is "batch":
+  This is the batched response from Option C (destroy old tool + create new one).
+  Parse ${_payload} as JSON. Confirm the create succeeded and identify the NEW
+  tool name from the frame text that queued this deploy step. If the create
+  failed, explain the error briefly to 'human', then send a direct corrected
+  create request to 'factory' for the NEW tool name.
+  If the create succeeded, tell the human the replacement tool is ready and
+  continue exploring with it exactly as in the factory-success case above.
+  Send {"text": "renew"} to 'keep_alive'.
+  Return frames: ["Active tool: <the new tool name from the frame text>\n@explore"] or ["Tool name: <the new tool name from the frame text>\n@deploy"] if you had to retry creation.
+
+If ${_msg_source} is neither "factory" nor "batch":
+  Treat it as an unexpected reply. Keep the current deployment intent alive.
+  Send {"text": "renew"} to 'keep_alive'.
+  Return frames: ["@0"].
 @@end
 
 @@explore
-STEP: Exploration. Results arrived: ${_msg} from ${_msg_source}.
+STEP: Exploration. The active tool name is recorded at the top of this frame.
+Results arrived: ${_msg} from ${_msg_source}.
 Full results in ${_payload} as JSON with a "results" array.
 
 Parse the results. Share your discoveries with the human. What did you find?
@@ -109,23 +129,25 @@ You have full creative autonomy. Choose ONE of these paths:
 Option A — Explore deeper: You have more questions about the current thread.
   Send a batch of bash commands and/or tool requests to investigate further.
   Send {"text": "renew"} to 'keep_alive'.
-  Return frames: ["@explore"].
+  Return frames: ["@0"].
 
 Option B — Build a new tool: You've identified something that would be easier
   to investigate with a purpose-built tool. Design it, tell the human what
   you're building and why.
   Send the create request to 'factory' with name, code, and initial state.
   Send {"text": "renew"} to 'keep_alive'.
-  Return frames: ["@deploy"].
+  Return frames: ["Tool name: <new_tool_name>\n@deploy"].
 
 Option C — Retire and replace a tool: Your current tool has served its purpose.
+  The OLD tool is the active tool recorded at the top of this frame.
+  Clearly choose and state a NEW tool name.
   Send a batch to destroy the old tool and create a new one:
   Send to 'batch': {"requests": [
-      {"mailbox": "factory", "msg": {"action": "destroy", "name": "<old_tool>"}},
+      {"mailbox": "factory", "msg": {"action": "destroy", "name": "<the active tool recorded at the top of this frame>"}},
       {"mailbox": "factory", "msg": {"action": "create", "name": "<new_tool>", "code": "<handler>", "state": <init>}}
     ]}
   Send {"text": "renew"} to 'keep_alive'.
-  Return frames: ["@deploy"].
+  Return frames: ["Old tool: <the active tool recorded at the top of this frame>\nNew tool: <new_tool>\n@deploy"].
 
 You must ALWAYS send at least one request (to batch, bash, factory, or a tool).
 You NEVER terminate. You NEVER return empty frames. If you run out of ideas

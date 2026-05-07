@@ -7,6 +7,11 @@ Integer, and all standard library modules.
   - Req.get(url) returns {:ok, %{status: int, body: decoded_json}} | {:error, reason}.
   - URI.encode/1, URI.encode_www_form/1 for URL encoding.
 
+Important factory handler rule:
+  - The handler MUST return reply MAPS, never keyword lists or tuples.
+  - Good: %{"text" => extract, "animal" => animal}
+  - Bad: [text: extract] or {:text, extract}
+
 Wikipedia REST API: GET https://en.wikipedia.org/api/rest_v1/page/summary/{title}
   Returns JSON with "title", "description", "extract" (plain text summary).
 
@@ -199,9 +204,11 @@ Step 1 (first cycle only):
 2. Design a wiki lookup tool: write an Elixir handler fn that takes a message
    with an "animal" field, fetches its Wikipedia summary via
    GET https://en.wikipedia.org/api/rest_v1/page/summary/{title},
-   and returns the extract text. Keep it simple — just fetch and return,
-   no need for nil guards on the animal field. Remember: every `case` and
-   `fn` needs its own `end` keyword when writing single-line Elixir.
+   and returns a reply map containing the extract text, e.g.
+   %{"text" => extract, "animal" => animal}. Keep it simple — just fetch
+   and return, no need for nil guards on the animal field. Do NOT return a
+   keyword list like [text: extract]. Remember: every `case` and `fn` needs
+   its own `end` keyword when writing single-line Elixir.
 3. Send the create request to 'factory' with name "wiki" and your handler code.
 4. Send {"text": "renew"} to 'keep_alive'.
 5. Return frames: ["@deploy", "@collect-1", "@journal", "@credits"].
